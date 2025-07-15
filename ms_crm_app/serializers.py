@@ -6,7 +6,3 @@ class UserProfileSerializers(serializers.ModelSerializer):
         model = UserProfile
         fields = '__all__'
 
-class QRCodeSerializers(serializers.ModelSerializer):   
-    class Meta:
-        model = QRCode
-        fields = '__all__'

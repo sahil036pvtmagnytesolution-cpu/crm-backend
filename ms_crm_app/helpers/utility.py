@@ -4,10 +4,10 @@ from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response 
 from django.utils import timezone
 
-app_name = 'ms_crm'
+app_name = 'ms_crm_app'
 
 def get_serializer_class(model_name):
-    module_name = 'ms_crm.serializers'  # Replace with your actual module name
+    module_name = 'ms_crm_app.serializers'  # Replace with your actual module name
     try:
         module = import_module(module_name)
         serializer_class_name = f"{model_name}Serializers"

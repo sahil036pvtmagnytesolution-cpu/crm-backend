@@ -1,4 +1,4 @@
-from ms_crm.models import *
+from ms_crm_app.models import *
 import jwt
 from django.utils import timezone
 
