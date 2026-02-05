@@ -11,7 +11,7 @@ class UserProfile(models.Model):
     business_name = models.CharField(max_length=100)
     user_email = models.EmailField(unique=True)
     contact_number = models.CharField(max_length=20)
-    password = models.CharField(max_length=128) 
+    password = models.CharField(max_length=255)
     address = models.TextField(max_length=100)
     city = models.CharField(max_length=100, null=True, blank=True)
     created_by = models.IntegerField(null=True, blank=True)

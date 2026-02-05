@@ -19,6 +19,14 @@ from django.urls import path, include
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('api/', include('ms_crm_app.url')),
-    path("core_api/", include("core.urls"))
+
+    # Business system
+    path('core_api/', include('core.urls')),
+
+    # Auth system
+    path('api/', include('ms_crm_app.urls')),
+
 ]
+
+
+

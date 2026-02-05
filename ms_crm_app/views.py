@@ -1,17 +1,25 @@
 from django.shortcuts import get_object_or_404
-from rest_framework.decorators import api_view 
+from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
+from django.contrib.auth import authenticate
+from rest_framework_simplejwt.tokens import RefreshToken
 from django.apps import apps
 from .models import *
 from .serializers import *
 from .helpers.utility import app_name, get_serializer_class, get_filtered_queryset, CustomPageNumberPagination
 from .helpers.auth_helper import generate_custom_tokens
 from django.contrib.auth.hashers import make_password, check_password
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.decorators import permission_classes
+from django.contrib.auth import authenticate
+from rest_framework_simplejwt.tokens import RefreshToken
+from core.models import Business
 
 @api_view(['GET', 'POST', 'PUT', 'DELETE'])
-def manage_data(request, model_name, field=None, value=None, item_id=None):            
-            
+@permission_classes([IsAuthenticated])
+def manage_data(request, model_name, field=None, value=None, item_id=None):
+
     try:
         model_class = apps.get_model(app_name, model_name)
     except LookupError:
@@ -22,9 +30,18 @@ def manage_data(request, model_name, field=None, value=None, item_id=None):
     except (ImportError, AttributeError) as e:
         return Response({'error': str(e)}, status=status.HTTP_404_NOT_FOUND)
 
+    # 🔐 Business isolation from JWT (optional but PRO)
+    # Example: If you later add business_id to JWT claims
+    # tenant_db = request.user.business_name
+
     if request.method == 'GET':
         try:
-            queryset = get_filtered_queryset(model_class, field, value, request.query_params).order_by('id')
+            queryset = get_filtered_queryset(
+                model_class,
+                field,
+                value,
+                request.query_params
+            ).order_by('id')
 
             paginator = CustomPageNumberPagination()
             paginated_qs = paginator.paginate_queryset(queryset, request)
@@ -33,22 +50,26 @@ def manage_data(request, model_name, field=None, value=None, item_id=None):
             return paginator.get_paginated_response(serializer.data)
         except Exception as e:
             return Response({'status': False, 'message': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-    
 
     elif request.method == 'POST':
         try:
             request_data = request.data.copy() if hasattr(request.data, 'copy') else request.data
             serializer = serializer_class(data=request_data)
+
             if serializer.is_valid():
-                serializer.save() 
+                serializer.save()
                 return Response({'status': True, 'data': serializer.data}, status=status.HTTP_201_CREATED)
             else:
-                print(serializer.errors)
-                return Response({"status": False, "message": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
+                return Response(
+                    {"status": False, "message": serializer.errors},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
         except Exception as e:
-            return Response({'status': False, 'message': 'Internal Server Error', 'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
+            return Response(
+                {'status': False, 'message': 'Internal Server Error', 'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
     elif request.method == 'DELETE':
         try:
@@ -66,8 +87,9 @@ def manage_data(request, model_name, field=None, value=None, item_id=None):
                 queryset = model_class.objects.filter(**filters)
 
             if not queryset or not queryset.exists():
-                return Response({'status': False, 'message': 'No matching items found'}, status=status.HTTP_404_NOT_FOUND)
-            
+                return Response({'status': False, 'message': 'No matching items found'},
+                                status=status.HTTP_404_NOT_FOUND)
+
             delete_multiple = False
             try:
                 delete_multiple = request.data.get('delete_multiple', False)
@@ -76,16 +98,22 @@ def manage_data(request, model_name, field=None, value=None, item_id=None):
 
             if delete_multiple:
                 count, _ = queryset.delete()
-                return Response({'status': True, 'message': f'{count} items deleted successfully'}, status=status.HTTP_200_OK)
+                return Response({'status': True, 'message': f'{count} items deleted successfully'},
+                                status=status.HTTP_200_OK)
+
             elif queryset.count() > 1:
-                return Response({'status': False, 'message': 'Multiple items matched. Set delete_multiple=true to confirm bulk delete.'}, status=status.HTTP_400_BAD_REQUEST)
+                return Response(
+                    {'status': False, 'message': 'Multiple items matched. Set delete_multiple=true to confirm bulk delete.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
             else:
                 queryset.first().delete()
                 return Response({'status': True, 'message': 'Item deleted successfully'})
 
         except Exception as e:
-            return Response({'status': False, 'message': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
+            return Response({'status': False, 'message': str(e)},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     elif request.method == 'PUT':
         try:
@@ -102,10 +130,12 @@ def manage_data(request, model_name, field=None, value=None, item_id=None):
                 filters = request.query_params.dict()
                 queryset = model_class.objects.filter(**filters)
             else:
-                return Response({'status': False, 'message': 'Missing item_id or field/value pair or query filters'}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({'status': False, 'message': 'Missing item_id or field/value pair or query filters'},
+                                status=status.HTTP_400_BAD_REQUEST)
 
             if not queryset.exists():
-                return Response({'status': False, 'message': 'No matching items found'}, status=status.HTTP_404_NOT_FOUND)
+                return Response({'status': False, 'message': 'No matching items found'},
+                                status=status.HTTP_404_NOT_FOUND)
 
             if update_multiple:
                 updated_count = 0
@@ -115,59 +145,80 @@ def manage_data(request, model_name, field=None, value=None, item_id=None):
                         serializer.save()
                         updated_count += 1
                     else:
-                        return Response({
-                            'status': False,
-                            'message': 'Validation failed on one or more records',
-                            'errors': serializer.errors
-                        }, status=status.HTTP_400_BAD_REQUEST)
+                        return Response(
+                            {'status': False, 'message': 'Validation failed', 'errors': serializer.errors},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
 
-                return Response({'status': True, 'message': f'{updated_count} items updated successfully'}, status=status.HTTP_200_OK)
+                return Response({'status': True, 'message': f'{updated_count} items updated successfully'},
+                                status=status.HTTP_200_OK)
 
             if queryset.count() > 1:
-                return Response({
-                    'status': False,
-                    'message': 'Multiple items matched. Set "update_multiple": true to update all.'
-                }, status=400)
+                return Response(
+                    {'status': False, 'message': 'Multiple items matched. Set "update_multiple": true to update all.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
             instance = queryset.first()
             serializer = serializer_class(instance, data=request_data, partial=True)
+
             if serializer.is_valid():
                 serializer.save()
-                return Response({'status': True, 'message': 'Item updated successfully'}, status=status.HTTP_200_OK)
-            else:
-                return Response({'status': False, 'errors': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({'status': True, 'message': 'Item updated successfully'},
+                                status=status.HTTP_200_OK)
+
+            return Response({'status': False, 'errors': serializer.errors},
+                            status=status.HTTP_400_BAD_REQUEST)
 
         except Exception as e:
-            return Response({'status': False, 'message': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({'status': False, 'message': str(e)},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @api_view(['POST'])
 def login(request):
+    email = request.data.get("email")
+    password = request.data.get("password")
+
+    if not email or not password:
+        return Response({"message": "Email and password required"}, status=400)
+
+    # 🔐 Django authentication
+    user = authenticate(username=email, password=password)
+
+    if user is None:
+        return Response({"message": "Invalid credentials"}, status=401)
+
+    if not user.is_active:
+        return Response(
+            {"message": "Business not approved by admin yet"},
+            status=403
+        )
+
+    # 🏢 Extra safety: business check
     try:
-        user_email = request.data.get('user_email')
-        user_password = request.data.get('password')
-        if not user_email or not user_password:
-            return Response({'status': False, 'message': 'Email and password required'}, status=status.HTTP_400_BAD_REQUEST)
+        business = Business.objects.get(email=email)
+    except Business.DoesNotExist:
+        return Response({"message": "Business not found"}, status=404)
 
-        userInstance = UserProfile.objects.filter(user_email=user_email).first()
-        if userInstance and check_password(user_password, userInstance.password):
-            UserToken.objects.filter(user=userInstance).delete()
-            tokens = generate_custom_tokens(userInstance)
+    if not business.is_approved:
+        return Response(
+            {"message": "Business not approved by admin yet"},
+            status=403
+        )
 
-            UserToken.objects.create(
-                user=userInstance,
-                access_token=tokens["access"],
-                refresh_token=tokens["refresh"]
-            )
+    # 🔑 JWT
+    refresh = RefreshToken.for_user(user)
 
-            userSerilizer = UserProfileSerializers(userInstance)
-
-            return Response({'status': True, 'message': 'Login successful', 'token': tokens['access'], 'userData': userSerilizer.data}, status=status.HTTP_200_OK)
-        else:
-            return Response({'status': False, 'message': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
-
-    except Exception as e:
-        return Response({'status': False, 'message': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
+    return Response({
+        "status": True,
+        "access": str(refresh.access_token),
+        "refresh": str(refresh),
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "business": business.name
+        }
+    })
 
 @api_view(['POST'])
 def signup(request):
