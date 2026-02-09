@@ -16,7 +16,6 @@ class BusinessAdmin(admin.ModelAdmin):
         'email',
         'owner_name',
         'is_approved',
-        'approve_button',
         'created_at'
     )
     list_filter = ('is_approved', 'created_at')
