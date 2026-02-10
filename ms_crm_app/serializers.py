@@ -6,3 +6,7 @@ class UserProfileSerializers(serializers.ModelSerializer):
         model = UserProfile
         fields = '__all__'
 
+# def validate_user_email(self, value):
+#         if UserProfile.objects.filter(user_email=value).exists():
+#             raise serializers.ValidationError("Email already exists")
+#         return value

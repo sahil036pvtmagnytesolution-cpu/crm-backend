@@ -40,11 +40,11 @@ class UserToken(models.Model):
 class ActivityLog(models.Model):
     description = models.TextField()
     date = models.DateTimeField()
-    staffid = models.CharField(max_length=100, blank=True, null=True)
+    staff_name = models.CharField(max_length=100, null=True, blank=True)
 
     class Meta:
-        managed = False
-        db_table = 'ms_activity_log'
+        db_table = "ms_activity_log"
+
 
 
 class Announcements(models.Model):
