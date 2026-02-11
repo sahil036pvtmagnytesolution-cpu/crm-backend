@@ -8,7 +8,23 @@ from django.db import transaction
 
 from .models import Business
 from .serializers import BusinessSerializer
-from .seeders.email_templates import seed_email_templates_optimized
+from core.seeders.email_templates import seed_email_templates_optimized
+
+import threading
+
+
+# =========================
+# ASYNC HELPER
+# =========================
+def run_async(func, *args):
+    """
+    🔥 Simple non-blocking runner
+    Request complete hone ke baad
+    background me kaam karega
+    """
+    t = threading.Thread(target=func, args=args)
+    t.daemon = True
+    t.start()
 
 
 # =========================
@@ -16,17 +32,16 @@ from .seeders.email_templates import seed_email_templates_optimized
 # =========================
 @api_view(['POST'])
 def register_business(request):
-    data = request.data.copy()
-    
-    required_fields = ['name', 'email', 'owner_name', 'password']
-    for field in required_fields:
+    data = request.data
+
+    # 🔹 ultra-fast validation
+    for field in ('name', 'email', 'owner_name', 'password'):
         if not data.get(field):
             return Response(
                 {"status": False, "message": f"{field} is required"},
                 status=400
             )
 
-    # ❌ Duplicate user block
     if User.objects.filter(username=data['email']).exists():
         return Response(
             {"status": False, "message": "User already exists"},
@@ -35,34 +50,24 @@ def register_business(request):
 
     with transaction.atomic():
 
-        # 🔹 CREATE USER (LOGIN BLOCKED)
-        user = User.objects.create_user(
+        # 🔥 FAST USER CREATE (no serializer)
+        user = User(
             username=data['email'],
             email=data['email'],
-            password=data['password'],
             is_active=False
         )
+        user.set_password(data['password'])   # hashing (still needed)
+        user.save()
 
-        # 🔹 CREATE BUSINESS
-        serializer = BusinessSerializer(data={
-            "name": data["name"],
-            "email": data["email"],
-            "owner_name": data["owner_name"]
-        })
+        # 🔥 FAST BUSINESS CREATE (NO SERIALIZER)
+        Business.objects.create(
+            name=data['name'],
+            email=data['email'],
+            owner_name=data['owner_name']
+        )
 
-        if not serializer.is_valid():
-            return Response(
-                {"status": False, "errors": serializer.errors},
-                status=400
-            )
-
-        business = serializer.save()
-
-    # 🔥 NON-BLOCKING HEAVY TASK
-    try:
-        seed_email_templates_optimized()
-    except Exception as e:
-        print("Email template seed failed:", e)
+    # 🚀 BACKGROUND WORK
+    run_async(seed_email_templates_optimized)
 
     return Response({
         "status": True,
@@ -86,16 +91,18 @@ def login(request):
             status=status.HTTP_401_UNAUTHORIZED
         )
 
-    if not check_password(password, user.password):
-        return Response(
-            {"message": "Invalid credentials"},
-            status=status.HTTP_401_UNAUTHORIZED
-        )
-
+    # 🔥 IMPORTANT: approval check FIRST
     if not user.is_active:
         return Response(
             {"message": "Business not approved by admin yet"},
             status=status.HTTP_403_FORBIDDEN
+        )
+
+    # password check AFTER approval
+    if not check_password(password, user.password):
+        return Response(
+            {"message": "Invalid credentials"},
+            status=status.HTTP_401_UNAUTHORIZED
         )
 
     refresh = RefreshToken.for_user(user)
@@ -107,3 +114,4 @@ def login(request):
             "email": user.email
         }
     }, status=status.HTTP_200_OK)
+
