@@ -8,6 +8,7 @@ from .models import Business
 from .serializers import BusinessSerializer
 from django.contrib.auth.hashers import make_password
 from .serializers import BusinessSerializer
+from django.contrib.auth.hashers import check_password
 
 # =========================
 # REGISTER BUSINESS
@@ -68,17 +69,29 @@ def login(request):
     email = request.data.get("email")
     password = request.data.get("password")
 
-    user = authenticate(username=email, password=password)
+    try:
+        user = User.objects.get(username=email)
+    except User.DoesNotExist:
+        return Response(
+            {"message": "Invalid credentials"},
+            status=status.HTTP_401_UNAUTHORIZED
+        )
 
-    if user is None:
-        return Response({"message": "Invalid credentials"}, status=401)
+    # 🔐 Password check
+    if not check_password(password, user.password):
+        return Response(
+            {"message": "Invalid credentials"},
+            status=status.HTTP_401_UNAUTHORIZED
+        )
 
+    # 🚫 Business not approved yet
     if not user.is_active:
         return Response(
             {"message": "Business not approved by admin yet"},
-            status=403
+            status=status.HTTP_403_FORBIDDEN
         )
 
+    # ✅ Approved user → token generate
     refresh = RefreshToken.for_user(user)
 
     return Response({
@@ -87,4 +100,4 @@ def login(request):
         "user": {
             "email": user.email
         }
-    })
+    }, status=status.HTTP_200_OK)
