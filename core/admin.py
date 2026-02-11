@@ -4,31 +4,40 @@ from django.urls import path
 from django.shortcuts import redirect
 from django.conf import settings
 from django.contrib.auth.models import User
+
 from .models import Business
-import subprocess
+from django.db import connection
+
 import MySQLdb
 
 
 @admin.register(Business)
 class BusinessAdmin(admin.ModelAdmin):
-    list_display = (
-        'name',
-        'email',
-        'owner_name',
-        'is_approved',
-        'created_at'
-    )
-    list_filter = ('is_approved', 'created_at')
-    search_fields = ('name', 'email', 'owner_name')
-    readonly_fields = ('approve_button',)
+    list_display = ("name", "email", "owner_name", "is_approved", "created_at")
+    list_filter = ("is_approved", "created_at")
+    search_fields = ("name", "email", "owner_name")
 
+    # 👇 IMPORTANT: approve_button ko form me dikhane ke liye
+    readonly_fields = ("approve_button",)
+    fields = (
+        "name",
+        "email",
+        "owner_name",
+        "is_approved",
+        "db_name",
+        "approve_button",
+    )
+
+    # =============================
+    # CUSTOM URL
+    # =============================
     def get_urls(self):
         urls = super().get_urls()
         custom_urls = [
             path(
-                'approve/<int:business_id>/',
+                "<int:business_id>/approve/",
                 self.admin_site.admin_view(self.approve_business),
-                name='approve-business',
+                name="approve-business",
             ),
         ]
         return custom_urls + urls
@@ -41,14 +50,15 @@ class BusinessAdmin(admin.ModelAdmin):
             return "✅ Approved"
 
         return format_html(
-            '<a class="button" href="approve/{}/">Approve</a>',
-            obj.id
-        )
+            '<a class="button" href="/admin/core/business/{}/approve/">Approve</a>',
+            obj.id,
+    )
 
-    approve_button.short_description = 'Approval'
+
+    approve_button.short_description = "Approval"
 
     # =============================
-    # APPROVE BUSINESS ACTION
+    # APPROVE BUSINESS (FAST & SAFE)
     # =============================
     def approve_business(self, request, business_id):
         try:
@@ -57,102 +67,116 @@ class BusinessAdmin(admin.ModelAdmin):
             if business.is_approved:
                 self.message_user(
                     request,
-                    "Already approved.",
-                    level=messages.WARNING
+                    "Business already approved",
+                    level=messages.WARNING,
                 )
-                return redirect("..")
+                return redirect(
+                    f"/admin/core/business/{business.id}/change/"
+                )
 
-            # =============================
-            # CREATE TENANT DB
-            # =============================
-            db_name = f"ms_crm_{business.name.lower().replace(' ', '_')}"
+            # -----------------------------
+            # CREATE TENANT DB (OPTIONAL, SAFE)
+            # -----------------------------
+            db_name = f"ms_crm_{business.id}"
             business.db_name = db_name
 
             root_conn = MySQLdb.connect(
-                host=settings.DATABASES['default']['HOST'],
-                user=settings.DATABASES['default']['USER'],
-                passwd=settings.DATABASES['default']['PASSWORD'],
-                charset='utf8mb4',
-                autocommit=True
+                host=settings.DATABASES["default"]["HOST"],
+                user=settings.DATABASES["default"]["USER"],
+                passwd=settings.DATABASES["default"]["PASSWORD"],
+                charset="utf8mb4",
+                autocommit=True,
             )
+
             with root_conn.cursor() as cursor:
-                cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{db_name}`")
+                cursor.execute(
+                    f"CREATE DATABASE IF NOT EXISTS `{db_name}`"
+                )
             root_conn.close()
 
-            # =============================
-            # DUMP SCHEMA
-            # =============================
-            dump_result = subprocess.run(
-                [
-                    "mysqldump",
-                    "-u",
-                    settings.DATABASES['default']['USER'],
-                    f"--password={settings.DATABASES['default']['PASSWORD']}",
-                    "--no-data",
-                    settings.DATABASES['default']['NAME'],
-                ],
-                capture_output=True,
-                text=True
+            # -----------------------------
+            # 🔥 INSTANT APPROVAL (NO DELAY)
+            # -----------------------------
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE core_business SET is_approved = 1 WHERE id = %s",
+                    [business_id],
             )
 
-            if dump_result.returncode != 0:
-                self.message_user(
-                    request,
-                    f"Schema dump failed:\n{dump_result.stderr}",
-                    level=messages.ERROR
-                )
-                return redirect("..")
-
-            schema_sql = dump_result.stdout
-
-            # =============================
-            # APPLY SCHEMA TO TENANT DB
-            # =============================
-            tenant_conn = MySQLdb.connect(
-                host=settings.DATABASES['default']['HOST'],
-                user=settings.DATABASES['default']['USER'],
-                passwd=settings.DATABASES['default']['PASSWORD'],
-                db=db_name,
-                charset='utf8mb4',
-                autocommit=True
-            )
-            with tenant_conn.cursor() as cursor:
-                for statement in schema_sql.split(";\n"):
-                    if statement.strip():
-                        cursor.execute(statement)
-            tenant_conn.close()
-
-            # =============================
-            # ACTIVATE DJANGO USER
-            # =============================
-            try:
-                user = User.objects.get(username=business.email)
-                user.is_active = True
-                user.save()
-            except User.DoesNotExist:
-                self.message_user(
-                    request,
-                    "Warning: Django user not found for this business",
-                    level=messages.WARNING
-                )
-
-            # =============================
-            # APPROVE BUSINESS
-            # =============================
-            business.is_approved = True
-            business.save()
+            # -----------------------------
+            # ACTIVATE USER (OPTIONAL)
+            # -----------------------------
+            User.objects.filter(
+                username=business.email
+            ).update(is_active=True)
 
             self.message_user(
                 request,
-                f"Business '{business.name}' approved, DB '{db_name}' created & login enabled ✅",
-                level=messages.SUCCESS
+                f"Business '{business.name}' approved successfully ✅",
+                level=messages.SUCCESS,
             )
-            return redirect("..")
+
+        except Business.DoesNotExist:
+            self.message_user(
+                request,
+                "Business not found",
+                level=messages.ERROR,
+            )
 
         except Exception as e:
             self.message_user(
                 request,
-                f"Error: {str(e)}",
-                level=messages.ERROR
+                f"Approval failed: {e}",
+                level=messages.ERROR,
             )
-            return redirect("..")
+
+        return redirect(
+            f"/admin/core/business/{business_id}/change/"
+        )
+
+    # ==================================================
+    # PERMANENT BACKUP APPROVAL (ADMIN ACTION)
+    # ==================================================
+    actions = ["approve_selected_businesses"]
+
+    def approve_selected_businesses(self, request, queryset):
+        approved_count = 0
+
+        for business in queryset:
+            if business.is_approved:
+                continue
+
+            # Same logic as button (NO CHANGE)
+            db_name = f"ms_crm_{business.id}"
+            business.db_name = db_name
+
+            root_conn = MySQLdb.connect(
+                host=settings.DATABASES["default"]["HOST"],
+                user=settings.DATABASES["default"]["USER"],
+                passwd=settings.DATABASES["default"]["PASSWORD"],
+                charset="utf8mb4",
+                autocommit=True,
+            )
+
+            with root_conn.cursor() as cursor:
+                cursor.execute(
+                    f"CREATE DATABASE IF NOT EXISTS `{db_name}`"
+                )
+            root_conn.close()
+
+            business.is_approved = True
+            business.save(update_fields=["is_approved", "db_name"])
+
+            User.objects.filter(
+                username=business.email
+            ).update(is_active=True)
+
+            approved_count += 1
+
+        self.message_user(
+            request,
+            f"{approved_count} business(es) approved successfully ✅",
+            level=messages.SUCCESS,
+        )
+
+    approve_selected_businesses.short_description = "✅ Approve selected businesses (Permanent)"

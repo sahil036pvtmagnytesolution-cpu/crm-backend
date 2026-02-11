@@ -44,6 +44,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    "core.middleware.TenantMiddleware",
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
 
@@ -175,3 +176,12 @@ SIMPLE_JWT = {
     'REFRESH_TOKEN_LIFETIME': timedelta(days=1),
     'AUTH_HEADER_TYPES': ('Bearer',),
 }
+
+DATABASE_ROUTERS = [
+    "core.db_router.TenantRouter",
+]
+# This is inserted data
+MIDDLEWARE.insert(
+    0,
+    "core.middleware.TenantMiddleware"
+)

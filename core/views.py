@@ -1,14 +1,15 @@
 from django.contrib.auth.models import User
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
-from django.contrib.auth import authenticate
-from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework import status
+from django.contrib.auth.hashers import check_password
+from rest_framework_simplejwt.tokens import RefreshToken
+from django.db import transaction
+
 from .models import Business
 from .serializers import BusinessSerializer
-from django.contrib.auth.hashers import make_password
-from .serializers import BusinessSerializer
-from django.contrib.auth.hashers import check_password
+from .seeders.email_templates import seed_email_templates_optimized
+
 
 # =========================
 # REGISTER BUSINESS
@@ -16,9 +17,8 @@ from django.contrib.auth.hashers import check_password
 @api_view(['POST'])
 def register_business(request):
     data = request.data.copy()
-
+    
     required_fields = ['name', 'email', 'owner_name', 'password']
-
     for field in required_fields:
         if not data.get(field):
             return Response(
@@ -26,39 +26,48 @@ def register_business(request):
                 status=400
             )
 
-    # ❌ Block duplicate signup
+    # ❌ Duplicate user block
     if User.objects.filter(username=data['email']).exists():
         return Response(
             {"status": False, "message": "User already exists"},
             status=400
         )
 
-    # ✅ Create Django user (LOGIN DISABLED)
-    user = User.objects.create_user(
-        username=data['email'],
-        email=data['email'],
-        password=data['password'],
-        is_active=False   # 🔐 BLOCK LOGIN
-    )
+    with transaction.atomic():
 
-    # ✅ Create Business
-    serializer = BusinessSerializer(data={
-        "name": data["name"],
-        "email": data["email"],
-        "owner_name": data["owner_name"]
-    })
+        # 🔹 CREATE USER (LOGIN BLOCKED)
+        user = User.objects.create_user(
+            username=data['email'],
+            email=data['email'],
+            password=data['password'],
+            is_active=False
+        )
 
-    if serializer.is_valid():
-        serializer.save()
-        return Response({
-            "status": True,
-            "message": "Signup successful. Please wait for admin approval."
-        }, status=201)
+        # 🔹 CREATE BUSINESS
+        serializer = BusinessSerializer(data={
+            "name": data["name"],
+            "email": data["email"],
+            "owner_name": data["owner_name"]
+        })
+
+        if not serializer.is_valid():
+            return Response(
+                {"status": False, "errors": serializer.errors},
+                status=400
+            )
+
+        business = serializer.save()
+
+    # 🔥 NON-BLOCKING HEAVY TASK
+    try:
+        seed_email_templates_optimized()
+    except Exception as e:
+        print("Email template seed failed:", e)
 
     return Response({
-        "status": False,
-        "errors": serializer.errors
-    }, status=400)
+        "status": True,
+        "message": "Signup successful. Please wait for admin approval."
+    }, status=201)
 
 
 # =========================
@@ -77,21 +86,18 @@ def login(request):
             status=status.HTTP_401_UNAUTHORIZED
         )
 
-    # 🔐 Password check
     if not check_password(password, user.password):
         return Response(
             {"message": "Invalid credentials"},
             status=status.HTTP_401_UNAUTHORIZED
         )
 
-    # 🚫 Business not approved yet
     if not user.is_active:
         return Response(
             {"message": "Business not approved by admin yet"},
             status=status.HTTP_403_FORBIDDEN
         )
 
-    # ✅ Approved user → token generate
     refresh = RefreshToken.for_user(user)
 
     return Response({

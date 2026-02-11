@@ -1,5 +1,3 @@
-# core/db_router.py
-
 from core.middleware import get_current_db
 
 class TenantRouter:
@@ -11,7 +9,7 @@ class TenantRouter:
 
     def allow_relation(self, obj1, obj2, **hints):
         db = get_current_db()
-        return db == obj1._state.db == obj2._state.db
+        return obj1._state.db == db and obj2._state.db == db
 
     def allow_migrate(self, db, app_label, model_name=None, **hints):
-        return db == 'default' or db.startswith("ms_crm_")
+        return db == "default"
