@@ -25,8 +25,4 @@ urlpatterns = [
 
     # Auth system
     path('api/', include('ms_crm_app.urls')),
-
 ]
-
-
-

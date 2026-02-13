@@ -10,6 +10,10 @@ from .models import Business
 from .serializers import BusinessSerializer
 from core.seeders.email_templates import seed_email_templates_optimized
 
+from rest_framework.decorators import api_view
+from .models import Role
+from .serializers import RoleSerializer
+
 import threading
 
 
@@ -115,3 +119,43 @@ def login(request):
         }
     }, status=status.HTTP_200_OK)
 
+# =========================
+# GET + CREATE ROLES
+# =========================
+@api_view(["GET", "POST"])
+def roles_api(request):
+
+    if request.method == "GET":
+        roles = Role.objects.all()
+        serializer = RoleSerializer(roles, many=True)
+        return Response(serializer.data, status=200)
+
+    if request.method == "POST":
+        serializer = RoleSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()   # is_approved = False (Pending)
+            return Response(
+                {"success": True, "message": "Role created"},
+                status=201
+            )
+        return Response(serializer.errors, status=400)
+
+
+# =========================
+# APPROVE ROLE (ADMIN)
+# =========================
+@api_view(["PATCH"])
+def approve_role(request, pk):
+    try:
+        role = Role.objects.get(id=pk)
+        role.is_approved = True
+        role.save()
+        return Response(
+            {"success": True, "message": "Role approved"},
+            status=200
+        )
+    except Role.DoesNotExist:
+        return Response(
+            {"success": False, "message": "Role not found"},
+            status=404
+        )

@@ -44,7 +44,10 @@ class ActivityLog(models.Model):
 
     class Meta:
         db_table = "ms_activity_log"
+        managed = False   # 🔥 THIS IS THE KEY FIX
 
+    def __str__(self):
+        return self.description[:50]
 
 
 class Announcements(models.Model):
@@ -1344,12 +1347,11 @@ class Reminders(models.Model):
 
 class Roles(models.Model):
     roleid = models.AutoField(primary_key=True)
-    name = models.CharField(max_length=150)
+    name = models.CharField(max_length=100)
     permissions = models.TextField(blank=True, null=True)
 
     class Meta:
-        managed = False
-        db_table = 'ms_roles'
+        db_table = "ms_roles"
 
 
 class SalesActivity(models.Model):

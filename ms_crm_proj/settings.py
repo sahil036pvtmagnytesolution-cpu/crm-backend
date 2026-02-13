@@ -181,7 +181,7 @@ DATABASE_ROUTERS = [
     "core.db_router.TenantRouter",
 ]
 # This is inserted data
-MIDDLEWARE.insert(
-    0,
-    "core.middleware.TenantMiddleware"
-)
+# MIDDLEWARE.insert(
+#     0,
+#     "core.middleware.TenantMiddleware"
+# )

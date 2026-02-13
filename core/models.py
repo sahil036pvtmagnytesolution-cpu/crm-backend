@@ -1,14 +1,20 @@
 from django.db import models
 
 
-# ⚠️ OLD Business model
 class Business(models.Model):
-    name = models.CharField(max_length=255)
-    email = models.EmailField(unique=True)
-    owner_name = models.CharField(max_length=255)
-    is_approved = models.BooleanField(default=False)
-    db_name = models.CharField(max_length=255, null=True, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
+    name = models.CharField(max_length=100, unique=True, db_index=True)
+    email = models.EmailField(unique=True, db_index=True)
+    owner_name = models.CharField(max_length=100)
+    is_approved = models.BooleanField(default=False, db_index=True)
+    db_name = models.CharField(max_length=100, blank=True, null=True, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = "core_business"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return self.name
 
 
 class EmailTemplate(models.Model):
@@ -70,3 +76,19 @@ class Business(models.Model):
     def __str__(self):
         return self.name
 
+# =========================
+# ROLE MODEL
+# =========================
+
+class Role(models.Model):
+    name = models.CharField(max_length=100, unique=True)
+    permissions = models.TextField(blank=True, null=True)
+    is_approved = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "core_roles"
+        ordering = ["-id"]
+
+    def __str__(self):
+        return self.name
