@@ -2,19 +2,25 @@ from django.db import models
 
 
 class Business(models.Model):
-    name = models.CharField(max_length=100, unique=True, db_index=True)
-    email = models.EmailField(unique=True, db_index=True)
-    owner_name = models.CharField(max_length=100)
-    is_approved = models.BooleanField(default=False, db_index=True)
-    db_name = models.CharField(max_length=100, blank=True, null=True, unique=True)
-    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    """
+    EXISTING TABLE ONLY
+    NO MIGRATION
+    NO DATA LOSS
+    """
+
+    name = models.CharField(max_length=255)
+    email = models.EmailField()
+    owner_name = models.CharField(max_length=255)
+    is_approved = models.BooleanField()
+    created_at = models.DateTimeField()
 
     class Meta:
-        db_table = "core_business"
-        ordering = ["-created_at"]
+        db_table = "ms_business"
+        managed = False   # 🔒 VERY IMPORTANT
 
     def __str__(self):
         return self.name
+
 
 
 class EmailTemplate(models.Model):

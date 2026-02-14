@@ -94,37 +94,54 @@ def manage_data(request, model_name, item_id=None):
 # ======================================================
 # AUTH
 # ======================================================
-@api_view(['POST'])
+@api_view(["POST"])
+@permission_classes([AllowAny])
 def login(request):
+
     email = request.data.get("email")
     password = request.data.get("password")
 
     if not email or not password:
         return Response(
-            {"status": False, "message": "Email and password required"},
+            {"message": "Email and password required"},
             status=status.HTTP_400_BAD_REQUEST
         )
 
-    user = authenticate(username=email, password=password)
-    if not user:
+    # ✅ AUTH USER (PERMANENT)
+    try:
+        user = User.objects.get(username=email)
+    except User.DoesNotExist:
         return Response(
-            {"status": False, "message": "Invalid credentials"},
+            {"message": "Invalid credentials"},
             status=status.HTTP_401_UNAUTHORIZED
+        )
+
+    if not user.check_password(password):
+        return Response(
+            {"message": "Invalid credentials"},
+            status=status.HTTP_401_UNAUTHORIZED
+        )
+
+    # ✅ BUSINESS APPROVAL (REAL TABLE)
+    business = Business.objects.filter(
+        email__iexact=user.email,
+        is_approved=1
+    ).first()
+
+    if not business:
+        return Response(
+            {"message": "Business not approved yet by admin"},
+            status=status.HTTP_403_FORBIDDEN
         )
 
     refresh = RefreshToken.for_user(user)
 
-    # 🔥 GET BUSINESS (APPROVED ONE)
-    business = Business.objects.filter(owner=user, is_approved=True).first()
-
     return Response({
-        "status": True,
-        "access": str(refresh.access_token),
-        "refresh": str(refresh),
-        "business_name": business.db_name if business else None,  # ✅ FIX
-        "user": {
-            "id": user.id,
-            "email": user.email
+        "message": "Login successful",
+        "access_token": str(refresh.access_token),
+        "refresh_token": str(refresh),
+        "business": {
+            "name": business.name
         }
     }, status=status.HTTP_200_OK)
 
