@@ -180,3 +180,15 @@ class BusinessAdmin(admin.ModelAdmin):
         )
 
     approve_selected_businesses.short_description = "✅ Approve selected businesses (Permanent)"
+# ==============================
+# ROLE ADMIN (SAFE ADDITION)
+# ==============================
+
+from .models import Role
+
+
+@admin.register(Role)
+class RoleAdmin(admin.ModelAdmin):
+    list_display = ("id", "name", "is_approved", "created_at")
+    list_filter = ("is_approved",)
+    search_fields = ("name",)
