@@ -87,10 +87,11 @@ class Business(models.Model):
 # =========================
 
 class Role(models.Model):
-    name = models.CharField(max_length=100, unique=True)
-    permissions = models.TextField(blank=True, null=True)
+    name = models.CharField(max_length=100)
+    permissions = models.TextField(default="Basic")  # ✅ safety
     is_approved = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
+
 
     class Meta:
         db_table = "core_roles"

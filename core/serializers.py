@@ -10,7 +10,7 @@ class BusinessSerializer(serializers.ModelSerializer):
 
 
 class RoleSerializer(serializers.ModelSerializer):
-    status = serializers.SerializerMethodField()
+    status = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Role
@@ -27,12 +27,9 @@ class RoleSerializer(serializers.ModelSerializer):
     def get_status(self, obj):
         return "Approved" if obj.is_approved else "Pending"
 
-    # ✅ ADD THIS (NO EXISTING CODE TOUCHED)
-    def create(self, validated_data):
-        """
-        Frontend se is_approved nahi aata,
-        to yahan default set kar rahe hain
-        """
-        validated_data.setdefault("is_approved", True)
-        validated_data.setdefault("permissions", "")
-        return super().create(validated_data)
+    # ✅ ADD THIS (KEY FIX)
+    def validate_permissions(self, value):
+        if not value or not value.strip():
+            return "Basic"   # default permission
+        return value
+
