@@ -1,5 +1,6 @@
 from django.db import models
-
+from django.contrib.auth.models import User
+from django.db import models
 
 class Business(models.Model):
     """
@@ -99,3 +100,41 @@ class Role(models.Model):
 
     def __str__(self):
         return self.name
+
+
+class StaffProfile(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE)
+    manager = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="team_members"
+    )
+
+    def __str__(self):
+        return self.user.username
+
+
+
+class Proposal(models.Model):
+    subject = models.CharField(max_length=255)
+    total = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    status = models.IntegerField(default=1)
+
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="created_proposals"
+    )
+
+    # ✅ ADD THIS FIELD (THIS WAS MISSING)
+    assigned = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="assigned_proposals"
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)

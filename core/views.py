@@ -1,15 +1,16 @@
 from django.contrib.auth.models import User
+from django.contrib.auth.hashers import check_password
+from django.db import transaction
+import threading
+
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
-from django.contrib.auth.hashers import check_password
 from rest_framework_simplejwt.tokens import RefreshToken
-from django.db import transaction
-import threading
 
-from .models import Business, Role
-from .serializers import BusinessSerializer, RoleSerializer
+from .models import Business, Role, Proposal, StaffProfile
+from .serializers import BusinessSerializer, RoleSerializer, ProposalSerializer
 from core.seeders.email_templates import seed_email_templates_optimized
 
 
@@ -46,7 +47,7 @@ def register_business(request):
         user = User(
             username=data["email"],
             email=data["email"],
-            is_active=False,
+            is_active=False,   # admin approval required
         )
         user.set_password(data["password"])
         user.save()
@@ -69,7 +70,7 @@ def register_business(request):
 
 
 # =========================
-# LOGIN
+# LOGIN (JWT)
 # =========================
 @api_view(["POST"])
 def login(request):
@@ -81,7 +82,6 @@ def login(request):
     except User.DoesNotExist:
         return Response({"message": "Invalid credentials"}, status=401)
 
-    # 🔒 Approval check FIRST
     if not user.is_active:
         return Response(
             {"message": "Business not approved by admin yet"},
@@ -95,35 +95,37 @@ def login(request):
 
     return Response(
         {
-            "access": str(refresh.access_token),
-            "refresh": str(refresh),
-            "user": {"email": user.email},
+            "access_token": str(refresh.access_token),  # ✅ frontend compatible
+            "refresh_token": str(refresh),
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "is_superuser": user.is_superuser,
+            },
         },
         status=200,
     )
 
 
 # =========================
-# GET + CREATE ROLES (JWT PROTECTED)
+# ROLES API (JWT PROTECTED)
 # =========================
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def roles_api(request):
-
     if request.method == "GET":
         roles = Role.objects.all().order_by("-id")
         serializer = RoleSerializer(roles, many=True)
         return Response(serializer.data, status=200)
 
-    if request.method == "POST":
-        serializer = RoleSerializer(data=request.data)
-        if serializer.is_valid():
-            serializer.save()
-            return Response(
-                {"success": True, "message": "Role created"},
-                status=201,
-            )
-        return Response(serializer.errors, status=400)
+    serializer = RoleSerializer(data=request.data)
+    if serializer.is_valid():
+        serializer.save()
+        return Response(
+            {"success": True, "message": "Role created"},
+            status=201,
+        )
+    return Response(serializer.errors, status=400)
 
 
 # =========================
@@ -144,5 +146,81 @@ def approve_role(request, pk):
             {"success": False, "message": "Role not found"},
             status=404,
         )
+
+
+# =========================
+# SALES / PROPOSALS LIST
+# =========================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def sales_proposals(request):
+    user = request.user
+
+    if user.is_superuser:
+        qs = Proposal.objects.all()
+    else:
+        staff_ids = [user.id]
+
+        team = StaffProfile.objects.filter(manager=user)
+        staff_ids += [m.user.id for m in team]
+
+        qs = Proposal.objects.filter(created_by_id__in=staff_ids)
+
+    serializer = ProposalSerializer(qs.order_by("-id"), many=True)
+    return Response(serializer.data, status=200)
+
+
+# =========================
+# ASSIGN PROPOSAL
+# =========================
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def assign_proposal(request, pk):
+    try:
+        proposal = Proposal.objects.get(id=pk)
+    except Proposal.DoesNotExist:
+        return Response({"error": "Proposal not found"}, status=404)
+
+    user_id = request.data.get("user_id")
+
+    # ✅ Unassign support
+    if user_id in [None, ""]:
+        proposal.assigned_to = None
+        proposal.save()
+        return Response({"message": "Unassigned successfully"}, status=200)
+
+    try:
+        user = User.objects.get(id=user_id)
+    except User.DoesNotExist:
+        return Response({"error": "User not found"}, status=404)
+
+    # ✅ Re-assign allowed
+    proposal.assigned_to = user
+    proposal.save()
+
+    return Response({"message": "Assigned successfully"}, status=200)
+
+# =========================
+# CREATE PROPOSAL
+# =========================
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def create_proposal(request):
+    serializer = ProposalSerializer(data=request.data)
+    if serializer.is_valid():
+        serializer.save(created_by=request.user)  # ✅ FIX
+        return Response(serializer.data, status=201)
+    return Response(serializer.errors, status=400)
+
+@api_view(["DELETE"])
+@permission_classes([IsAuthenticated])
+def delete_proposal(request, pk):
+    try:
+        proposal = Proposal.objects.get(id=pk)
+    except Proposal.DoesNotExist:
+        return Response({"error": "Proposal not found"}, status=404)
+
+    proposal.delete()
+    return Response({"message": "Deleted successfully"}, status=200)
 
 

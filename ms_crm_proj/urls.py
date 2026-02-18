@@ -16,13 +16,20 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.urls import path, include
+from rest_framework_simplejwt.views import (
+    TokenObtainPairView,
+    TokenRefreshView,
+)
+
 
 urlpatterns = [
-    path('admin/', admin.site.urls),
+    path("admin/", admin.site.urls),
 
-    # Business system
-    path('core_api/', include('core.urls')),
+    # ✅ SIMPLE JWT DEFAULT
+    path("api/token/", TokenObtainPairView.as_view(), name="token_obtain_pair"),
+    path("api/token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
 
-    # Auth system
-    path('api/', include('ms_crm_app.urls')),
+    # CORE API
+    path("core_api/", include("core.urls")),
 ]
+

@@ -8,6 +8,10 @@ from django.contrib.auth.models import User
 from .models import Business
 from django.db import connection
 
+from django.contrib import admin
+from .models import Proposal
+
+
 import MySQLdb
 
 
@@ -192,3 +196,5 @@ class RoleAdmin(admin.ModelAdmin):
     list_display = ("id", "name", "is_approved", "created_at")
     list_filter = ("is_approved",)
     search_fields = ("name",)
+
+admin.site.register(Proposal)
