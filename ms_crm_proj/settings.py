@@ -39,6 +39,7 @@ INSTALLED_APPS = [
     'corsheaders',
     'rest_framework',
     'rest_framework.authtoken',
+    'rest_framework_simplejwt',
     'core',
     'ms_crm_app',
 ]
@@ -91,6 +92,7 @@ DATABASES = {
         'PORT': '3306',
     }
 }
+
 
 
 # Password validation
