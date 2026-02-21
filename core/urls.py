@@ -1,4 +1,5 @@
-from django.urls import path
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
 from .views import (
     proposal_detail,
     register_business,
@@ -9,9 +10,13 @@ from .views import (
     create_proposal,
     assign_proposal,
     users_list,
-    # delete_proposal,
+    ExpenseViewSet,  # ✅ NEW
 )
 from .views import SmallStatsView
+
+# ✅ Router for Expense API
+router = DefaultRouter()
+router.register(r'expenses', ExpenseViewSet, basename="expenses")
 
 urlpatterns = [
     # Auth / Business
@@ -24,15 +29,17 @@ urlpatterns = [
     path("Roles/approve/<int:pk>/", approve_role),
 
     # Proposals
-    path("proposals/", create_proposal),                 
-    path("proposals/<int:pk>/assign/", assign_proposal), 
+    path("proposals/", create_proposal),
+    path("proposals/<int:pk>/assign/", assign_proposal),
     path("report/sales/", sales_proposals),
 
-    # ✅ DETAIL + UPDATE
+    # Detail + Update
     path("proposals/<int:pk>/", proposal_detail),
 
-    path('dashboard/small-stats/', SmallStatsView.as_view(), name='small-stats'),
+    path("dashboard/small-stats/", SmallStatsView.as_view(), name="small-stats"),
 
     path("users/", users_list),
 
+    # ✅ Expenses API
+    path("", include(router.urls)),
 ]

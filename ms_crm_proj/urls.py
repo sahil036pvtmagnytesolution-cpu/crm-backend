@@ -31,5 +31,6 @@ urlpatterns = [
 
     # CORE API
     path("core_api/", include("core.urls")),
+
 ]
 

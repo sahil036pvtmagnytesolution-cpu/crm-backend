@@ -4,6 +4,8 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from django.contrib.auth.models import User
 from core.models import Proposal
 from .models import Proposal
+from .models import Expense
+
 
 # ================= BUSINESS =================
 class BusinessSerializer(serializers.ModelSerializer):
@@ -125,3 +127,9 @@ class EmailTokenObtainPairSerializer(TokenObtainPairSerializer):
             "password": password,
         })
         return data
+
+
+class ExpenseSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Expense
+        fields = "__all__"

@@ -159,3 +159,23 @@ class Proposal(models.Model):
 
     def __str__(self):
         return self.subject
+
+
+
+class Expense(models.Model):
+    CATEGORY_CHOICES = [
+        ("Travel", "Travel"),
+        ("Food", "Food"),
+        ("Office", "Office"),
+    ]
+
+    name = models.CharField(max_length=255)
+    category = models.CharField(max_length=100, choices=CATEGORY_CHOICES)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    date = models.DateField()
+    customer = models.CharField(max_length=255, blank=True, null=True)
+    payment_mode = models.CharField(max_length=100, blank=True, null=True)
+    status = models.CharField(max_length=50, default="Not Invoiced")
+
+    def __str__(self):
+        return self.name

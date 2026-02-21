@@ -17,6 +17,10 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 
+from rest_framework.viewsets import ModelViewSet
+from .models import Expense
+from .serializers import ExpenseSerializer
+
 class SmallStatsView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -36,6 +40,10 @@ def run_async(func, *args):
     t.daemon = True
     t.start()
 
+
+class ExpenseViewSet(ModelViewSet):
+    queryset = Expense.objects.all().order_by('-id')
+    serializer_class = ExpenseSerializer
 
 # =========================
 # REGISTER BUSINESS
@@ -248,3 +256,4 @@ def users_list(request):
     users = User.objects.all()[:5]   # ✅ only 5 users
     data = [{"id": u.id, "name": u.username} for u in users]
     return Response(data)
+
