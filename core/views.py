@@ -3,6 +3,12 @@ from django.contrib.auth.hashers import check_password
 from django.db import transaction
 import threading
 
+from django.core.mail import send_mail
+from django.conf import settings
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework import status
+
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -20,6 +26,58 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.viewsets import ModelViewSet
 from .models import Expense
 from .serializers import ExpenseSerializer
+
+from django.contrib import admin
+from .models import Expense
+
+from rest_framework import viewsets
+from .models import Lead
+from .serializers import LeadSerializer
+
+from .models import Client
+from .serializers import ClientSerializer
+
+from rest_framework import viewsets, status
+from .models import Client
+from .serializers import ClientSerializer
+from rest_framework.permissions import AllowAny
+
+from rest_framework import generics
+from rest_framework.response import Response
+from rest_framework import status
+from .models import Estimate
+from .serializers import EstimateSerializer
+
+from .models import CalendarEvent
+from .serializers import CalendarEventSerializer
+
+from .models import Proposal
+from .serializers import ProposalSerializer
+
+class ProposalViewSet(ModelViewSet):
+    queryset = Proposal.objects.all()
+    serializer_class = ProposalSerializer
+
+class EstimateViewSet(ModelViewSet):
+    queryset = Estimate.objects.all()
+    serializer_class = EstimateSerializer
+
+class CalendarEventViewSet(ModelViewSet):
+    queryset = CalendarEvent.objects.all()
+    serializer_class = CalendarEventSerializer
+
+class EstimateListCreateView(generics.ListCreateAPIView):
+    queryset = Estimate.objects.all()
+    serializer_class = EstimateSerializer
+
+class ClientViewSet(viewsets.ModelViewSet):
+    queryset = Client.objects.all()
+    serializer_class = ClientSerializer
+    permission_classes = [AllowAny]
+
+class LeadViewSet(viewsets.ModelViewSet):
+    queryset = Lead.objects.all().order_by("-id")
+    serializer_class = LeadSerializer
 
 class SmallStatsView(APIView):
     permission_classes = [IsAuthenticated]
@@ -257,3 +315,105 @@ def users_list(request):
     data = [{"id": u.id, "name": u.username} for u in users]
     return Response(data)
 
+
+# ==============================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def dashboard_overview(request):
+    total_proposals = Proposal.objects.count()
+    total_users = User.objects.count()
+
+    return Response({
+        "total_proposals": total_proposals,
+        "total_users": total_users,
+    })
+
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def small_stats(request):
+    data = [
+        {"title": "Total Sales", "val": "₹0", "pct": 0, "color": "#28a745"},
+        {"title": "Total Leads", "val": "0", "pct": 0, "color": "#17a2b8"},
+        {"title": "Projects", "val": "0", "pct": 0, "color": "#ffc107"},
+        {"title": "Tasks", "val": "0", "pct": 0, "color": "#dc3545"},
+    ]
+    return Response(data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def dashboard_overview(request):
+    return Response([])
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def leads_overview(request):
+    return Response({
+        "labels": ["New", "Contacted", "Qualified"],
+        "data": [5, 3, 2],
+        "colors": ["#007bff", "#28a745", "#ffc107"]
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def project_status(request):
+    return Response({
+        "labels": ["Pending", "Completed"],
+        "data": [4, 6],
+        "colors": ["#dc3545", "#28a745"]
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def weekly_payments(request):
+    return Response({
+        "labels": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+        "datasets": [
+            {
+                "label": "Payments",
+                "data": [0, 0, 0, 0, 0]
+            }
+        ]
+    })
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def dashboard_activity(request):
+    return Response([
+        {
+            "time": "10:30 AM",
+            "text": "New proposal created",
+            "project": "Website Development",
+            "status": "New",
+        },
+        {
+            "time": "12:15 PM",
+            "text": "Lead converted",
+            "project": "CRM System",
+            "status": "Completed",
+        },
+    ])
+
+# =========================Customer API=========================
+class ClientViewSet(viewsets.ModelViewSet):
+    queryset = Client.objects.all()
+    serializer_class = ClientSerializer
+    permission_classes = [AllowAny]
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+
+        if not serializer.is_valid():
+            print("❌ SERIALIZER ERROR:", serializer.errors)  # 👈 Important
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        self.perform_create(serializer)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+    
+# =========================Email SetView=========================
+    

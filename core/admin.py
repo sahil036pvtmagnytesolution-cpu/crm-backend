@@ -11,6 +11,11 @@ from django.db import connection
 from django.contrib import admin
 from .models import Proposal
 
+from django.contrib import admin
+from .models import Expense
+
+from django.contrib import admin
+from .models import Lead
 
 import MySQLdb
 
@@ -198,3 +203,33 @@ class RoleAdmin(admin.ModelAdmin):
     search_fields = ("name",)
 
 admin.site.register(Proposal)
+
+
+
+@admin.register(Expense)
+class ExpenseAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "name",
+        "category",
+        "amount",
+        "date",
+        "customer",
+        "payment_mode",
+        "status",
+    )
+
+    search_fields = ("name", "category", "customer")
+    list_filter = ("category", "status", "payment_mode")
+
+    ordering = ("-id",)
+
+# ==============================
+# LEAD ADMIN
+# ==============================
+@admin.register(Lead)
+class LeadAdmin(admin.ModelAdmin):
+    list_display = ("name", "email", "phone", "status", "created_at")
+    list_filter = ("status", "source")
+    search_fields = ("name", "email", "phone")
+    ordering = ("-created_at",)

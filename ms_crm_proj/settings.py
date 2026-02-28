@@ -141,8 +141,8 @@ EMAIL_HOST = 'smtp.gmail.com'
 EMAIL_PORT = 587
 EMAIL_USE_TLS = True
 
-EMAIL_HOST_USER = 'biken.magnytesolution@gmail.com'  
-EMAIL_HOST_PASSWORD = 'ekyk nakx vfhl dnwp'
+EMAIL_HOST_USER = 'ts0279190@gmail.com'  
+EMAIL_HOST_PASSWORD = 'hyfr kswo qfgf penq'
 
 DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
 SUPERADMIN_EMAIL = 'magnytesolution@gmail.com'

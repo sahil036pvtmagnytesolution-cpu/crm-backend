@@ -5,7 +5,33 @@ from django.contrib.auth.models import User
 from core.models import Proposal
 from .models import Proposal
 from .models import Expense
+from .models import Lead
+from .models import Client
+from .models import Estimate
+from .models import CalendarEvent
 
+#================== CalenderEvent ============
+class CalendarEventSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CalendarEvent
+        fields = "__all__"
+
+# ================= Customer =================
+class ClientSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Client
+        fields = "__all__"
+
+# ================= Estimate =================
+class EstimateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Estimate
+        fields = "__all__"
+#==================Leads===================
+class LeadSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Lead
+        fields = "__all__"
 
 # ================= BUSINESS =================
 class BusinessSerializer(serializers.ModelSerializer):

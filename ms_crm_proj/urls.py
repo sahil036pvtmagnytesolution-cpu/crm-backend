@@ -21,16 +21,15 @@ from rest_framework_simplejwt.views import (
     TokenRefreshView,
 )
 
-
 urlpatterns = [
     path("admin/", admin.site.urls),
 
-    # ✅ SIMPLE JWT DEFAULT
+    # JWT
     path("api/token/", TokenObtainPairView.as_view(), name="token_obtain_pair"),
     path("api/token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
 
-    # CORE API
+    # ✅ ONLY ONE API PREFIX
+    path("api/manage_data/", include("core.urls")),
     path("core_api/", include("core.urls")),
-
 ]
 
