@@ -25,6 +25,8 @@ from .views import (
 )
 from .views import ClientViewSet
 
+from .views import ProposalViewSet, ApprovedUsersView
+
 router = DefaultRouter()
 
 # ✅ Expenses
@@ -80,7 +82,7 @@ urlpatterns = [
 
     # Estimate, Invoice, Payments (Placeholders)
     path("Estimates/", EstimateListCreateView.as_view()),
-    # path("invoices/", InvoiceListCreateView.as_view(), name="invoices"),
-    # path("payments/", PaymentListCreateView.as_view(), name="payments"),
+    
+    path("approved-users/", ApprovedUsersView.as_view()),
     
 ]

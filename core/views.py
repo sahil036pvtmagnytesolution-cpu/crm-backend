@@ -1,3 +1,5 @@
+import email
+
 from django.contrib.auth.models import User
 from django.contrib.auth.hashers import check_password
 from django.db import transaction
@@ -54,9 +56,99 @@ from .serializers import CalendarEventSerializer
 from .models import Proposal
 from .serializers import ProposalSerializer
 
+from rest_framework.views import APIView
+from django.contrib.auth import get_user_model
+from rest_framework.response import Response
+
+from django.core.mail import EmailMultiAlternatives
+from django.utils.html import strip_tags
+from django.utils.encoding import force_bytes
+from django.core.mail import EmailMessage
+from django.contrib.staticfiles import finders
+from django.core.files.base import ContentFile
+from django.core.mail import get_connection
+from email.mime.image import MIMEImage
+import os
+
+class ApprovedUsersView(APIView):
+
+    def get(self, request):
+        User = get_user_model()
+
+        users = User.objects.filter(is_active=True)
+
+        data = [
+            {
+                "id": u.id,
+                "name": u.first_name or u.username,
+                "email": u.email,
+            }
+            for u in users
+        ]
+
+        return Response(data)
+
 class ProposalViewSet(ModelViewSet):
     queryset = Proposal.objects.all()
     serializer_class = ProposalSerializer
+     # ================= ASSIGN + EMAIL =================
+    @action(detail=True, methods=['post'])
+    def assign(self, request, pk=None):
+
+        print("ASSIGN API HIT")
+
+        proposal = self.get_object()
+        user_id = request.data.get("user_id")
+
+        if not user_id:
+            proposal.assigned_to = None
+            proposal.save()
+            return Response({"message": "Unassigned successfully"})
+
+        try:
+            User = get_user_model()
+            user = User.objects.get(id=user_id)
+
+            proposal.assigned_to = user
+            proposal.save()
+
+            print("SENDING MAIL TO:", user.email)  # 👈 Debug print
+
+            # ===== SEND EMAIL =====
+            subject = f"New Proposal Assigned - #{proposal.id}"
+
+            message = f"""
+Hello {user.first_name or user.username},
+
+You have been assigned a new proposal.
+
+Proposal ID: {proposal.id}
+Subject: {proposal.subject}
+Total: ₹{proposal.total}
+
+Please login to CRM to review it.
+
+Regards,
+CRM Team
+            """
+
+            send_mail(
+                subject,
+                message,
+                settings.DEFAULT_FROM_EMAIL,
+                [user.email],
+                fail_silently=False,
+            )
+
+            return Response(
+                {"message": "Assigned & Email Sent Successfully"}
+            )
+
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
 class EstimateViewSet(ModelViewSet):
     queryset = Estimate.objects.all()
@@ -258,15 +350,102 @@ def assign_proposal(request, pk):
 
     if user_id is None:
         proposal.assigned_to = None
-    else:
-        try:
-            user = User.objects.get(pk=user_id)
-            proposal.assigned_to = user
-        except User.DoesNotExist:
-            return Response({"error": "User not found"}, status=404)
+        proposal.save()
+        return Response({"message": "Unassigned successfully"})
 
-    proposal.save()
-    return Response({"message": "Assigned successfully"})
+    try:
+        user = User.objects.get(pk=user_id)
+        proposal.assigned_to = user
+        proposal.save()
+
+        # ✅ Correct proposal page link
+        frontend_url = f"http://localhost:3000/sales/proposals/{proposal.id}"
+
+        subject = f"New Proposal Assigned - #{proposal.id}"
+
+        html_content = f"""
+        <div style="font-family: Arial, sans-serif; background:#f4f6f9; padding:20px;">
+            <div style="max-width:600px; margin:auto; background:#ffffff; border-radius:8px; overflow:hidden; box-shadow:0 4px 12px rgba(0,0,0,0.1);">
+
+                <div style="background:#2c3e50; padding:20px; text-align:center;">
+                    <img src="cid:companylogo" style="max-height:60px;"><br>
+                    <h2 style="color:#ffffff; margin:10px 0 0;">New Proposal Assigned</h2>
+                </div>
+
+                <div style="padding:20px;">
+                    <p>Hello <strong>{user.first_name or user.username}</strong>,</p>
+                    <p>You have been assigned a new proposal. Details are below:</p>
+
+                    <table style="width:100%; border-collapse: collapse; margin-top:15px;">
+                        <tr>
+                            <td style="padding:8px; border:1px solid #ddd;"><strong>Proposal ID</strong></td>
+                            <td style="padding:8px; border:1px solid #ddd;">#{proposal.id}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding:8px; border:1px solid #ddd;"><strong>Subject</strong></td>
+                            <td style="padding:8px; border:1px solid #ddd;">{getattr(proposal, 'subject', 'N/A')}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding:8px; border:1px solid #ddd;"><strong>Total</strong></td>
+                            <td style="padding:8px; border:1px solid #ddd;">₹{getattr(proposal, 'total', '0')}</td>
+                        </tr>
+                    </table>
+
+                    <div style="text-align:center; margin-top:25px;">
+                        <a href="{frontend_url}" 
+                           style="background:#27ae60; color:#ffffff; padding:12px 25px; text-decoration:none; border-radius:5px; display:inline-block;">
+                           View Proposal
+                        </a>
+                    </div>
+
+                    <p style="margin-top:30px;">Regards,<br><strong>Magnyte Solution CRM Team</strong></p>
+                </div>
+            </div>
+        </div>
+        """
+
+        text_content = strip_tags(html_content)
+
+        email = EmailMultiAlternatives(
+            subject,
+            text_content,
+            settings.DEFAULT_FROM_EMAIL,
+            [user.email],
+        )
+
+        email.attach_alternative(html_content, "text/html")
+
+        # ✅ Correct logo path
+        logo_path = os.path.join(
+            settings.BASE_DIR.parent,
+            "crm-frontend",
+            "public",
+            "ms.png"
+        )
+
+        if os.path.exists(logo_path):
+            with open(logo_path, "rb") as f:
+                logo = MIMEImage(f.read())
+                logo.add_header("Content-ID", "<companylogo>")
+                logo.add_header("Content-Disposition", "inline", filename="ms.png")
+                email.attach(logo)
+            print("Logo attached successfully")
+        else:
+            print("Logo file not found at:", logo_path)
+
+        # ✅ IMPORTANT: Send email
+        email.send()
+
+        print("HTML EMAIL SENT TO:", user.email)
+
+        return Response({"message": "Assigned & Professional Email Sent"})
+
+    except User.DoesNotExist:
+        return Response({"error": "User not found"}, status=404)
+
+    except Exception as e:
+        print("EMAIL ERROR:", str(e))
+        return Response({"error": str(e)}, status=400)
 
 
 # =========================
