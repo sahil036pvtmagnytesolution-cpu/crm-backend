@@ -1,6 +1,5 @@
 from django.db import models
 from django.contrib.auth.models import User
-from django.db import models
 
 class Business(models.Model):
     """
@@ -265,3 +264,22 @@ class CalendarEvent(models.Model):
 
     def __str__(self):
         return self.title
+    
+# ========================= EmailCampaign Model =========================
+class EmailCampaign(models.Model):
+    subject = models.CharField(max_length=255)
+    message = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.subject
+
+
+class EmailRecipient(models.Model):
+    campaign = models.ForeignKey(EmailCampaign, on_delete=models.CASCADE, related_name="recipients")
+    email = models.EmailField()
+    is_sent = models.BooleanField(default=False)
+    sent_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return self.email

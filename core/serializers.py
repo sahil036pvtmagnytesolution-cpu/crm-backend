@@ -9,6 +9,8 @@ from .models import Lead
 from .models import Client
 from .models import Estimate
 from .models import CalendarEvent
+from .models import EmailCampaign, EmailRecipient
+
 
 #================== CalenderEvent ============
 class CalendarEventSerializer(serializers.ModelSerializer):
@@ -158,4 +160,17 @@ class EmailTokenObtainPairSerializer(TokenObtainPairSerializer):
 class ExpenseSerializer(serializers.ModelSerializer):
     class Meta:
         model = Expense
+        fields = "__all__"
+
+# ================== THIS IS EMAILCAMPAIGN CODE ==================
+class EmailRecipientSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EmailRecipient
+        fields = "__all__"
+
+class EmailCampaignSerializer(serializers.ModelSerializer):
+    recipients = EmailRecipientSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = EmailCampaign
         fields = "__all__"

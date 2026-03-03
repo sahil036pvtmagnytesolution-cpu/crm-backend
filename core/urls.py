@@ -22,6 +22,8 @@ from .views import (
     EstimateListCreateView,
     EstimateViewSet,
     ProposalViewSet,
+    upload_and_send_emails,
+    send_single_email,
 )
 from .views import ClientViewSet
 
@@ -84,5 +86,11 @@ urlpatterns = [
     path("Estimates/", EstimateListCreateView.as_view()),
     
     path("approved-users/", ApprovedUsersView.as_view()),
+
+    # Email Campaigns (Placeholders)
+    path("email-campaign/", upload_and_send_emails),
+    
+    # Single Email
+    path("send-single-email/", send_single_email),
     
 ]

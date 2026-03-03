@@ -69,6 +69,9 @@ from django.core.files.base import ContentFile
 from django.core.mail import get_connection
 from email.mime.image import MIMEImage
 import os
+import pandas as pd
+from django.utils import timezone
+from .models import EmailCampaign, EmailRecipient
 
 class ApprovedUsersView(APIView):
 
@@ -594,5 +597,103 @@ class ClientViewSet(viewsets.ModelViewSet):
         self.perform_create(serializer)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
     
-# =========================Email SetView=========================
-    
+# ========================= EmailCampaign =========================
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def upload_and_send_emails(request):
+
+    subject = request.data.get("subject")
+    message = request.data.get("message")
+    excel_file = request.FILES.get("file")
+
+    if not subject or not message:
+        return Response({"error": "Subject and message required"}, status=400)
+
+    if not excel_file:
+        return Response({"error": "Excel file required"}, status=400)
+
+    try:
+        df = pd.read_excel(excel_file)
+    except Exception as e:
+        return Response({"error": "Invalid Excel file"}, status=400)
+
+    # ✅ Detect column automatically (email / Email)
+    if "email" in df.columns:
+        email_column = "email"
+    elif "Email" in df.columns:
+        email_column = "Email"
+    else:
+        return Response({"error": "Excel must contain 'email' column"}, status=400)
+
+    campaign = EmailCampaign.objects.create(
+        subject=subject,
+        message=message
+    )
+
+    sent_list = []
+    failed_list = []
+
+    for email in df[email_column]:
+
+        recipient = EmailRecipient.objects.create(
+            campaign=campaign,
+            email=email
+        )
+
+        try:
+            send_mail(
+                subject,
+                message,
+                settings.DEFAULT_FROM_EMAIL,
+                [email],
+                fail_silently=False,
+            )
+
+            recipient.is_sent = True
+            recipient.sent_at = timezone.now()
+            recipient.save()
+
+            sent_list.append(email)
+
+        except Exception as e:
+            print("Email failed:", e)
+            failed_list.append(email)
+
+    return Response({
+        "message": "Processed Successfully",
+        "sent_emails": sent_list,
+        "failed_emails": failed_list
+    }, status=200)   
+
+# ========================= SINGLE EMAIL SEND =========================
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def send_single_email(request):
+
+    email = request.data.get("email")
+    subject = request.data.get("subject")
+    message = request.data.get("message")
+
+    if not email or not subject or not message:
+        return Response({"error": "All fields required"}, status=400)
+
+    try:
+        send_mail(
+            subject,
+            message,
+            settings.DEFAULT_FROM_EMAIL,
+            [email],
+            fail_silently=False,
+        )
+
+        return Response({
+            "status": "success",
+            "email": email
+        })
+
+    except Exception as e:
+        return Response({
+            "status": "failed",
+            "email": email,
+            "error": str(e)
+        }, status=400)
