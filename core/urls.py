@@ -26,8 +26,8 @@ from .views import (
     send_single_email,
 )
 from .views import ClientViewSet
-
 from .views import ProposalViewSet, ApprovedUsersView
+from . import views
 
 router = DefaultRouter()
 
@@ -76,7 +76,6 @@ urlpatterns = [
 
     # Dashboard Overview
     path("dashboard/overview/", dashboard_overview),
-
     path("dashboard/leads-overview/", leads_overview),
     path("dashboard/project-status/", project_status),
     path("dashboard/weekly-payments/", weekly_payments),
@@ -92,5 +91,19 @@ urlpatterns = [
     
     # Single Email
     path("send-single-email/", send_single_email),
-    
+
+    # Invoice
+    path("invoices/", views.invoice_list, name="invoice-list"),
+    path("invoices/<int:pk>/", views.invoice_detail, name="invoice-detail"),
+
+    # Reminders
+    path("invoices/<int:pk>/reminders/", views.invoice_reminders),
+    path("invoices/<int:pk>/tasks/", views.invoice_tasks),
+
+    #send invoice email
+    path("send-invoice-email/", views.send_invoice_email),
+
+    path("invoices/<int:pk>/email-history/", views.invoice_email_history
+)
+
 ]

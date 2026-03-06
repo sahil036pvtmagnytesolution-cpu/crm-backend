@@ -10,8 +10,37 @@ from .models import Client
 from .models import Estimate
 from .models import CalendarEvent
 from .models import EmailCampaign, EmailRecipient
+from .models import Invoice
+from .models import InvoiceReminder
+from .models import InvoiceTask
+from rest_framework import serializers
+from .models import Invoice, InvoiceReminder, InvoiceTask, InvoiceEmailLog
+
+# ======================= InvoiceEmail ======================
+class InvoiceEmailLogSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = InvoiceEmailLog
+        fields = "__all__"
+
+# ======================= Invoice Reminders =================
+class InvoiceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Invoice
+        fields = "__all__"
 
 
+class InvoiceReminderSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = InvoiceReminder
+        fields = "__all__"
+
+
+class InvoiceTaskSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = InvoiceTask
+        fields = "__all__"
+        
 #================== CalenderEvent ============
 class CalendarEventSerializer(serializers.ModelSerializer):
     class Meta:

@@ -72,6 +72,15 @@ import os
 import pandas as pd
 from django.utils import timezone
 from .models import EmailCampaign, EmailRecipient
+from .models import Invoice
+from .serializers import InvoiceSerializer
+from .models import InvoiceTask, InvoiceReminder
+from .serializers import ( InvoiceSerializer, InvoiceReminderSerializer, InvoiceTaskSerializer )
+from django.core.mail import EmailMessage
+from .models import InvoiceEmailLog
+from .serializers import InvoiceEmailLogSerializer
+from .models import Invoice, InvoiceEmailLog
+from rest_framework.permissions import AllowAny
 
 class ApprovedUsersView(APIView):
 
@@ -154,8 +163,57 @@ CRM Team
             )
 
 class EstimateViewSet(ModelViewSet):
+
     queryset = Estimate.objects.all()
     serializer_class = EstimateSerializer
+
+    # ================= CREATE =================
+    def perform_create(self, serializer):
+
+        estimate = serializer.save()
+
+        self.create_invoice(estimate)
+
+    # ================= UPDATE =================
+    def perform_update(self, serializer):
+
+        estimate = serializer.save()
+
+        self.create_invoice(estimate)
+
+    # ================= CREATE INVOICE =================
+    def create_invoice(self, estimate):
+
+        if estimate.status.lower() != "accepted":
+            return
+
+        # check invoice already exists
+        if Invoice.objects.filter(
+            invoice_number=f"INV-{estimate.estimate_number}"
+        ).exists():
+            return
+
+        # find client
+        client = Client.objects.filter(
+            company=estimate.customer
+        ).first()
+
+        if not client:
+            print("⚠ Client not found for estimate")
+            return
+
+        Invoice.objects.create(
+            invoice_number=f"INV-{estimate.estimate_number}",
+            customer=client,
+            invoice_date=estimate.date.date(),
+            due_date=estimate.expiry_date.date(),
+            subtotal=estimate.amount,
+            tax_amount=estimate.total_tax,
+            total_amount=estimate.amount + estimate.total_tax,
+            status="Unpaid"
+        )
+
+        print("✅ Invoice created from estimate:", estimate.estimate_number)
 
 class CalendarEventViewSet(ModelViewSet):
     queryset = CalendarEvent.objects.all()
@@ -697,3 +755,211 @@ def send_single_email(request):
             "email": email,
             "error": str(e)
         }, status=400)
+    
+# ========================= Invoice Model =========================
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def invoice_list(request):
+
+    if request.method == "GET":
+
+        invoices = Invoice.objects.all().order_by("-id")
+        serializer = InvoiceSerializer(invoices, many=True)
+
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    if request.method == "POST":
+
+        data = request.data.copy()
+
+        serializer = InvoiceSerializer(data=data)
+
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=201)
+
+        print(serializer.errors)
+
+        return Response(serializer.errors, status=400)
+
+# ====================== Invoice Detail ===============================
+@api_view(["GET", "PUT", "DELETE"])
+@permission_classes([IsAuthenticated])
+def invoice_detail(request, pk):
+
+    try:
+        invoice = Invoice.objects.get(pk=pk)
+    except Invoice.DoesNotExist:
+        return Response({"error": "Invoice not found"}, status=404)
+
+    # GET single invoice
+    if request.method == "GET":
+        serializer = InvoiceSerializer(invoice)
+        return Response(serializer.data)
+
+    # UPDATE invoice
+    if request.method == "PUT":
+        serializer = InvoiceSerializer(invoice, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data)
+        return Response(serializer.errors, status=400)
+
+    # DELETE invoice
+    if request.method == "DELETE":
+        invoice.delete()
+        return Response({"message": "Invoice deleted successfully"}, status=204)
+    
+# ====================== Invoice Reminders ======================
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def invoice_reminders(request, pk):
+
+    if request.method == "GET":
+
+        reminders = InvoiceReminder.objects.filter(invoice_id=pk)
+
+        serializer = InvoiceReminderSerializer(reminders, many=True)
+
+        return Response(serializer.data)
+
+
+    if request.method == "POST":
+
+        data = request.data.copy()
+
+        data["invoice"] = pk
+
+        serializer = InvoiceReminderSerializer(data=data)
+
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=201)
+
+        return Response(serializer.errors, status=400)
+
+
+
+# ====================== Invoice Tasks ======================
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def invoice_tasks(request, pk):
+
+    if request.method == "GET":
+
+        tasks = InvoiceTask.objects.filter(invoice_id=pk)
+
+        serializer = InvoiceTaskSerializer(tasks, many=True)
+
+        return Response(serializer.data)
+
+
+    if request.method == "POST":
+
+        data = request.data.copy()
+
+        data["invoice"] = pk
+
+        serializer = InvoiceTaskSerializer(data=data)
+
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=201)
+
+        return Response(serializer.errors, status=400)
+
+# ====================== send invoice email ====================================
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def send_invoice_email(request):
+
+    invoice_id = request.data.get("invoice_id")
+    email = request.data.get("email")
+    message = request.data.get("message")
+
+    if not invoice_id or not email:
+        return Response(
+            {"error": "invoice_id and email required"},
+            status=400
+        )
+
+    try:
+
+        invoice = Invoice.objects.get(id=invoice_id)
+
+        subject = f"Invoice #{invoice.invoice_number}"
+
+        # SEND EMAIL
+        send_mail(
+            subject,
+            message,
+            settings.DEFAULT_FROM_EMAIL,
+            [email],
+            fail_silently=False,
+        )
+
+        # SAVE HISTORY
+        log = InvoiceEmailLog.objects.create(
+            invoice=invoice,
+            email=email,
+            message=message
+        )
+
+        print("EMAIL LOG SAVED:", log.id)
+
+        return Response({
+            "success": True,
+            "message": "Email sent and logged"
+        })
+
+    except Exception as e:
+
+        print("EMAIL ERROR:", str(e))
+
+        return Response({"error": str(e)}, status=400)
+
+# ======================= Invoice Email History =======================
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def invoice_email_history(request, pk):
+
+    logs = InvoiceEmailLog.objects.filter(invoice_id=pk).order_by("-id")
+
+    serializer = InvoiceEmailLogSerializer(logs, many=True)
+
+    return Response(serializer.data)
+
+# ====================== Estimate (Invoice Convert API) ========================
+# @api_view(["POST"])
+# @permission_classes([IsAuthenticated])
+# def convert_estimate_to_invoice(request, estimate_id):
+
+#     try:
+#         estimate = Estimate.objects.get(id=estimate_id)
+
+#         # already converted check
+#         if Invoice.objects.filter(invoice_number=estimate.estimate_number).exists():
+#             return Response(
+#                 {"error": "Invoice already created"},
+#                 status=400
+#             )
+
+#         invoice = Invoice.objects.create(
+#             invoice_number=f"INV-{estimate.id}",
+#             customer=Client.objects.first(),   # temporary mapping
+#             invoice_date=estimate.date,
+#             due_date=estimate.expiry_date,
+#             subtotal=estimate.amount,
+#             tax_amount=estimate.total_tax,
+#             total_amount=estimate.amount + estimate.total_tax,
+#             status="Unpaid"
+#         )
+
+#         return Response({
+#             "message": "Invoice created",
+#             "invoice_id": invoice.id
+#         })
+
+#     except Estimate.DoesNotExist:
+#         return Response({"error": "Estimate not found"}, status=404)
+

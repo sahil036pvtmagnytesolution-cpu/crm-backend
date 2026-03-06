@@ -1,5 +1,7 @@
 from django.db import models
 from django.contrib.auth.models import User
+from django.utils import timezone
+from datetime import date
 
 class Business(models.Model):
     """
@@ -280,6 +282,77 @@ class EmailRecipient(models.Model):
     email = models.EmailField()
     is_sent = models.BooleanField(default=False)
     sent_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return self.email
+
+class Invoice(models.Model):
+    invoice_number = models.CharField(max_length=50)
+
+    customer = models.ForeignKey(Client, on_delete=models.CASCADE)
+
+    invoice_date = models.DateField(default=date.today)
+    due_date = models.DateField(default=date.today)
+
+    subtotal = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    tax_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    total_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+
+    status = models.CharField(
+        max_length=20,
+        choices=[
+            ("Draft","Draft"),
+            ("Unpaid","Unpaid"),
+            ("Paid","Paid"),
+            ("Overdue","Overdue"),
+        ],
+        default="Draft"
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.invoice_number
+
+# ===================== Invoice Tasks panel =================
+class InvoiceReminder(models.Model):
+
+    invoice = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name="reminders")
+
+    description = models.TextField()
+
+    date = models.DateTimeField()
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Reminder for {self.invoice.invoice_number}"
+
+
+class InvoiceTask(models.Model):
+
+    invoice = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name="tasks")
+
+    description = models.TextField()
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Task for {self.invoice.invoice_number}"
+
+class InvoiceEmailLog(models.Model):
+
+    invoice = models.ForeignKey(
+        "Invoice",
+        on_delete=models.CASCADE,
+        related_name="email_logs"
+    )
+
+    email = models.EmailField()
+
+    message = models.TextField()
+
+    sent_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
         return self.email
