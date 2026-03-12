@@ -16,6 +16,7 @@ from .models import Expense
 
 from django.contrib import admin
 from .models import Lead
+from .models import Invoice, InvoicePayment
 
 import MySQLdb
 
@@ -233,3 +234,29 @@ class LeadAdmin(admin.ModelAdmin):
     list_filter = ("status", "source")
     search_fields = ("name", "email", "phone")
     ordering = ("-created_at",)
+
+# ==============================
+# Invoice payment
+# ==============================
+@admin.register(Invoice)
+class InvoiceAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "invoice_number",
+        "customer",
+        "total_amount",
+        "status",
+        "invoice_date",
+        "due_date",
+    )
+
+
+@admin.register(InvoicePayment)
+class InvoicePaymentAdmin(admin.ModelAdmin):
+    list_display = ("id", "invoice", "payment_mode", "transaction_id", "amount")
+
+    search_fields = ("transaction_id",)
+
+search_fields = ("invoice_number", "customer__company")
+
+list_filter = ("status", "invoice_date")

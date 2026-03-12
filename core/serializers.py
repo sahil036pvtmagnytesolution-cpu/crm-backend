@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Business, Role, Proposal
+from .models import Business, Customer, Role, Proposal
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from django.contrib.auth.models import User
 from core.models import Proposal
@@ -14,7 +14,26 @@ from .models import Invoice
 from .models import InvoiceReminder
 from .models import InvoiceTask
 from rest_framework import serializers
-from .models import Invoice, InvoiceReminder, InvoiceTask, InvoiceEmailLog
+from .models import Invoice, InvoiceReminder, InvoiceTask, InvoiceEmailLog, InvoicePayment
+
+# ======================= Customer ==========================
+class CustomerSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Customer
+        fields = "__all__"
+# ======================= Payment Invoice ===================
+class InvoicePaymentSerializer(serializers.ModelSerializer):
+
+    customer = serializers.SerializerMethodField()
+
+    class Meta:
+        model = InvoicePayment
+        fields = "__all__"
+
+    def get_customer(self, obj):
+        if obj.invoice and obj.invoice.customer:
+            return obj.invoice.customer.company
+        return "-"
 
 # ======================= InvoiceEmail ======================
 class InvoiceEmailLogSerializer(serializers.ModelSerializer):
@@ -25,10 +44,10 @@ class InvoiceEmailLogSerializer(serializers.ModelSerializer):
 
 # ======================= Invoice Reminders =================
 class InvoiceSerializer(serializers.ModelSerializer):
+    payments = InvoicePaymentSerializer(many=True, read_only=True)
     class Meta:
         model = Invoice
         fields = "__all__"
-
 
 class InvoiceReminderSerializer(serializers.ModelSerializer):
     class Meta:
@@ -55,6 +74,7 @@ class ClientSerializer(serializers.ModelSerializer):
 
 # ================= Estimate =================
 class EstimateSerializer(serializers.ModelSerializer):
+    invoice = InvoiceSerializer(many=True, read_only=True)
     class Meta:
         model = Estimate
         fields = "__all__"
