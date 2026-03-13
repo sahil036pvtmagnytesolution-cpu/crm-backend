@@ -25,6 +25,17 @@ from .views import (
     send_single_email,
     invoice_payment_records,
     toggle_client_active,
+    contacts_list_create,
+    contacts_detail,
+    items_groups_list_create,
+    items_groups_detail,
+    items_list_create,
+    items_detail,
+    public_items_list,
+    creditnotes_list_create,
+    creditnote_detail,
+    creditnote_reminders,
+    creditnote_tasks,
 )
 from .views import ClientViewSet, ApprovedUsersView
 from . import views
@@ -55,6 +66,23 @@ urlpatterns = [
 
     # Users list for assign dropdown
     path("users/", users_list),
+
+    # Contacts
+    path("contacts/", contacts_list_create),
+    path("contacts/<int:pk>/", contacts_detail),
+
+    # Items
+    path("Items/", items_list_create),
+    path("Items/<int:pk>/", items_detail),
+    path("ItemsGroups/", items_groups_list_create),
+    path("ItemsGroups/<int:pk>/", items_groups_detail),
+    path("items-master/", public_items_list),
+
+    # Credit Notes
+    path("Creditnotes/", creditnotes_list_create),
+    path("Creditnotesave/<int:pk>/", creditnote_detail),
+    path("Creditnote/<int:pk>/reminders/", creditnote_reminders),
+    path("Creditnotes/<int:pk>/tasks/", creditnote_tasks),
 
     # Router URLs
     path("", include(router.urls)),

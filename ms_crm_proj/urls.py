@@ -20,6 +20,7 @@ from rest_framework_simplejwt.views import (
     TokenObtainPairView,
     TokenRefreshView,
 )
+from core.views import public_items_list
 
 urlpatterns = [
     path("admin/", admin.site.urls),
@@ -30,6 +31,7 @@ urlpatterns = [
 
     # ✅ ONLY ONE API PREFIX
     path("api/manage_data/", include("core.urls")),
+    path("api/items/", public_items_list),
     path("core_api/", include("core.urls")),
 ]
 

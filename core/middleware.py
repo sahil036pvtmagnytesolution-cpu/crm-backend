@@ -65,19 +65,11 @@ class TenantMiddleware:
                 else f"ms_crm_{raw_tenant}"
             )
 
-            default_db = settings.DATABASES["default"]
+            default_db = settings.DATABASES["default"].copy()
+            default_db["NAME"] = db_name
 
             # Ensure single alias only: "tenant"
-            settings.DATABASES["tenant"] = {
-                "ENGINE": default_db["ENGINE"],
-                "NAME": db_name,
-                "USER": default_db["USER"],
-                "PASSWORD": default_db["PASSWORD"],
-                "HOST": default_db.get("HOST", "localhost"),
-                "PORT": default_db.get("PORT", "3306"),
-                "OPTIONS": default_db.get("OPTIONS", {}),
-                "CONN_MAX_AGE": default_db.get("CONN_MAX_AGE", 0),
-            }
+            settings.DATABASES["tenant"] = default_db
 
             # Switch ORM routing to tenant
             set_current_db("tenant")

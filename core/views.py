@@ -17,7 +17,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import Business, Customer, Role, Proposal, StaffProfile
+from .models import Business, Customer, Item, ItemGroup, Role, Proposal, StaffProfile
 from .serializers import BusinessSerializer, RoleSerializer, ProposalSerializer
 from core.seeders.email_templates import seed_email_templates_optimized
 from rest_framework.permissions import AllowAny
@@ -83,9 +83,13 @@ from .models import Invoice, InvoiceEmailLog
 from rest_framework.permissions import AllowAny
 from .models import InvoicePayment
 from .serializers import InvoicePaymentSerializer
-from .models import Client, Estimate, Invoice
+from .models import Client, Contact, CreditNote, CreditNoteReminder, CreditNoteTask, Estimate, Invoice
 from rest_framework.authentication import SessionAuthentication
 from rest_framework_simplejwt.authentication import JWTAuthentication
+from .serializers import ContactSerializer
+from .serializers import CreditNoteReminderSerializer, CreditNoteSerializer, CreditNoteTaskSerializer
+from .serializers import ItemGroupSerializer, ItemSerializer
+from .item_master import sync_item_to_master, sync_items_to_master
 
 class ApprovedUsersView(APIView):
 
@@ -196,9 +200,7 @@ class EstimateViewSet(ModelViewSet):
             return
 
         # 🔹 Find client
-        client = Client.objects.filter(
-            company=estimate.customer
-        ).first()
+        client = estimate.customer
 
         if not client:
             print("⚠ Client not found")
@@ -237,6 +239,7 @@ class ClientViewSet(viewsets.ModelViewSet):
     serializer_class = ClientSerializer
     authentication_classes = [JWTAuthentication, SessionAuthentication]
     permission_classes = [IsAuthenticated]
+
 
 class LeadViewSet(viewsets.ModelViewSet):
     queryset = Lead.objects.all().order_by("-id")
@@ -781,28 +784,69 @@ def send_single_email(request):
             "email": email,
             "error": str(e)
         }, status=400)
-    
 # ========================= Invoice Model =========================
+def _sync_invoice_payment(invoice):
+    payment = InvoicePayment.objects.filter(invoice=invoice).first()
+
+    if payment:
+        payment.payment_mode = invoice.payment_mode or "Null"
+        payment.transaction_id = f"{invoice.payment_mode}-{invoice.id}"
+        payment.amount = invoice.total_amount
+        payment.save()
+        return
+
+    InvoicePayment.objects.create(
+        invoice=invoice,
+        payment_mode=invoice.payment_mode or "Null",
+        transaction_id=f"{invoice.payment_mode}-{invoice.id}",
+        amount=invoice.total_amount,
+    )
+
+
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def invoice_list(request):
+    if request.method == "POST":
+        data = request.data.copy()
+        customer_id = data.get("customer") or data.get("clientid")
 
-    # 🔹 AUTO CONVERT ESTIMATES → INVOICES
+        if not customer_id:
+            return Response({"error": "Customer is required"}, status=400)
+
+        try:
+            customer = Client.objects.get(pk=customer_id)
+        except Client.DoesNotExist:
+            return Response({"error": "Customer not found"}, status=404)
+
+        payload = {
+            "invoice_number": data.get("invoice_number") or data.get("number") or "",
+            "reference_estimate": data.get("reference_estimate") or None,
+            "customer": customer.id,
+            "invoice_date": data.get("invoice_date") or timezone.now().date(),
+            "due_date": data.get("due_date") or timezone.now().date(),
+            "payment_mode": data.get("payment_mode") or data.get("paymentMode") or "Null",
+            "subtotal": data.get("subtotal") or 0,
+            "tax_amount": data.get("tax_amount") or 0,
+            "total_amount": data.get("total_amount") or 0,
+            "status": data.get("status") or "Draft",
+            "items": data.get("items") or [],
+        }
+
+        serializer = InvoiceSerializer(data=payload)
+        if serializer.is_valid():
+            invoice = serializer.save()
+            _sync_invoice_payment(invoice)
+            return Response(InvoiceSerializer(invoice).data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=400)
+
     estimates = Estimate.objects.all()
 
     for estimate in estimates:
-
-        existing = Invoice.objects.filter(
-            reference_estimate=estimate
-        ).first()
-
+        existing = Invoice.objects.filter(reference_estimate=estimate).first()
         if existing:
             continue
 
-        client = Client.objects.filter(
-            company=estimate.customer
-        ).first()
-
+        client = estimate.customer
         if not client:
             continue
 
@@ -815,77 +859,43 @@ def invoice_list(request):
             subtotal=estimate.amount,
             tax_amount=estimate.total_tax,
             total_amount=estimate.amount + estimate.total_tax,
-            status="Unpaid"
+            status="Unpaid",
+            items=getattr(estimate, "items", []),
         )
 
-    # 🔹 RETURN ALL INVOICES
     invoices = Invoice.objects.filter(customer__is_active=True).order_by("-id")
     serializer = InvoiceSerializer(invoices, many=True)
-
     return Response(serializer.data)
+
 
 # ====================== Invoice Detail ===============================
 @api_view(["GET", "PUT", "DELETE"])
 @permission_classes([IsAuthenticated])
 def invoice_detail(request, pk):
-
     try:
         invoice = Invoice.objects.get(pk=pk)
     except Invoice.DoesNotExist:
         return Response({"error": "Invoice not found"}, status=404)
 
-    # ====================== GET ======================
     if request.method == "GET":
         serializer = InvoiceSerializer(invoice)
         return Response(serializer.data)
 
-    # ====================== UPDATE ======================
     if request.method == "PUT":
-
         data = request.data.copy()
+        data.setdefault("tax_amount", invoice.tax_amount)
+        data.setdefault("total_amount", invoice.total_amount)
+        data.setdefault("items", invoice.items)
 
-    # safe defaults
-    data.setdefault("tax_amount", invoice.tax_amount)
-    data.setdefault("total_amount", invoice.total_amount)
+        serializer = InvoiceSerializer(invoice, data=data, partial=True)
+        if serializer.is_valid():
+            updated_invoice = serializer.save()
+            _sync_invoice_payment(updated_invoice)
+            return Response(InvoiceSerializer(updated_invoice).data)
+        return Response(serializer.errors, status=400)
 
-    serializer = InvoiceSerializer(invoice, data=data, partial=True)
-
-    if serializer.is_valid():
-
-        updated_invoice = serializer.save()
-
-        payment = InvoicePayment.objects.filter(
-        invoice=updated_invoice
-    ).first()
-
-    if payment:
-        # 🔄 update existing payment
-        payment.payment_mode = updated_invoice.payment_mode or "Null"
-        payment.transaction_id = f"{updated_invoice.payment_mode}-{updated_invoice.id}"
-        payment.amount = updated_invoice.total_amount
-        payment.save()
-
-    else:
-        # ➕ create payment if not exist
-        InvoicePayment.objects.create(
-            invoice=updated_invoice,
-            payment_mode=updated_invoice.payment_mode or "Null",
-            transaction_id=f"{updated_invoice.payment_mode}-{updated_invoice.id}",
-            amount=updated_invoice.total_amount
-        )
-
-        return Response(serializer.data)
-
-    # 🔴 IMPORTANT DEBUG
-    print("❌ SERIALIZER ERRORS:", serializer.errors)
-
-    return Response(serializer.errors, status=400)
-
-    # ====================== DELETE ======================
-    if request.method == "DELETE":
-        invoice.delete()
-        return Response({"message": "Invoice deleted successfully"}, status=204)
-    
+    invoice.delete()
+    return Response({"message": "Invoice deleted successfully"}, status=204)
 # ====================== Invoice Reminders ======================
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
@@ -1098,7 +1108,7 @@ def convert_existing_estimates(request):
             continue
 
         # find client
-        client = Client.objects.filter(company=estimate.customer).first()
+        client = estimate.customer
 
         if not client:
             continue
@@ -1112,7 +1122,8 @@ def convert_existing_estimates(request):
             subtotal=estimate.amount,
             tax_amount=estimate.total_tax,
             total_amount=estimate.amount + estimate.total_tax,
-            status="Unpaid"
+            status="Unpaid",
+            items=getattr(estimate, "items", []),
         )
 
         created += 1
@@ -1137,7 +1148,7 @@ def convert_old_estimates_to_invoices(request):
             continue
 
         # client find
-        client = Client.objects.filter(company=estimate.customer).first()
+        client = estimate.customer
         if not client:
             continue
 
@@ -1151,7 +1162,8 @@ def convert_old_estimates_to_invoices(request):
             subtotal=estimate.amount,
             tax_amount=estimate.total_tax,
             total_amount=estimate.amount + estimate.total_tax,
-            status="Unpaid"
+            status="Unpaid",
+            items=getattr(estimate, "items", []),
         )
 
         created += 1
@@ -1179,9 +1191,7 @@ def fix_estimate_invoices(request):
         if existing:
             continue
 
-        client = Client.objects.filter(
-            company=estimate.customer
-        ).first()
+        client = estimate.customer
 
         if not client:
             print("Client not found:", estimate.customer)
@@ -1196,7 +1206,8 @@ def fix_estimate_invoices(request):
             subtotal=estimate.amount,
             tax_amount=estimate.total_tax,
             total_amount=estimate.amount + estimate.total_tax,
-            status="Unpaid"
+            status="Unpaid",
+            items=getattr(estimate, "items", []),
         )
 
         created += 1
@@ -1222,9 +1233,7 @@ def create_invoice_from_estimate(estimate):
         return
 
     # 🔹 find client
-    client = Client.objects.filter(
-        company=estimate.customer
-    ).first()
+    client = estimate.customer
 
     if not client:
         print("Client not found:", estimate.customer)
@@ -1240,8 +1249,9 @@ def create_invoice_from_estimate(estimate):
         subtotal=estimate.amount,
         tax_amount=estimate.total_tax,
         total_amount=estimate.amount + estimate.total_tax,
-        status="Unpaid"
-    )
+        status="Unpaid",
+            items=getattr(estimate, "items", []),
+        )
 
     print("✅ Invoice created from estimate:", invoice.invoice_number)
 
@@ -1271,3 +1281,357 @@ def toggle_client_active(request, pk):
     )
 
     return Response({"message": "Customer status updated"})
+
+
+def get_contacts_db_alias():
+    return "default"
+
+
+def _serialize_contact(contact):
+    return {
+        "id": contact.id,
+        "userid": None,
+        "is_primary": int(contact.is_primary),
+        "firstname": contact.firstname,
+        "lastname": contact.lastname,
+        "email": contact.email,
+        "phonenumber": contact.phonenumber,
+        "title": contact.title,
+        "datecreated": contact.created_at,
+        "password": contact.password,
+        "last_login": contact.last_login,
+        "active": int(contact.active),
+        "direction": contact.direction,
+        "invoice_emails": int(contact.invoice_emails),
+        "estimate_emails": int(contact.estimate_emails),
+        "credit_note_emails": int(contact.credit_note_emails),
+        "contract_emails": int(contact.contract_emails),
+        "task_emails": int(contact.task_emails),
+        "project_emails": int(contact.project_emails),
+        "ticket_emails": int(contact.ticket_emails),
+        "company": contact.company or "-",
+    }
+
+
+def _get_or_create_client(company_name, phonenumber=""):
+    if not company_name:
+        return None
+
+    client = Client.objects.filter(company__iexact=company_name).first()
+    if client:
+        return client
+
+    return Client.objects.create(
+        company=company_name,
+        phone=phonenumber or "",
+        country="",
+        city="",
+        zip_code="",
+        state="",
+        billing_address="",
+        shipping_address="",
+        is_active=True,
+    )
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def contacts_list_create(request):
+    if request.method == "GET":
+        contacts = Contact.objects.all().order_by("-created_at", "-id")
+        return Response([_serialize_contact(contact) for contact in contacts])
+
+    data = request.data
+    company_name = (data.get("company") or "").strip()
+    client = _get_or_create_client(
+        company_name,
+        data.get("phonenumber") or "",
+    )
+
+    contact = Contact.objects.create(
+        is_primary=bool(int(data.get("is_primary", 0) or 0)),
+        firstname=data.get("firstname", "").strip(),
+        lastname=data.get("lastname", "").strip(),
+        email=data.get("email", "").strip(),
+        company=company_name or (client.company if client else ""),
+        phonenumber=data.get("phonenumber", "").strip(),
+        title=data.get("title") or "",
+        password=data.get("password") or "",
+        last_login=timezone.now(),
+        active=bool(int(data.get("active", 1) or 1)),
+        direction=data.get("direction") or None,
+        invoice_emails=bool(int(data.get("invoice_emails", 0) or 0)),
+        estimate_emails=bool(int(data.get("estimate_emails", 0) or 0)),
+        credit_note_emails=bool(int(data.get("credit_note_emails", 0) or 0)),
+        contract_emails=bool(int(data.get("contract_emails", 0) or 0)),
+        task_emails=bool(int(data.get("task_emails", 0) or 0)),
+        project_emails=bool(int(data.get("project_emails", 0) or 0)),
+        ticket_emails=bool(int(data.get("ticket_emails", 0) or 0)),
+    )
+
+    return Response(_serialize_contact(contact), status=status.HTTP_201_CREATED)
+
+
+@api_view(["GET", "PATCH", "PUT", "DELETE"])
+@permission_classes([IsAuthenticated])
+def contacts_detail(request, pk):
+    try:
+        contact = Contact.objects.get(pk=pk)
+    except Contact.DoesNotExist:
+        return Response({"error": "Contact not found"}, status=404)
+
+    if request.method == "GET":
+        return Response(_serialize_contact(contact))
+
+    if request.method == "DELETE":
+        contact.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    data = request.data
+
+    if "company" in data:
+        company_name = (data.get("company") or "").strip()
+        client = _get_or_create_client(
+            company_name,
+            data.get("phonenumber") or contact.phonenumber,
+        )
+        contact.company = company_name or (client.company if client else contact.company)
+
+    updatable_fields = {
+        "is_primary": bool,
+        "firstname": str,
+        "lastname": str,
+        "email": str,
+        "company": str,
+        "phonenumber": str,
+        "title": str,
+        "password": str,
+        "active": bool,
+        "direction": str,
+        "invoice_emails": bool,
+        "estimate_emails": bool,
+        "credit_note_emails": bool,
+        "contract_emails": bool,
+        "task_emails": bool,
+        "project_emails": bool,
+        "ticket_emails": bool,
+    }
+
+    for field, caster in updatable_fields.items():
+        if field in data:
+            raw_value = data.get(field)
+            if raw_value is None:
+                setattr(contact, field, None)
+            elif caster is bool:
+                setattr(contact, field, bool(int(raw_value)))
+            else:
+                setattr(contact, field, raw_value)
+
+    if "last_login" in data and data.get("last_login"):
+        contact.last_login = data.get("last_login")
+
+    contact.save()
+    return Response(_serialize_contact(contact))
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def items_groups_list_create(request):
+    if request.method == "GET":
+        groups = ItemGroup.objects.all().order_by("name", "id")
+        serializer = ItemGroupSerializer(groups, many=True)
+        return Response(serializer.data)
+
+    serializer = ItemGroupSerializer(data=request.data)
+    if serializer.is_valid():
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(["PUT", "PATCH", "DELETE"])
+@permission_classes([IsAuthenticated])
+def items_groups_detail(request, pk):
+    try:
+        group = ItemGroup.objects.get(pk=pk)
+    except ItemGroup.DoesNotExist:
+        return Response({"error": "Item group not found"}, status=404)
+
+    if request.method == "DELETE":
+        group.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    serializer = ItemGroupSerializer(group, data=request.data, partial=request.method == "PATCH")
+    if serializer.is_valid():
+        serializer.save()
+        return Response(serializer.data)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def items_list_create(request):
+    if request.method == "GET":
+        items = Item.objects.select_related("group").all().order_by("-created_at", "-id")
+        serializer = ItemSerializer(items, many=True)
+        return Response(serializer.data)
+
+    item = sync_item_to_master(request.data.copy())
+    if not item:
+        return Response({"error": "Item name or description is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+    serializer = ItemSerializer(item)
+    return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+@api_view(["PUT", "PATCH", "DELETE"])
+@permission_classes([IsAuthenticated])
+def items_detail(request, pk):
+    try:
+        item = Item.objects.get(pk=pk)
+    except Item.DoesNotExist:
+        return Response({"error": "Item not found"}, status=404)
+
+    if request.method == "DELETE":
+        item.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    payload = request.data.copy()
+    payload["item_name"] = payload.get("item_name") or item.item_name
+    payload["item_code"] = payload.get("item_code") or item.item_code
+    if "status" not in payload:
+        payload["status"] = item.status
+
+    synced_item = sync_item_to_master({"id": item.id, **payload}) or item
+    serializer = ItemSerializer(synced_item)
+    return Response(serializer.data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def public_items_list(request):
+    items = Item.objects.select_related("group").all().order_by("item_name", "id")
+    serializer = ItemSerializer(items, many=True)
+    return Response(serializer.data)
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def creditnotes_list_create(request):
+    if request.method == "GET":
+        notes = CreditNote.objects.using("default").all().order_by("-datecreated", "-id")
+        serializer = CreditNoteSerializer(notes, many=True)
+        return Response(serializer.data)
+
+    data = request.data.copy()
+
+    customer_id = data.get("clientid")
+    customer = None
+    if customer_id:
+      customer = Client.objects.using("default").filter(pk=customer_id).first()
+
+    prefix = "CN-"
+    raw_number = data.get("creditNoteNumber") or data.get("number")
+    if raw_number:
+        raw_number = str(raw_number)
+        if raw_number.upper().startswith("CN-"):
+            prefix = "CN-"
+            raw_number = raw_number[3:]
+    next_number = CreditNote.objects.using("default").count() + 1
+    try:
+        note_number = int(raw_number) if raw_number else next_number
+    except (TypeError, ValueError):
+        note_number = next_number
+
+    payload = {
+        "client": customer,
+        "deleted_customer_name": data.get("deleted_customer_name") or (customer.company if customer else ""),
+        "number": note_number,
+        "prefix": data.get("prefix") or prefix,
+        "number_format": data.get("number_format") or "",
+        "date": data.get("creditNoteDate") or data.get("date") or timezone.now().date(),
+        "duedate": data.get("expiryDate") or data.get("duedate") or None,
+        "project_id": data.get("project_id") or None,
+        "reference_no": data.get("reference") or data.get("reference_no") or "",
+        "subtotal": data.get("subtotal") or 0,
+        "total_tax": data.get("total_tax") or 0,
+        "total": data.get("total") or 0,
+        "adjustment": data.get("adjustment") or 0,
+        "addedfrom": data.get("addedfrom") or 0,
+        "status": data.get("status") or 1,
+        "clientnote": data.get("clientnote") or "",
+        "adminnote": data.get("adminNote") or data.get("adminnote") or "",
+        "terms": data.get("terms") or "",
+        "currency": data.get("currency") or "INR",
+        "discount_percent": data.get("discount_percent") or 0,
+        "discount_total": data.get("discount") or data.get("discount_total") or 0,
+        "discount_type": data.get("discountType") or data.get("discount_type") or "none",
+        "billing_street": data.get("billTo", {}).get("street", "") if isinstance(data.get("billTo"), dict) else data.get("billing_street") or "",
+        "billing_city": data.get("billTo", {}).get("city", "") if isinstance(data.get("billTo"), dict) else data.get("billing_city") or "",
+        "billing_state": data.get("billTo", {}).get("state", "") if isinstance(data.get("billTo"), dict) else data.get("billing_state") or "",
+        "billing_zip": data.get("billTo", {}).get("zip", "") if isinstance(data.get("billTo"), dict) else data.get("billing_zip") or "",
+        "billing_country": data.get("billTo", {}).get("country", "") if isinstance(data.get("billTo"), dict) else data.get("billing_country") or "",
+        "shipping_street": data.get("shipTo", {}).get("street", "") if isinstance(data.get("shipTo"), dict) else data.get("shipping_street") or "",
+        "shipping_city": data.get("shipTo", {}).get("city", "") if isinstance(data.get("shipTo"), dict) else data.get("shipping_city") or "",
+        "shipping_state": data.get("shipTo", {}).get("state", "") if isinstance(data.get("shipTo"), dict) else data.get("shipping_state") or "",
+        "shipping_zip": data.get("shipTo", {}).get("zip", "") if isinstance(data.get("shipTo"), dict) else data.get("shipping_zip") or "",
+        "shipping_country": data.get("shipTo", {}).get("country", "") if isinstance(data.get("shipTo"), dict) else data.get("shipping_country") or "",
+        "include_shipping": bool(data.get("include_shipping") or False),
+        "show_shipping_on_credit_note": bool(data.get("show_shipping_on_credit_note") or False),
+        "show_quantity_as": data.get("show_quantity_as") or data.get("quantityType") or "Qty",
+        "email_signature": data.get("email_signature") or "",
+        "items": data.get("items") or [],
+    }
+
+    credit_note = CreditNote.objects.using("default").create(**payload)
+    sync_items_to_master(payload["items"])
+    serializer = CreditNoteSerializer(credit_note)
+    return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def creditnote_detail(request, pk):
+    try:
+        credit_note = CreditNote.objects.using("default").get(pk=pk)
+    except CreditNote.DoesNotExist:
+        return Response({"error": "Credit note not found"}, status=404)
+
+    serializer = CreditNoteSerializer(credit_note)
+    return Response(serializer.data)
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def creditnote_reminders(request, pk):
+    if request.method == "GET":
+        reminders = CreditNoteReminder.objects.using("default").filter(credit_note_id=pk)
+        serializer = CreditNoteReminderSerializer(reminders, many=True)
+        return Response(serializer.data)
+
+    serializer = CreditNoteReminderSerializer(
+        data={**request.data, "credit_note": pk}
+    )
+    if serializer.is_valid():
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def creditnote_tasks(request, pk):
+    if request.method == "GET":
+        tasks = CreditNoteTask.objects.using("default").filter(credit_note_id=pk)
+        serializer = CreditNoteTaskSerializer(tasks, many=True)
+        return Response(serializer.data)
+
+    serializer = CreditNoteTaskSerializer(
+        data={**request.data, "credit_note": pk}
+    )
+    if serializer.is_valid():
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+

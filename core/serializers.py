@@ -1,5 +1,6 @@
+from django.utils import timezone
 from rest_framework import serializers
-from .models import Business, Customer, Role, Proposal
+from .models import Business, Contact, CreditNote, CreditNoteReminder, CreditNoteTask, Customer, Item, ItemGroup, Role, Proposal
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from django.contrib.auth.models import User
 from core.models import Proposal
@@ -15,7 +16,7 @@ from .models import InvoiceReminder
 from .models import InvoiceTask
 from rest_framework import serializers
 from .models import Invoice, InvoiceReminder, InvoiceTask, InvoiceEmailLog, InvoicePayment
-
+from .item_master import sync_items_to_master
 # ======================= Customer ==========================
 class CustomerSerializer(serializers.ModelSerializer):
     class Meta:
@@ -49,6 +50,16 @@ class InvoiceSerializer(serializers.ModelSerializer):
         model = Invoice
         fields = "__all__"
 
+    def create(self, validated_data):
+        invoice = super().create(validated_data)
+        sync_items_to_master(invoice.items)
+        return invoice
+
+    def update(self, instance, validated_data):
+        invoice = super().update(instance, validated_data)
+        sync_items_to_master(invoice.items)
+        return invoice
+
 class InvoiceReminderSerializer(serializers.ModelSerializer):
     class Meta:
         model = InvoiceReminder
@@ -59,7 +70,69 @@ class InvoiceTaskSerializer(serializers.ModelSerializer):
     class Meta:
         model = InvoiceTask
         fields = "__all__"
-        
+
+
+class CreditNoteSerializer(serializers.ModelSerializer):
+    clientid = serializers.IntegerField(source="client_id", required=False, allow_null=True)
+
+    class Meta:
+        model = CreditNote
+        fields = "__all__"
+
+
+class CreditNoteReminderSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CreditNoteReminder
+        fields = "__all__"
+
+
+class CreditNoteTaskSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CreditNoteTask
+        fields = "__all__"
+
+
+class ItemGroupSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ItemGroup
+        fields = "__all__"
+
+
+class ItemSerializer(serializers.ModelSerializer):
+    unit_price = serializers.DecimalField(
+        source="rate",
+        max_digits=12,
+        decimal_places=2,
+        required=False,
+    )
+    group_id = ItemGroupSerializer(source="group", read_only=True)
+    group_name = serializers.CharField(source="group.name", read_only=True)
+    group = serializers.PrimaryKeyRelatedField(
+        queryset=ItemGroup.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+
+    class Meta:
+        model = Item
+        fields = [
+            "id",
+            "item_name",
+            "item_code",
+            "description",
+            "long_description",
+            "rate",
+            "unit_price",
+            "tax",
+            "tax2",
+            "unit",
+            "status",
+            "group",
+            "group_id",
+            "group_name",
+            "created_at",
+        ]
+          
 #================== CalenderEvent ============
 class CalendarEventSerializer(serializers.ModelSerializer):
     class Meta:
@@ -72,12 +145,66 @@ class ClientSerializer(serializers.ModelSerializer):
         model = Client
         fields = "__all__"
 
+
+class ContactSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Contact
+        fields = [
+            "id",
+            "is_primary",
+            "firstname",
+            "lastname",
+            "email",
+            "company",
+            "phonenumber",
+            "title",
+            "password",
+            "last_login",
+            "active",
+            "direction",
+            "invoice_emails",
+            "estimate_emails",
+            "credit_note_emails",
+            "contract_emails",
+            "task_emails",
+            "project_emails",
+            "ticket_emails",
+            "created_at",
+        ]
+        extra_kwargs = {
+            "is_primary": {"required": False},
+            "company": {"required": False, "allow_blank": True, "allow_null": True},
+            "phonenumber": {"required": False, "allow_blank": True},
+            "title": {"required": False, "allow_blank": True, "allow_null": True},
+            "password": {"required": False, "allow_blank": True, "allow_null": True},
+            "last_login": {"required": False, "allow_null": True},
+            "active": {"required": False},
+            "direction": {"required": False, "allow_blank": True, "allow_null": True},
+            "invoice_emails": {"required": False},
+            "estimate_emails": {"required": False},
+            "credit_note_emails": {"required": False},
+            "contract_emails": {"required": False},
+            "task_emails": {"required": False},
+            "project_emails": {"required": False},
+            "ticket_emails": {"required": False},
+        }
+
 # ================= Estimate =================
 class EstimateSerializer(serializers.ModelSerializer):
     invoice = InvoiceSerializer(many=True, read_only=True)
     class Meta:
         model = Estimate
         fields = "__all__"
+
+    def create(self, validated_data):
+        estimate = super().create(validated_data)
+        sync_items_to_master(estimate.items)
+        return estimate
+
+    def update(self, instance, validated_data):
+        estimate = super().update(instance, validated_data)
+        sync_items_to_master(estimate.items)
+        return estimate
 #==================Leads===================
 class LeadSerializer(serializers.ModelSerializer):
     class Meta:
@@ -148,6 +275,7 @@ class ProposalSerializer(serializers.ModelSerializer):
             proposal.adjustment
         )
         proposal.save()
+        sync_items_to_master(items)
         return proposal
 
     # ✅ UPDATE METHOD
@@ -164,6 +292,7 @@ class ProposalSerializer(serializers.ModelSerializer):
             instance.adjustment
         )
         instance.save()
+        sync_items_to_master(items)
         return instance
 
     # ✅ TOTAL CALCULATION

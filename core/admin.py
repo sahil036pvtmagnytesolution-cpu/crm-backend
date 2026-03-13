@@ -17,6 +17,7 @@ from .models import Expense
 from django.contrib import admin
 from .models import Lead
 from .models import Invoice, InvoicePayment
+from .models import AdminClient, AdminContact
 
 import MySQLdb
 
@@ -260,3 +261,44 @@ class InvoicePaymentAdmin(admin.ModelAdmin):
 search_fields = ("invoice_number", "customer__company")
 
 list_filter = ("status", "invoice_date")
+
+
+class LegacyTenantAdminMixin:
+    def get_queryset(self, request):
+        return super().get_queryset(request).using("default")
+
+    def get_object(self, request, object_id, from_field=None):
+        queryset = self.get_queryset(request)
+        model_field = from_field or self.model._meta.pk.attname
+        return queryset.filter(**{model_field: object_id}).first()
+
+    def save_model(self, request, obj, form, change):
+        obj.save(using="default")
+
+    def delete_model(self, request, obj):
+        obj.delete(using="default")
+
+
+@admin.register(AdminClient)
+class AdminClientAdmin(LegacyTenantAdminMixin, admin.ModelAdmin):
+    list_display = ("id", "company", "phone", "is_active", "created_at")
+    list_filter = ("is_active", "created_at")
+    search_fields = ("company", "phone", "city", "state")
+    ordering = ("-id",)
+
+
+@admin.register(AdminContact)
+class AdminContactAdmin(LegacyTenantAdminMixin, admin.ModelAdmin):
+    list_display = (
+        "id",
+        "firstname",
+        "lastname",
+        "email",
+        "company",
+        "active",
+        "last_login",
+        "created_at",
+    )
+    list_filter = ("active", "is_primary", "created_at")
+    search_fields = ("firstname", "lastname", "email", "phonenumber")
+    ordering = ("-created_at", "-id")
