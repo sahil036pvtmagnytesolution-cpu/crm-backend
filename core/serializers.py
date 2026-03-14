@@ -17,6 +17,51 @@ from .models import InvoiceTask
 from rest_framework import serializers
 from .models import Invoice, InvoiceReminder, InvoiceTask, InvoiceEmailLog, InvoicePayment
 from .item_master import sync_items_to_master
+
+
+def _normalize_items_payload(items):
+    """
+    Normalize line items across Proposal/Estimate/Invoice/Credit Note.
+
+    Frontend screens send mixed keys like `longDescription` vs `long_description`.
+    We persist and return a canonical shape so UIs can reliably render
+    `description` + `long_description` from backend data.
+    """
+    if not isinstance(items, list):
+        return []
+
+    normalized = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+
+        item = dict(raw)
+
+        # Canonical long description
+        if not item.get("long_description"):
+            item["long_description"] = (
+                item.get("longDescription")
+                or item.get("longdescription")
+                or item.get("details")
+                or ""
+            )
+
+        # Back-compat field used by some forms
+        if not item.get("longDescription"):
+            item["longDescription"] = item.get("long_description") or ""
+
+        # Canonical description
+        if not item.get("description"):
+            item["description"] = (
+                item.get("item_name")
+                or item.get("name")
+                or item.get("label")
+                or ""
+            )
+
+        normalized.append(item)
+
+    return normalized
 # ======================= Customer ==========================
 class CustomerSerializer(serializers.ModelSerializer):
     class Meta:
@@ -51,14 +96,22 @@ class InvoiceSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
     def create(self, validated_data):
+        validated_data["items"] = _normalize_items_payload(validated_data.get("items"))
         invoice = super().create(validated_data)
         sync_items_to_master(invoice.items)
         return invoice
 
     def update(self, instance, validated_data):
+        if "items" in validated_data:
+            validated_data["items"] = _normalize_items_payload(validated_data.get("items"))
         invoice = super().update(instance, validated_data)
         sync_items_to_master(invoice.items)
         return invoice
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["items"] = _normalize_items_payload(data.get("items"))
+        return data
 
 class InvoiceReminderSerializer(serializers.ModelSerializer):
     class Meta:
@@ -78,6 +131,24 @@ class CreditNoteSerializer(serializers.ModelSerializer):
     class Meta:
         model = CreditNote
         fields = "__all__"
+
+    def create(self, validated_data):
+        validated_data["items"] = _normalize_items_payload(validated_data.get("items"))
+        credit_note = super().create(validated_data)
+        sync_items_to_master(credit_note.items)
+        return credit_note
+
+    def update(self, instance, validated_data):
+        if "items" in validated_data:
+            validated_data["items"] = _normalize_items_payload(validated_data.get("items"))
+        credit_note = super().update(instance, validated_data)
+        sync_items_to_master(credit_note.items)
+        return credit_note
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["items"] = _normalize_items_payload(data.get("items"))
+        return data
 
 
 class CreditNoteReminderSerializer(serializers.ModelSerializer):
@@ -197,14 +268,22 @@ class EstimateSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
     def create(self, validated_data):
+        validated_data["items"] = _normalize_items_payload(validated_data.get("items"))
         estimate = super().create(validated_data)
         sync_items_to_master(estimate.items)
         return estimate
 
     def update(self, instance, validated_data):
+        if "items" in validated_data:
+            validated_data["items"] = _normalize_items_payload(validated_data.get("items"))
         estimate = super().update(instance, validated_data)
         sync_items_to_master(estimate.items)
         return estimate
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["items"] = _normalize_items_payload(data.get("items"))
+        return data
 #==================Leads===================
 class LeadSerializer(serializers.ModelSerializer):
     class Meta:
@@ -265,7 +344,7 @@ class ProposalSerializer(serializers.ModelSerializer):
 
     # ✅ CREATE METHOD
     def create(self, validated_data):
-        items = validated_data.pop("items", [])
+        items = _normalize_items_payload(validated_data.pop("items", []))
         proposal = Proposal.objects.create(**validated_data)
 
         proposal.items = items
@@ -280,7 +359,7 @@ class ProposalSerializer(serializers.ModelSerializer):
 
     # ✅ UPDATE METHOD
     def update(self, instance, validated_data):
-        items = validated_data.pop("items", instance.items)
+        items = _normalize_items_payload(validated_data.pop("items", instance.items))
 
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
@@ -294,6 +373,11 @@ class ProposalSerializer(serializers.ModelSerializer):
         instance.save()
         sync_items_to_master(items)
         return instance
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["items"] = _normalize_items_payload(data.get("items"))
+        return data
 
     # ✅ TOTAL CALCULATION
     def calculate_total(self, items, discount, adjustment):

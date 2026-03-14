@@ -92,8 +92,9 @@ def sync_item_to_master(item_data):
     else:
         item = Item.objects.filter(item_name__iexact=item_name).first()
 
+    # Keep defaults limited to non-identity fields to avoid duplicate kwargs
+    # when calling `Item.objects.create(item_name=..., **defaults)`.
     defaults = {
-        "item_name": item_name,
         "description": description,
         "long_description": long_description,
         "rate": unit_price,
@@ -105,6 +106,7 @@ def sync_item_to_master(item_data):
     }
 
     if item:
+        item.item_name = item_name
         for field, value in defaults.items():
             setattr(item, field, value)
         if item_code:
