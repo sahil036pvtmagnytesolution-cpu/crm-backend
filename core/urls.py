@@ -12,6 +12,7 @@ from .views import (
     assign_proposal,
     users_list,
     ExpenseViewSet,
+    ContractViewSet,
     SmallStatsView,
     LeadViewSet,
     leads_overview,
@@ -43,6 +44,7 @@ from . import views
 router = DefaultRouter()
 
 router.register(r'expenses', ExpenseViewSet, basename="expenses")
+router.register(r'contracts', ContractViewSet, basename="contracts")
 router.register(r'leads', LeadViewSet)
 router.register(r'clients', ClientViewSet)
 router.register(r'calendar-events', CalendarEventViewSet, basename="calendar-events")

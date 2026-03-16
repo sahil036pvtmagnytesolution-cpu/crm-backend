@@ -16,6 +16,7 @@ from .models import InvoiceReminder
 from .models import InvoiceTask
 from rest_framework import serializers
 from .models import Invoice, InvoiceReminder, InvoiceTask, InvoiceEmailLog, InvoicePayment
+from .models import Contract
 from .item_master import sync_items_to_master
 
 
@@ -420,9 +421,124 @@ class EmailTokenObtainPairSerializer(TokenObtainPairSerializer):
 
 
 class ExpenseSerializer(serializers.ModelSerializer):
+    customer_display = serializers.SerializerMethodField()
+    invoice_number = serializers.SerializerMethodField()
+    payment_mode_display = serializers.SerializerMethodField()
+
     class Meta:
         model = Expense
         fields = "__all__"
+
+    def get_customer_display(self, obj):
+        if getattr(obj, "customer_ref", None):
+            return obj.customer_ref.company
+
+        if getattr(obj, "customer", None):
+            return obj.customer
+
+        if getattr(obj, "invoice_ref", None) and getattr(obj.invoice_ref, "customer", None):
+            return obj.invoice_ref.customer.company
+
+        return "-"
+
+    def get_invoice_number(self, obj):
+        if getattr(obj, "invoice_ref", None):
+            return obj.invoice_ref.invoice_number
+        return None
+
+    def get_payment_mode_display(self, obj):
+        if getattr(obj, "payment_mode", None):
+            return obj.payment_mode
+        if getattr(obj, "invoice_ref", None):
+            return obj.invoice_ref.payment_mode
+        return "Null"
+
+    def validate(self, attrs):
+        raw_customer = self.initial_data.get("customer")
+        raw_reference = self.initial_data.get("reference")
+        raw_invoice = (
+            self.initial_data.get("invoice_ref")
+            or self.initial_data.get("invoice")
+            or self.initial_data.get("invoiceId")
+        )
+
+        if not attrs.get("customer_ref") and raw_customer:
+            try:
+                customer_id = int(raw_customer)
+            except (TypeError, ValueError):
+                customer_id = None
+
+            if customer_id is not None:
+                customer = Client.objects.filter(pk=customer_id).first()
+                if customer:
+                    attrs["customer_ref"] = customer
+                    if str(raw_customer).strip().isdigit():
+                        attrs["customer"] = customer.company
+
+        if not attrs.get("invoice_ref"):
+            key = raw_invoice or raw_reference
+            if key:
+                invoice = None
+                try:
+                    invoice_id = int(key)
+                except (TypeError, ValueError):
+                    invoice_id = None
+
+                if invoice_id is not None:
+                    invoice = Invoice.objects.filter(pk=invoice_id).first()
+
+                if not invoice:
+                    invoice = Invoice.objects.filter(
+                        invoice_number__iexact=str(key).strip()
+                    ).first()
+
+                if invoice:
+                    attrs["invoice_ref"] = invoice
+
+                    if not attrs.get("customer_ref") and getattr(invoice, "customer", None):
+                        attrs["customer_ref"] = invoice.customer
+
+                    if not attrs.get("payment_mode") and getattr(invoice, "payment_mode", None):
+                        attrs["payment_mode"] = invoice.payment_mode
+
+                    if not attrs.get("customer") and getattr(invoice, "customer", None):
+                        attrs["customer"] = invoice.customer.company
+
+        return attrs
+
+
+class ContractSerializer(serializers.ModelSerializer):
+    customer_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Contract
+        fields = "__all__"
+
+    def get_customer_display(self, obj):
+        if getattr(obj, "customer_ref", None):
+            return obj.customer_ref.company
+        if getattr(obj, "customer", None):
+            return obj.customer
+        return "-"
+
+    def validate(self, attrs):
+        if attrs.get("customer_ref") and not attrs.get("customer"):
+            attrs["customer"] = attrs["customer_ref"].company
+
+        raw_customer = self.initial_data.get("customer")
+        if not attrs.get("customer_ref") and raw_customer:
+            try:
+                customer_id = int(raw_customer)
+            except (TypeError, ValueError):
+                customer_id = None
+
+            if customer_id is not None:
+                customer = Client.objects.filter(pk=customer_id).first()
+                if customer:
+                    attrs["customer_ref"] = customer
+                    attrs["customer"] = customer.company
+
+        return attrs
 
 # ================== THIS IS EMAILCAMPAIGN CODE ==================
 class EmailRecipientSerializer(serializers.ModelSerializer):

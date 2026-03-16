@@ -28,6 +28,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.viewsets import ModelViewSet
 from .models import Expense
 from .serializers import ExpenseSerializer
+from .models import Contract
+from .serializers import ContractSerializer
 
 from django.contrib import admin
 from .models import Expense
@@ -268,6 +270,15 @@ def run_async(func, *args):
 class ExpenseViewSet(ModelViewSet):
     queryset = Expense.objects.all().order_by('-id')
     serializer_class = ExpenseSerializer
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+
+class ContractViewSet(ModelViewSet):
+    queryset = Contract.objects.all().order_by("-id")
+    serializer_class = ContractSerializer
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
 
 # =========================
 # REGISTER BUSINESS

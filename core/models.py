@@ -149,6 +149,20 @@ class Expense(models.Model):
     tax1 = models.CharField(max_length=50, blank=True, null=True)
     tax2 = models.CharField(max_length=50, blank=True, null=True)
     payment_mode = models.CharField(max_length=100, blank=True, null=True)
+    customer_ref = models.ForeignKey(
+        "Client",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="expenses",
+    )
+    invoice_ref = models.ForeignKey(
+        "Invoice",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="expenses",
+    )
     reference = models.CharField(max_length=255, blank=True, null=True)
     repeat_every = models.CharField(max_length=50, blank=True, null=True)
 
@@ -439,6 +453,40 @@ class ItemGroup(models.Model):
 
     def __str__(self):
         return self.name
+
+
+class Contract(models.Model):
+    STATUS_CHOICES = [
+        ("Draft", "Draft"),
+        ("Active", "Active"),
+        ("Expired", "Expired"),
+    ]
+
+    customer_ref = models.ForeignKey(
+        "Client",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="contracts",
+    )
+
+    customer = models.CharField(max_length=255, blank=True, null=True)
+    subject = models.CharField(max_length=255)
+    contract_type = models.CharField(max_length=100, blank=True, null=True)
+    contract_value = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    start_date = models.DateField(null=True, blank=True)
+    end_date = models.DateField(null=True, blank=True)
+    signature = models.CharField(max_length=255, blank=True, null=True)
+    description = models.TextField(blank=True, null=True)
+
+    hide_from_customer = models.BooleanField(default=False)
+    is_trashed = models.BooleanField(default=False)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="Draft")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.subject
 
 
 class Item(models.Model):

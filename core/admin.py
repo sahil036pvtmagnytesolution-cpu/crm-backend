@@ -13,6 +13,7 @@ from .models import Proposal
 
 from django.contrib import admin
 from .models import Expense
+from .models import Contract
 
 from django.contrib import admin
 from .models import Lead
@@ -284,6 +285,24 @@ class AdminClientAdmin(LegacyTenantAdminMixin, admin.ModelAdmin):
     list_display = ("id", "company", "phone", "is_active", "created_at")
     list_filter = ("is_active", "created_at")
     search_fields = ("company", "phone", "city", "state")
+    ordering = ("-id",)
+
+
+@admin.register(Contract)
+class ContractAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "subject",
+        "customer",
+        "contract_type",
+        "contract_value",
+        "start_date",
+        "end_date",
+        "status",
+    )
+
+    search_fields = ("subject", "customer", "contract_type")
+    list_filter = ("status", "contract_type", "hide_from_customer", "is_trashed")
     ordering = ("-id",)
 
 
