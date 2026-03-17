@@ -2,9 +2,14 @@ from django.db import models
 from django.contrib.auth.models import User
 from django.utils import timezone
 from datetime import date
+from ms_crm_app.models import (
+    Staff as LegacyStaff,
+    KnowledgeBase as LegacyKnowledgeBase,
+    KnowledgeBaseGroups as LegacyKnowledgeBaseGroups,
+)
 
 
-class Business(models.Model):
+class LegacyBusiness(models.Model):
     """
     EXISTING TABLE ONLY
     NO MIGRATION
@@ -478,6 +483,7 @@ class Contract(models.Model):
     end_date = models.DateField(null=True, blank=True)
     signature = models.CharField(max_length=255, blank=True, null=True)
     description = models.TextField(blank=True, null=True)
+    content = models.TextField(blank=True, null=True)
 
     hide_from_customer = models.BooleanField(default=False)
     is_trashed = models.BooleanField(default=False)
@@ -487,6 +493,142 @@ class Contract(models.Model):
 
     def __str__(self):
         return self.subject
+
+
+class ContractType(models.Model):
+    name = models.CharField(max_length=191, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "core_contract_type"
+        ordering = ["name", "id"]
+
+    def __str__(self):
+        return self.name
+
+
+class ContractAttachment(models.Model):
+    contract = models.ForeignKey(
+        Contract,
+        on_delete=models.CASCADE,
+        related_name="attachments",
+    )
+    file = models.FileField(upload_to="contracts/attachments/%Y/%m/")
+    filename = models.CharField(max_length=255, blank=True, null=True)
+    uploaded_by = models.CharField(max_length=191, blank=True, null=True)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "core_contract_attachment"
+        ordering = ["-uploaded_at", "-id"]
+
+    def save(self, *args, **kwargs):
+        if not self.filename and getattr(self, "file", None):
+            try:
+                self.filename = self.file.name.split("/")[-1]
+            except Exception:
+                self.filename = self.filename or ""
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.filename or f"Attachment #{self.id}"
+
+
+class ContractComment(models.Model):
+    contract = models.ForeignKey(
+        Contract,
+        on_delete=models.CASCADE,
+        related_name="comments",
+    )
+    comment = models.TextField()
+    created_by = models.CharField(max_length=191, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "core_contract_comment"
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return f"Comment #{self.id}"
+
+
+class ContractRenewal(models.Model):
+    contract = models.ForeignKey(
+        Contract,
+        on_delete=models.CASCADE,
+        related_name="renewals",
+    )
+    old_start_date = models.DateField(blank=True, null=True)
+    new_start_date = models.DateField(blank=True, null=True)
+    old_end_date = models.DateField(blank=True, null=True)
+    new_end_date = models.DateField(blank=True, null=True)
+    old_value = models.DecimalField(
+        max_digits=12, decimal_places=2, blank=True, null=True
+    )
+    new_value = models.DecimalField(
+        max_digits=12, decimal_places=2, blank=True, null=True
+    )
+    notes = models.TextField(blank=True, null=True)
+    renewed_by = models.CharField(max_length=191, blank=True, null=True)
+    renewed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "core_contract_renewal"
+        ordering = ["-renewed_at", "-id"]
+
+    def __str__(self):
+        return f"Renewal #{self.id}"
+
+
+class ContractTask(models.Model):
+    PRIORITY_CHOICES = [
+        ("Low", "Low"),
+        ("Medium", "Medium"),
+        ("High", "High"),
+    ]
+
+    contract = models.ForeignKey(
+        Contract,
+        on_delete=models.CASCADE,
+        related_name="tasks",
+    )
+    subject = models.CharField(max_length=255)
+    description = models.TextField(blank=True, null=True)
+    start_date = models.DateField(blank=True, null=True)
+    due_date = models.DateField(blank=True, null=True)
+    priority = models.CharField(
+        max_length=20, choices=PRIORITY_CHOICES, default="Medium"
+    )
+    is_public = models.BooleanField(default=False)
+    is_billable = models.BooleanField(default=True)
+    tags = models.CharField(max_length=255, blank=True, null=True)
+    created_by = models.CharField(max_length=191, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "core_contract_task"
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return self.subject
+
+
+class ContractNote(models.Model):
+    contract = models.ForeignKey(
+        Contract,
+        on_delete=models.CASCADE,
+        related_name="notes",
+    )
+    note = models.TextField()
+    created_by = models.CharField(max_length=191, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "core_contract_note"
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return f"Note #{self.id}"
 
 
 class Item(models.Model):
@@ -582,3 +724,115 @@ class AdminContact(Contact):
         app_label = "core"
         verbose_name = "Contact"
         verbose_name_plural = "Contacts"
+
+
+class Project(models.Model):
+    STATUS_CHOICES = [
+        ("Draft", "Draft"),
+        ("Sent", "Sent"),
+        ("Expired", "Expired"),
+        ("Declined", "Declined"),
+        ("Accepted", "Accepted"),
+        ("In Progress", "In Progress"),
+        ("Completed", "Completed"),
+        ("On Hold", "On Hold"),
+    ]
+
+    BILLING_TYPE_CHOICES = [
+        ("Fixed Rate", "Fixed Rate"),
+        ("Hourly", "Hourly"),
+    ]
+
+    name = models.CharField(max_length=255, db_index=True)
+    client = models.ForeignKey(
+        Client,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="projects",
+        db_index=True,
+    )
+
+    progress = models.PositiveSmallIntegerField(default=0)
+    status = models.CharField(
+        max_length=32,
+        choices=STATUS_CHOICES,
+        default="Draft",
+        db_index=True,
+    )
+
+    billing_type = models.CharField(
+        max_length=32,
+        choices=BILLING_TYPE_CHOICES,
+        default="Fixed Rate",
+    )
+    total_rate = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    estimated_hours = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+
+    start_date = models.DateField(blank=True, null=True)
+    deadline = models.DateField(blank=True, null=True)
+
+    tags = models.CharField(max_length=255, blank=True, null=True)
+    description = models.TextField(blank=True, null=True)
+
+    members = models.ManyToManyField(
+        User,
+        blank=True,
+        related_name="project_memberships",
+    )
+
+    mentor = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="mentored_projects",
+    )
+
+    send_email = models.BooleanField(default=False)
+    visible_tabs = models.JSONField(default=list, blank=True)
+    settings = models.JSONField(default=list, blank=True)
+
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="created_projects",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True, db_index=True)
+
+    class Meta:
+        db_table = "core_project"
+        ordering = ["-created_at", "-id"]
+        indexes = [
+            models.Index(fields=["client", "status"]),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class StaffProxy(LegacyStaff):
+    class Meta:
+        proxy = True
+        app_label = "core"
+        verbose_name = "Staff"
+        verbose_name_plural = "Staff"
+
+
+class KnowledgeBaseProxy(LegacyKnowledgeBase):
+    class Meta:
+        proxy = True
+        app_label = "core"
+        verbose_name = "Knowledge Base Article"
+        verbose_name_plural = "Knowledge Base Articles"
+
+
+class KnowledgeBaseGroupProxy(LegacyKnowledgeBaseGroups):
+    class Meta:
+        proxy = True
+        app_label = "core"
+        verbose_name = "Knowledge Base Group"
+        verbose_name_plural = "Knowledge Base Groups"

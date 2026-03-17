@@ -1,7 +1,7 @@
 import email
 
 from django.contrib.auth.models import User
-from django.contrib.auth.hashers import check_password
+from django.contrib.auth.hashers import check_password, make_password
 from django.db import transaction
 import threading
 
@@ -10,6 +10,7 @@ from django.conf import settings
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.parsers import MultiPartParser, FormParser
 
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -18,7 +19,10 @@ from rest_framework import status
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import Business, Customer, Item, ItemGroup, Role, Proposal, StaffProfile
-from .serializers import BusinessSerializer, RoleSerializer, ProposalSerializer
+from ms_crm_app.models import Staff, KnowledgeBase, KnowledgeBaseGroups
+from ms_crm_app.helpers.ensure_tables import ensure_project_tables, ensure_knowledge_base_tables
+from ms_crm_app.helpers.ensure_tables import ensure_staff_table
+from .serializers import BusinessSerializer, RoleSerializer, ProposalSerializer, StaffSerializer
 from core.seeders.email_templates import seed_email_templates_optimized
 from rest_framework.permissions import AllowAny
 from rest_framework.views import APIView
@@ -28,8 +32,24 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.viewsets import ModelViewSet
 from .models import Expense
 from .serializers import ExpenseSerializer
-from .models import Contract
-from .serializers import ContractSerializer
+from .models import (
+    Contract,
+    ContractType,
+    ContractAttachment,
+    ContractComment,
+    ContractRenewal,
+    ContractTask,
+    ContractNote,
+)
+from .serializers import (
+    ContractSerializer,
+    ContractTypeSerializer,
+    ContractAttachmentSerializer,
+    ContractCommentSerializer,
+    ContractRenewalSerializer,
+    ContractTaskSerializer,
+    ContractNoteSerializer,
+)
 
 from django.contrib import admin
 from .models import Expense
@@ -92,6 +112,11 @@ from .serializers import ContactSerializer
 from .serializers import CreditNoteReminderSerializer, CreditNoteSerializer, CreditNoteTaskSerializer
 from .serializers import ItemGroupSerializer, ItemSerializer
 from .item_master import sync_item_to_master, sync_items_to_master
+from .models import Project
+from .serializers import ProjectSerializer
+from django.db.models import Count, Sum
+from django.db.utils import OperationalError, ProgrammingError
+from django.utils.text import slugify
 
 class ApprovedUsersView(APIView):
 
@@ -247,6 +272,198 @@ class LeadViewSet(viewsets.ModelViewSet):
     queryset = Lead.objects.all().order_by("-id")
     serializer_class = LeadSerializer
 
+
+class ProjectViewSet(ModelViewSet):
+    queryset = Project.objects.all().select_related("client").prefetch_related("members").order_by("-id")
+    serializer_class = ProjectSerializer
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def _missing_table_error(self):
+        return Response(
+            {
+                "detail": "Projects table not found. Run backend migrations (core 0044_project).",
+            },
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    def _handle_missing_table(self, exc, *, empty_ok: bool):
+        msg = str(exc)
+        if "core_project" in msg and ("doesn't exist" in msg or "1146" in msg):
+            # Table not created yet (migration not applied).
+            return Response([]) if empty_ok else self._missing_table_error()
+        return None
+
+    def get_queryset(self):
+        try:
+            ensure_project_tables()
+        except Exception as exc:
+            print("Project table ensure failed:", exc)
+        qs = super().get_queryset()
+
+        client_id = (
+            self.request.query_params.get("clientid")
+            or self.request.query_params.get("client")
+        )
+        if client_id:
+            try:
+                qs = qs.filter(client_id=int(client_id))
+            except (TypeError, ValueError):
+                pass
+
+        return qs
+
+    def list(self, request, *args, **kwargs):
+        try:
+            ensure_project_tables()
+            return super().list(request, *args, **kwargs)
+        except (ProgrammingError, OperationalError) as exc:
+            handled = self._handle_missing_table(exc, empty_ok=True)
+            if handled is not None:
+                return handled
+            raise
+
+    def create(self, request, *args, **kwargs):
+        try:
+            ensure_project_tables()
+            return super().create(request, *args, **kwargs)
+        except (ProgrammingError, OperationalError) as exc:
+            handled = self._handle_missing_table(exc, empty_ok=False)
+            if handled is not None:
+                return handled
+            raise
+
+    def perform_create(self, serializer):
+        project = serializer.save(created_by=getattr(self.request, "user", None))
+
+        if not getattr(project, "send_email", False):
+            return
+
+        mentor = getattr(project, "mentor", None) or getattr(project, "created_by", None)
+        recipients = set()
+
+        if mentor and getattr(mentor, "email", None):
+            recipients.add(mentor.email)
+
+        for member in project.members.all():
+            if getattr(member, "email", None):
+                recipients.add(member.email)
+
+        recipients = [e for e in recipients if e]
+        if not recipients:
+            return
+
+        client_name = getattr(getattr(project, "client", None), "company", None) or "-"
+        start_date = project.start_date.isoformat() if project.start_date else "-"
+        deadline = project.deadline.isoformat() if project.deadline else "-"
+        mentor_name = _user_display(mentor) if mentor else "-"
+        member_names = ", ".join([_user_display(m) for m in project.members.all()]) or "-"
+        visible_tabs = ", ".join(project.visible_tabs or []) or "-"
+        settings_list = "<br/>".join([f"• {s}" for s in (project.settings or [])]) or "-"
+
+        subject = f"New Project Created: {project.name}"
+        html_message = f"""
+<h3>New project created</h3>
+<p><b>Project:</b> {project.name}</p>
+<p><b>Customer:</b> {client_name}</p>
+<p><b>Mentor:</b> {mentor_name}</p>
+<p><b>Members:</b> {member_names}</p>
+<p><b>Status:</b> {project.status}</p>
+<p><b>Start:</b> {start_date}</p>
+<p><b>Deadline:</b> {deadline}</p>
+<p><b>Visible Tabs:</b> {visible_tabs}</p>
+<p><b>Project Settings:</b><br/>{settings_list}</p>
+<hr/>
+{project.description or ""}
+"""
+        message = strip_tags(html_message)
+
+        try:
+            send_mail(
+                subject,
+                message,
+                settings.DEFAULT_FROM_EMAIL,
+                recipients,
+                fail_silently=False,
+                html_message=html_message,
+            )
+        except Exception as e:
+            # Don't fail project creation because of email.
+            print("Project email failed:", e)
+
+    @action(detail=True, methods=["post"])
+    def send_created_email(self, request, pk=None):
+        project = self.get_object()
+
+        mentor = getattr(project, "mentor", None) or getattr(project, "created_by", None)
+        recipients = set()
+
+        if mentor and getattr(mentor, "email", None):
+            recipients.add(mentor.email)
+
+        for member in project.members.all():
+            if getattr(member, "email", None):
+                recipients.add(member.email)
+
+        recipients = [e for e in recipients if e]
+        if not recipients:
+            return Response({"detail": "No recipient emails found."}, status=status.HTTP_400_BAD_REQUEST)
+
+        client_name = getattr(getattr(project, "client", None), "company", None) or "-"
+        start_date = project.start_date.isoformat() if project.start_date else "-"
+        deadline = project.deadline.isoformat() if project.deadline else "-"
+        mentor_name = _user_display(mentor) if mentor else "-"
+        member_names = ", ".join([_user_display(m) for m in project.members.all()]) or "-"
+        visible_tabs = ", ".join(project.visible_tabs or []) or "-"
+        settings_list = "<br/>".join([f"• {s}" for s in (project.settings or [])]) or "-"
+
+        subject = f"New Project Created: {project.name}"
+        html_message = f"""
+<h3>New project created</h3>
+<p><b>Project:</b> {project.name}</p>
+<p><b>Customer:</b> {client_name}</p>
+<p><b>Mentor:</b> {mentor_name}</p>
+<p><b>Members:</b> {member_names}</p>
+<p><b>Status:</b> {project.status}</p>
+<p><b>Start:</b> {start_date}</p>
+<p><b>Deadline:</b> {deadline}</p>
+<p><b>Visible Tabs:</b> {visible_tabs}</p>
+<p><b>Project Settings:</b><br/>{settings_list}</p>
+<hr/>
+{project.description or ""}
+"""
+        message = strip_tags(html_message)
+
+        try:
+            send_mail(
+                subject,
+                message,
+                settings.DEFAULT_FROM_EMAIL,
+                recipients,
+                fail_silently=False,
+                html_message=html_message,
+            )
+        except Exception as e:
+            return Response({"detail": f"Email failed: {e}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({"message": "Email sent", "recipients": recipients})
+
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        try:
+            qs = self.get_queryset()
+            summary = (
+                qs.values("status")
+                .annotate(count=Count("id"), total_rate=Sum("total_rate"))
+                .order_by("status")
+            )
+            return Response(list(summary))
+        except (ProgrammingError, OperationalError) as exc:
+            handled = self._handle_missing_table(exc, empty_ok=True)
+            if handled is not None:
+                return handled
+            raise
+
 class SmallStatsView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -274,11 +491,169 @@ class ExpenseViewSet(ModelViewSet):
     permission_classes = [IsAuthenticated]
 
 
+class ContractTypeViewSet(ModelViewSet):
+    queryset = ContractType.objects.all().order_by("name", "id")
+    serializer_class = ContractTypeSerializer
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+
+def _user_display(user):
+    return (
+        getattr(user, "username", None)
+        or getattr(user, "email", None)
+        or getattr(user, "get_username", lambda: "")()
+        or str(user)
+    )
+
+
+class _ContractChildFilterMixin:
+    contract_query_param = "contract"
+
+    def filter_by_contract(self, qs):
+        contract_id = self.request.query_params.get(self.contract_query_param)
+        if contract_id:
+            return qs.filter(contract_id=contract_id)
+        return qs.none()
+
+
+class ContractAttachmentViewSet(_ContractChildFilterMixin, ModelViewSet):
+    queryset = ContractAttachment.objects.all().order_by("-uploaded_at", "-id")
+    serializer_class = ContractAttachmentSerializer
+    parser_classes = [MultiPartParser, FormParser]
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return self.filter_by_contract(super().get_queryset())
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        ctx["request"] = self.request
+        return ctx
+
+    def perform_create(self, serializer):
+        serializer.save(uploaded_by=_user_display(self.request.user))
+
+
+class ContractCommentViewSet(_ContractChildFilterMixin, ModelViewSet):
+    queryset = ContractComment.objects.all().order_by("-created_at", "-id")
+    serializer_class = ContractCommentSerializer
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return self.filter_by_contract(super().get_queryset())
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=_user_display(self.request.user))
+
+
+class ContractNoteViewSet(_ContractChildFilterMixin, ModelViewSet):
+    queryset = ContractNote.objects.all().order_by("-created_at", "-id")
+    serializer_class = ContractNoteSerializer
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return self.filter_by_contract(super().get_queryset())
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=_user_display(self.request.user))
+
+
+class ContractTaskViewSet(_ContractChildFilterMixin, ModelViewSet):
+    queryset = ContractTask.objects.all().order_by("-created_at", "-id")
+    serializer_class = ContractTaskSerializer
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return self.filter_by_contract(super().get_queryset())
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=_user_display(self.request.user))
+
+
+class ContractRenewalViewSet(_ContractChildFilterMixin, ModelViewSet):
+    queryset = ContractRenewal.objects.all().order_by("-renewed_at", "-id")
+    serializer_class = ContractRenewalSerializer
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return self.filter_by_contract(super().get_queryset())
+
+    def perform_create(self, serializer):
+        contract = serializer.validated_data.get("contract")
+        renewal = serializer.save(
+            old_start_date=getattr(contract, "start_date", None),
+            old_end_date=getattr(contract, "end_date", None),
+            old_value=getattr(contract, "contract_value", None),
+            renewed_by=_user_display(self.request.user),
+        )
+
+        # Update contract to renewed values (if provided)
+        updated = False
+        if renewal.new_start_date:
+            contract.start_date = renewal.new_start_date
+            updated = True
+        if renewal.new_end_date:
+            contract.end_date = renewal.new_end_date
+            updated = True
+        if renewal.new_value is not None:
+            contract.contract_value = renewal.new_value
+            updated = True
+
+        if updated:
+            contract.save(update_fields=["start_date", "end_date", "contract_value"])
+
+
 class ContractViewSet(ModelViewSet):
     queryset = Contract.objects.all().order_by("-id")
     serializer_class = ContractSerializer
     authentication_classes = [JWTAuthentication, SessionAuthentication]
     permission_classes = [IsAuthenticated]
+
+    @action(detail=True, methods=["post"], url_path="convert-to-invoice")
+    def convert_to_invoice(self, request, pk=None):
+        contract = self.get_object()
+
+        customer = getattr(contract, "customer_ref", None)
+        if not customer and getattr(contract, "customer", None):
+            customer = Client.objects.filter(company__iexact=str(contract.customer).strip()).first()
+
+        if not customer:
+            return Response(
+                {"error": "Contract customer is missing"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        make_draft = bool(request.data.get("draft", True))
+        inv_status = "Draft" if make_draft else "Unpaid"
+
+        value = getattr(contract, "contract_value", None) or 0
+        invoice = Invoice.objects.create(
+            invoice_number=f"INV-CON-{contract.id}",
+            customer=customer,
+            invoice_date=timezone.now().date(),
+            due_date=timezone.now().date(),
+            payment_mode="Null",
+            subtotal=value,
+            tax_amount=0,
+            total_amount=value,
+            status=inv_status,
+            items=[
+                {
+                    "description": contract.subject or "Contract",
+                    "long_description": (contract.content or contract.description or "").strip(),
+                    "qty": 1,
+                    "rate": float(value) if value else 0,
+                }
+            ],
+        )
+
+        return Response(InvoiceSerializer(invoice, context={"request": request}).data, status=201)
 
 # =========================
 # REGISTER BUSINESS
@@ -1445,7 +1820,217 @@ def contacts_detail(request, pk):
     return Response(_serialize_contact(contact))
 
 
+# ================= STAFF API =================
 @api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def staff_list_create(request):
+    """List all staff members or create a new staff member"""
+    ensure_staff_table()
+
+    if request.method == "GET":
+        staff_members = Staff.objects.all().order_by("-staffid")
+        serializer = StaffSerializer(staff_members, many=True)
+        return Response(serializer.data)
+
+    data = request.data.copy()
+
+    raw_password = (data.get("password") or "").strip()
+    if not raw_password:
+        return Response(
+            {"detail": "Password is required."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    data["password"] = make_password(raw_password)
+    data["admin"] = int(data.get("admin", 0) or 0)
+    data["active"] = int(data.get("active", 1) or 1)
+    data["is_not_staff"] = int(data.get("is_not_staff", 0) or 0)
+    data["default_language"] = data.get("default_language") or "english"
+    data["direction"] = data.get("direction") or "ltr"
+    data["two_factor_auth_enabled"] = int(data.get("two_factor_auth_enabled", 0) or 0)
+
+    try:
+        data["hourly_rate"] = float(data.get("hourly_rate") or 0)
+    except (TypeError, ValueError):
+        data["hourly_rate"] = 0
+
+    serializer = StaffSerializer(data=data)
+    serializer.is_valid(raise_exception=True)
+    staff = serializer.save(datecreated=timezone.now())
+    return Response(StaffSerializer(staff).data, status=status.HTTP_201_CREATED)
+
+
+@api_view(["GET", "PUT", "PATCH", "DELETE"])
+@permission_classes([IsAuthenticated])
+def staff_detail(request, pk):
+    """Get, update or delete a specific staff member"""
+    ensure_staff_table()
+
+    try:
+        staff = Staff.objects.get(pk=pk)
+    except Staff.DoesNotExist:
+        return Response(
+            {"error": "Staff member not found"},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    if request.method == "GET":
+        return Response(StaffSerializer(staff).data)
+
+    if request.method == "DELETE":
+        staff.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    data = request.data.copy()
+
+    if "password" in data:
+        raw_password = (data.get("password") or "").strip()
+        if raw_password:
+            data["password"] = make_password(raw_password)
+        else:
+            data.pop("password", None)
+
+    serializer = StaffSerializer(staff, data=data, partial=True)
+    serializer.is_valid(raise_exception=True)
+    staff = serializer.save()
+    return Response(StaffSerializer(staff).data)
+
+
+def _serialize_kb_group(group):
+    return {
+        "groupid": group.groupid,
+        "name": group.name,
+        "group_slug": group.group_slug,
+        "description": group.description,
+        "active": group.active,
+        "color": group.color,
+        "group_order": group.group_order,
+    }
+
+
+def _serialize_kb_article(article, group_name=None):
+    return {
+        "articleid": article.articleid,
+        "articlegroup": article.articlegroup,
+        "group_name": group_name,
+        "subject": article.subject,
+        "description": article.description,
+        "slug": article.slug,
+        "active": article.active,
+        "datecreated": article.datecreated.isoformat() if article.datecreated else None,
+        "article_order": article.article_order,
+        "staff_article": article.staff_article,
+    }
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def knowledge_base_groups_list_create(request):
+    from core.middleware import get_current_db
+
+    try:
+        ensure_knowledge_base_tables()
+    except Exception as exc:
+        return Response(
+            {"detail": f"Knowledge base tables ensure failed: {exc}"},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    db = get_current_db()
+
+    if request.method == "GET":
+        groups = KnowledgeBaseGroups.objects.using(db).all().order_by("group_order", "groupid")
+        return Response([_serialize_kb_group(g) for g in groups])
+
+    data = request.data or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return Response({"detail": "Group name is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+    group = KnowledgeBaseGroups.objects.using(db).create(
+        name=name,
+        group_slug=(data.get("group_slug") or slugify(name) or name),
+        description=data.get("description") or "",
+        active=int(data.get("active", 1)),
+        color=data.get("color") or "#28B8DA",
+        group_order=int(data.get("group_order") or 0),
+    )
+    return Response(_serialize_kb_group(group), status=status.HTTP_201_CREATED)
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def knowledge_base_list_create(request):
+    from core.middleware import get_current_db
+
+    try:
+        ensure_knowledge_base_tables()
+    except Exception as exc:
+        return Response(
+            {"detail": f"Knowledge base tables ensure failed: {exc}"},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    db = get_current_db()
+
+    if request.method == "GET":
+        qs = KnowledgeBase.objects.using(db).all().order_by("-articleid")
+
+        group_id = request.query_params.get("group")
+        if group_id:
+            try:
+                qs = qs.filter(articlegroup=int(group_id))
+            except (TypeError, ValueError):
+                pass
+
+        active_only = request.query_params.get("active")
+        if active_only is not None and str(active_only).strip() != "":
+            try:
+                qs = qs.filter(active=int(active_only))
+            except (TypeError, ValueError):
+                pass
+
+        groups = KnowledgeBaseGroups.objects.using(db).all()
+        group_map = {g.groupid: g.name for g in groups}
+
+        return Response([_serialize_kb_article(a, group_map.get(a.articlegroup)) for a in qs])
+
+    data = request.data or {}
+    subject = (data.get("subject") or "").strip()
+    description = (data.get("description") or "").strip()
+    if not subject or not description:
+        return Response(
+            {"detail": "Subject and description are required"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    group_id = data.get("articlegroup")
+    if not group_id:
+        first_group = KnowledgeBaseGroups.objects.using(db).order_by("group_order", "groupid").first()
+        group_id = first_group.groupid if first_group else 1
+
+    slug = data.get("slug") or slugify(subject) or subject
+
+    article = KnowledgeBase.objects.using(db).create(
+        articlegroup=int(group_id),
+        subject=subject,
+        description=description,
+        slug=slug,
+        active=int(data.get("active", 1)),
+        datecreated=timezone.now(),
+        article_order=int(data.get("article_order") or 0),
+        staff_article=int(data.get("staff_article") or 0),
+    )
+
+    group_name = None
+    if group_id:
+        grp = KnowledgeBaseGroups.objects.using(db).filter(groupid=group_id).first()
+        group_name = grp.name if grp else None
+    return Response(_serialize_kb_article(article, group_name), status=status.HTTP_201_CREATED)
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
 @permission_classes([IsAuthenticated])
 def items_groups_list_create(request):
     if request.method == "GET":
@@ -1642,7 +2227,88 @@ def creditnote_tasks(request, pk):
     )
     if serializer.is_valid():
         serializer.save()
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+    return Response(serializer.data, status=status.HTTP_201_CREATED)
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+# ========================= MEDIA FILE API =========================
+import os
+from datetime import datetime
+from django.conf import settings
+from rest_framework.parsers import MultiPartParser, FormParser
+
+# In-memory storage for media files (demo mode)
+# In production, use a proper database model and file storage
+MEDIA_FILES = []
+MEDIA_ID_COUNTER = [0]  # Using list to allow modification in nested function
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def media_files_list(request):
+    """Get all media files"""
+    return Response(MEDIA_FILES)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def upload_media(request):
+    """Upload a media file"""
+    if 'file' not in request.FILES:
+        return Response({"error": "No file provided"}, status=400)
+    
+    file = request.FILES['file']
+    MEDIA_ID_COUNTER[0] += 1
+    
+    # Determine file type
+    filename = file.name
+    ext = filename.split('.')[-1].lower() if '.' in filename else ''
+    
+    image_exts = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'svg', 'webp']
+    video_exts = ['mp4', 'avi', 'mov', 'wmv', 'flv']
+    audio_exts = ['mp3', 'wav', 'ogg', 'aac']
+    doc_exts = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt']
+    
+    if ext in image_exts:
+        file_type = 'image'
+    elif ext in video_exts:
+        file_type = 'video'
+    elif ext in audio_exts:
+        file_type = 'audio'
+    elif ext in doc_exts:
+        file_type = 'document'
+    else:
+        file_type = 'other'
+    
+    # Format file size
+    file_size = file.size
+    if file_size >= 1024 * 1024:
+        size_str = f"{round(file_size / (1024 * 1024) * 100) / 100} MB"
+    elif file_size >= 1024:
+        size_str = f"{round(file_size / 1024 * 100) / 100} KB"
+    else:
+        size_str = f"{file_size} Bytes"
+    
+    media_file = {
+        "id": MEDIA_ID_COUNTER[0],
+        "name": filename,
+        "type": file_type,
+        "size": size_str,
+        "url": f"/media/{filename}",
+        "uploaded_at": datetime.now().strftime("%Y-%m-%d")
+    }
+    
+    MEDIA_FILES.append(media_file)
+    
+    return Response(media_file, status=201)
+
+
+@api_view(["DELETE"])
+@permission_classes([IsAuthenticated])
+def media_file_delete(request, pk):
+    """Delete a media file"""
+    global MEDIA_FILES
+    MEDIA_FILES = [f for f in MEDIA_FILES if f["id"] != int(pk)]
+    return Response({"status": "deleted"}, status=200)
 
 

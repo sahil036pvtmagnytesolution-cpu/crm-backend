@@ -5,7 +5,13 @@ from django.shortcuts import redirect
 from django.conf import settings
 from django.contrib.auth.models import User
 
-from .models import Business
+from .models import (
+    Business,
+    Project,
+    StaffProxy,
+    KnowledgeBaseProxy,
+    KnowledgeBaseGroupProxy,
+)
 from django.db import connection
 
 from django.contrib import admin
@@ -19,6 +25,11 @@ from django.contrib import admin
 from .models import Lead
 from .models import Invoice, InvoicePayment
 from .models import AdminClient, AdminContact
+from ms_crm_app.helpers.ensure_tables import (
+    ensure_staff_table,
+    ensure_project_tables,
+    ensure_knowledge_base_tables,
+)
 
 import MySQLdb
 
@@ -321,3 +332,63 @@ class AdminContactAdmin(LegacyTenantAdminMixin, admin.ModelAdmin):
     list_filter = ("active", "is_primary", "created_at")
     search_fields = ("firstname", "lastname", "email", "phonenumber")
     ordering = ("-created_at", "-id")
+
+
+@admin.register(Project)
+class ProjectAdmin(admin.ModelAdmin):
+    list_display = ("id", "name", "client", "status", "start_date", "deadline", "created_at")
+    list_filter = ("status", "billing_type", "created_at")
+    search_fields = ("name", "client__company", "tags")
+    ordering = ("-created_at", "-id")
+
+    def get_queryset(self, request):
+        try:
+            ensure_project_tables()
+        except Exception as exc:
+            print("Project table ensure failed (admin):", exc)
+        return super().get_queryset(request)
+
+
+@admin.register(StaffProxy)
+class StaffAdmin(admin.ModelAdmin):
+    list_display = ("staffid", "firstname", "lastname", "email", "phonenumber", "admin", "active", "datecreated")
+    list_filter = ("admin", "active")
+    search_fields = ("firstname", "lastname", "email", "phonenumber")
+    ordering = ("-staffid",)
+
+    def get_queryset(self, request):
+        try:
+            ensure_staff_table()
+        except Exception as exc:
+            print("Staff table ensure failed (admin):", exc)
+        return super().get_queryset(request)
+
+
+@admin.register(KnowledgeBaseGroupProxy)
+class KnowledgeBaseGroupAdmin(admin.ModelAdmin):
+    list_display = ("groupid", "name", "active", "group_order", "color")
+    list_filter = ("active",)
+    search_fields = ("name", "group_slug")
+    ordering = ("group_order", "groupid")
+
+    def get_queryset(self, request):
+        try:
+            ensure_knowledge_base_tables()
+        except Exception as exc:
+            print("Knowledge base tables ensure failed (admin):", exc)
+        return super().get_queryset(request)
+
+
+@admin.register(KnowledgeBaseProxy)
+class KnowledgeBaseAdmin(admin.ModelAdmin):
+    list_display = ("articleid", "subject", "articlegroup", "active", "datecreated")
+    list_filter = ("active",)
+    search_fields = ("subject", "slug")
+    ordering = ("-articleid",)
+
+    def get_queryset(self, request):
+        try:
+            ensure_knowledge_base_tables()
+        except Exception as exc:
+            print("Knowledge base tables ensure failed (admin):", exc)
+        return super().get_queryset(request)

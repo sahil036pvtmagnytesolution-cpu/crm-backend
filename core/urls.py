@@ -13,6 +13,12 @@ from .views import (
     users_list,
     ExpenseViewSet,
     ContractViewSet,
+    ContractTypeViewSet,
+    ContractAttachmentViewSet,
+    ContractCommentViewSet,
+    ContractRenewalViewSet,
+    ContractTaskViewSet,
+    ContractNoteViewSet,
     SmallStatsView,
     LeadViewSet,
     leads_overview,
@@ -28,6 +34,10 @@ from .views import (
     toggle_client_active,
     contacts_list_create,
     contacts_detail,
+    staff_list_create,
+    staff_detail,
+    knowledge_base_groups_list_create,
+    knowledge_base_list_create,
     items_groups_list_create,
     items_groups_detail,
     items_list_create,
@@ -37,19 +47,28 @@ from .views import (
     creditnote_detail,
     creditnote_reminders,
     creditnote_tasks,
+    ProjectViewSet,
 )
 from .views import ClientViewSet, ApprovedUsersView
+from .views import media_files_list, upload_media, media_file_delete
 from . import views
 
 router = DefaultRouter()
 
 router.register(r'expenses', ExpenseViewSet, basename="expenses")
 router.register(r'contracts', ContractViewSet, basename="contracts")
+router.register(r'contract-types', ContractTypeViewSet, basename="contract-types")
+router.register(r'contract-attachments', ContractAttachmentViewSet, basename="contract-attachments")
+router.register(r'contract-comments', ContractCommentViewSet, basename="contract-comments")
+router.register(r'contract-renewals', ContractRenewalViewSet, basename="contract-renewals")
+router.register(r'contract-tasks', ContractTaskViewSet, basename="contract-tasks")
+router.register(r'contract-notes', ContractNoteViewSet, basename="contract-notes")
 router.register(r'leads', LeadViewSet)
 router.register(r'clients', ClientViewSet)
 router.register(r'calendar-events', CalendarEventViewSet, basename="calendar-events")
 router.register(r'estimates', EstimateViewSet, basename='estimates')
 router.register(r'proposals', ProposalViewSet)
+router.register(r'projects', ProjectViewSet, basename="projects")
 
 urlpatterns = [
 
@@ -73,6 +92,14 @@ urlpatterns = [
     path("contacts/", contacts_list_create),
     path("contacts/<int:pk>/", contacts_detail),
 
+    # Staff
+    path("staff/", staff_list_create),
+    path("staff/<int:pk>/", staff_detail),
+
+    # Knowledge Base
+    path("knowledge-base-groups/", knowledge_base_groups_list_create),
+    path("knowledge-base/", knowledge_base_list_create),
+
     # Items
     path("Items/", items_list_create),
     path("Items/<int:pk>/", items_detail),
@@ -85,6 +112,27 @@ urlpatterns = [
     path("Creditnotesave/<int:pk>/", creditnote_detail),
     path("Creditnote/<int:pk>/reminders/", creditnote_reminders),
     path("Creditnotes/<int:pk>/tasks/", creditnote_tasks),
+
+    # Projects (back-compat with older frontend paths)
+    path(
+        "Projects/",
+        ProjectViewSet.as_view({"get": "list", "post": "create"}),
+    ),
+    path(
+        "Projects/summary/",
+        ProjectViewSet.as_view({"get": "summary"}),
+    ),
+    path(
+        "Projects/<int:pk>/",
+        ProjectViewSet.as_view(
+            {
+                "get": "retrieve",
+                "put": "update",
+                "patch": "partial_update",
+                "delete": "destroy",
+            }
+        ),
+    ),
 
     # Router URLs
     path("", include(router.urls)),
@@ -134,6 +182,10 @@ urlpatterns = [
 
     # customers
     path("clients/<int:pk>/toggle-active/", toggle_client_active),
-
-
-]
+    
+    # Media API
+    path("media-files/", media_files_list, name="media-files-list"),
+    path("media-files/<int:pk>/", media_file_delete, name="media-file-delete"),
+    path("upload-media/", upload_media, name="upload-media"),
+    
+    ]
