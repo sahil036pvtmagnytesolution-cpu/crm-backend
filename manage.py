@@ -2,6 +2,9 @@
 """Django's command-line utility for administrative tasks."""
 import os
 import sys
+import pymysql
+pymysql.install_as_MySQLdb()
+pymysql.version_info = (2, 2, 1, "final", 0)
 
 
 def main():

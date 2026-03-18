@@ -6,6 +6,7 @@ from .views import (
     proposal_detail,
     register_business,
     login,
+    logout,
     roles_api,
     approve_role,
     sales_proposals,
@@ -48,6 +49,15 @@ from .views import (
     creditnote_reminders,
     creditnote_tasks,
     ProjectViewSet,
+    announcements_list,
+    announcements_detail,
+    goals_list,
+    goals_detail,
+    activity_log_list,
+    activity_logs_api,
+    surveys_list,
+    database_backups,
+    ticket_pipe_log_list,
 )
 from .views import ClientViewSet, ApprovedUsersView
 from .views import media_files_list, upload_media, media_file_delete
@@ -75,6 +85,7 @@ urlpatterns = [
     # Auth
     path("register-business/", register_business),
     path("login/", login),
+    path("logout/", logout),
 
     # Roles
     path("Roles/", roles_api),
@@ -187,5 +198,16 @@ urlpatterns = [
     path("media-files/", media_files_list, name="media-files-list"),
     path("media-files/<int:pk>/", media_file_delete, name="media-file-delete"),
     path("upload-media/", upload_media, name="upload-media"),
+
+    # Utilities
+    path("utilities/announcements/", announcements_list),
+    path("utilities/announcements/<int:pk>/", announcements_detail),
+    path("utilities/goals/", goals_list),
+    path("utilities/goals/<int:pk>/", goals_detail),
+    path("utilities/activity-log/", activity_log_list),
+    path("activity-logs/", activity_logs_api),
+    path("utilities/surveys/", surveys_list),
+    path("utilities/database-backups/", database_backups),
+    path("utilities/ticket-pipe-log/", ticket_pipe_log_list),
     
     ]

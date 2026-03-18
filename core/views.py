@@ -18,10 +18,37 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import Business, Customer, Item, ItemGroup, Role, Proposal, StaffProfile
-from ms_crm_app.models import Staff, KnowledgeBase, KnowledgeBaseGroups
-from ms_crm_app.helpers.ensure_tables import ensure_project_tables, ensure_knowledge_base_tables
-from ms_crm_app.helpers.ensure_tables import ensure_staff_table
+from .models import (
+    Business,
+    Customer,
+    Item,
+    ItemGroup,
+    Role,
+    Proposal,
+    StaffProfile,
+    ActivityLog as CoreActivityLog,
+)
+from ms_crm_app.models import (
+    Staff,
+    KnowledgeBase,
+    KnowledgeBaseGroups,
+    ActivityLog as LegacyActivityLog,
+    Announcements as LegacyAnnouncements,
+    Goals as LegacyGoals,
+    Surveys as LegacySurveys,
+    TicketsPipeLog as LegacyTicketsPipeLog,
+)
+from ms_crm_app.helpers.ensure_tables import (
+    ensure_project_tables,
+    ensure_knowledge_base_tables,
+    ensure_staff_table,
+    ensure_announcements_table,
+    ensure_goals_table,
+    ensure_activity_log_table,
+    ensure_surveys_table,
+    ensure_tickets_pipe_log_table,
+)
+from core.utils.activity_log import log_activity, serialize_activity_log
 from .serializers import BusinessSerializer, RoleSerializer, ProposalSerializer, StaffSerializer
 from core.seeders.email_templates import seed_email_templates_optimized
 from rest_framework.permissions import AllowAny
@@ -69,6 +96,8 @@ from rest_framework.permissions import AllowAny
 from rest_framework import generics
 from rest_framework.response import Response
 from rest_framework import status
+from django.db import connections
+import re
 from .models import Estimate
 from .serializers import EstimateSerializer
 
@@ -205,11 +234,11 @@ class EstimateViewSet(ModelViewSet):
     # ================ Create Estimate =================
     def perform_create(self, serializer):
         estimate = serializer.save()
-        create_invoice_from_estimate(estimate)
+        create_invoice_from_estimate(estimate, user=getattr(self.request, "user", None))
     # ================ Update Estimate =================
     def perform_update(self, serializer):
         estimate = serializer.save()
-        create_invoice_from_estimate(estimate)
+        create_invoice_from_estimate(estimate, user=getattr(self.request, "user", None))
 
     # ================= CREATE INVOICE =================
     def create_invoice(self, estimate):
@@ -271,6 +300,30 @@ class ClientViewSet(viewsets.ModelViewSet):
 class LeadViewSet(viewsets.ModelViewSet):
     queryset = Lead.objects.all().order_by("-id")
     serializer_class = LeadSerializer
+
+    def perform_create(self, serializer):
+        lead = serializer.save()
+        name = getattr(lead, "name", None) or "Unknown"
+        log_activity(f"Lead Created [Name: {name}]", user=getattr(self.request, "user", None))
+
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        old_status = getattr(instance, "status", None)
+        lead = serializer.save()
+        name = getattr(lead, "name", None) or "Unknown"
+        new_status = getattr(lead, "status", None)
+        if old_status != new_status and new_status is not None:
+            log_activity(
+                f"Lead Status Changed [Name: {name} | Status: {old_status} -> {new_status}]",
+                user=getattr(self.request, "user", None),
+            )
+        else:
+            log_activity(f"Lead Updated [Name: {name}]", user=getattr(self.request, "user", None))
+
+    def perform_destroy(self, instance):
+        name = getattr(instance, "name", None) or "Unknown"
+        super().perform_destroy(instance)
+        log_activity(f"Lead Deleted [Name: {name}]", user=getattr(self.request, "user", None))
 
 
 class ProjectViewSet(ModelViewSet):
@@ -716,18 +769,22 @@ def login(request):
     try:
         user = User.objects.get(username=email)
     except User.DoesNotExist:
+        log_activity(f"Failed Login Attempt [Email: {email or '-'}]", user=None)
         return Response({"message": "Invalid credentials"}, status=401)
 
     if not user.is_active:
+        log_activity(f"Failed Login Attempt [Email: {email or '-'}]", user=None)
         return Response(
             {"message": "Business not approved by admin yet"},
             status=403,
         )
 
     if not check_password(password, user.password):
+        log_activity(f"Failed Login Attempt [Email: {email or '-'}]", user=None)
         return Response({"message": "Invalid credentials"}, status=401)
 
     refresh = RefreshToken.for_user(user)
+    log_activity(f"Staff Login [Email: {user.email or user.username}]", user=user)
 
     return Response(
         {
@@ -741,6 +798,17 @@ def login(request):
         },
         status=200,
     )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def logout(request):
+    user = getattr(request, "user", None)
+    identifier = "-"
+    if user is not None:
+        identifier = user.email or user.username or "-"
+    log_activity(f"Staff Logout [Email: {identifier}]", user=user)
+    return Response({"message": "Logged out"}, status=status.HTTP_200_OK)
 
 
 # =========================
@@ -999,12 +1067,6 @@ def small_stats(request):
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
-def dashboard_overview(request):
-    return Response([])
-
-
-@api_view(["GET"])
-@permission_classes([IsAuthenticated])
 def leads_overview(request):
     return Response({
         "labels": ["New", "Contacted", "Qualified"],
@@ -1026,12 +1088,32 @@ def project_status(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def weekly_payments(request):
+    today = timezone.localdate()
+    start_date = today - timedelta(days=6)
+    days = [start_date + timedelta(days=offset) for offset in range(7)]
+    totals = {day: 0.0 for day in days}
+
+    payments = InvoicePayment.objects.filter(payment_date__range=(start_date, today))
+    for payment in payments:
+        pay_date = payment.payment_date
+        if isinstance(pay_date, datetime):
+            pay_date = pay_date.date()
+        if pay_date in totals:
+            try:
+                amount = float(payment.amount or 0)
+            except (TypeError, ValueError):
+                amount = 0.0
+            totals[pay_date] += amount
+
+    labels = [day.strftime("%a") for day in days]
+    data = [round(totals[day], 2) for day in days]
+
     return Response({
-        "labels": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+        "labels": labels,
         "datasets": [
             {
                 "label": "Payments",
-                "data": [0, 0, 0, 0, 0]
+                "data": data
             }
         ]
     })
@@ -1069,6 +1151,29 @@ class ClientViewSet(viewsets.ModelViewSet):
 
         self.perform_create(serializer)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    def perform_create(self, serializer):
+        client = serializer.save()
+        name = getattr(client, "company", None) or "Unknown"
+        log_activity(f"Customer Created [Name: {name}]", user=getattr(self.request, "user", None))
+
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        old_active = getattr(instance, "is_active", None)
+        client = serializer.save()
+        name = getattr(client, "company", None) or "Unknown"
+        log_activity(f"Customer Updated [Name: {name}]", user=getattr(self.request, "user", None))
+        if old_active is not None and old_active != getattr(client, "is_active", None):
+            log_activity(
+                f"Customer Status Changed [Name: {name} | Active: {old_active} -> {client.is_active}]",
+                user=getattr(self.request, "user", None),
+            )
+
+    def perform_destroy(self, instance):
+        name = getattr(instance, "company", None) or "Unknown"
+        super().perform_destroy(instance)
+        log_activity(f"Customer Deleted [Name: {name}]", user=getattr(self.request, "user", None))
+
     
 # ========================= EmailCampaign =========================
 @api_view(["POST"])
@@ -1171,7 +1276,7 @@ def send_single_email(request):
             "error": str(e)
         }, status=400)
 # ========================= Invoice Model =========================
-def _sync_invoice_payment(invoice):
+def _sync_invoice_payment(invoice, user=None):
     payment = InvoicePayment.objects.filter(invoice=invoice).first()
 
     if payment:
@@ -1179,6 +1284,10 @@ def _sync_invoice_payment(invoice):
         payment.transaction_id = f"{invoice.payment_mode}-{invoice.id}"
         payment.amount = invoice.total_amount
         payment.save()
+        log_activity(
+            f"Payment Updated [Invoice No: {invoice.invoice_number}]",
+            user=user,
+        )
         return
 
     InvoicePayment.objects.create(
@@ -1186,6 +1295,10 @@ def _sync_invoice_payment(invoice):
         payment_mode=invoice.payment_mode or "Null",
         transaction_id=f"{invoice.payment_mode}-{invoice.id}",
         amount=invoice.total_amount,
+    )
+    log_activity(
+        f"Payment Added [Invoice No: {invoice.invoice_number}]",
+        user=user,
     )
 
 
@@ -1221,7 +1334,11 @@ def invoice_list(request):
         serializer = InvoiceSerializer(data=payload)
         if serializer.is_valid():
             invoice = serializer.save()
-            _sync_invoice_payment(invoice)
+            _sync_invoice_payment(invoice, user=getattr(request, "user", None))
+            log_activity(
+                f"Invoice Created [Invoice No: {invoice.invoice_number}]",
+                user=getattr(request, "user", None),
+            )
             return Response(InvoiceSerializer(invoice).data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=400)
 
@@ -1276,10 +1393,18 @@ def invoice_detail(request, pk):
         serializer = InvoiceSerializer(invoice, data=data, partial=True)
         if serializer.is_valid():
             updated_invoice = serializer.save()
-            _sync_invoice_payment(updated_invoice)
+            _sync_invoice_payment(updated_invoice, user=getattr(request, "user", None))
+            log_activity(
+                f"Invoice Updated [Invoice No: {updated_invoice.invoice_number}]",
+                user=getattr(request, "user", None),
+            )
             return Response(InvoiceSerializer(updated_invoice).data)
         return Response(serializer.errors, status=400)
 
+    log_activity(
+        f"Invoice Deleted [Invoice No: {invoice.invoice_number}]",
+        user=getattr(request, "user", None),
+    )
     invoice.delete()
     return Response({"message": "Invoice deleted successfully"}, status=204)
 # ====================== Invoice Reminders ======================
@@ -1442,6 +1567,11 @@ def create_invoice_payment(request):
 
     if serializer.is_valid():
         payment = serializer.save()
+        invoice_no = getattr(getattr(payment, "invoice", None), "invoice_number", None) or "-"
+        log_activity(
+            f"Payment Added [Invoice No: {invoice_no}]",
+            user=getattr(request, "user", None),
+        )
 
         return Response({
             "success": True,
@@ -1604,7 +1734,7 @@ def fix_estimate_invoices(request):
     })
 
 # ====================== HELPER FUNCTION ======================
-def create_invoice_from_estimate(estimate):
+def create_invoice_from_estimate(estimate, user=None):
 
     # 🔹 Only create when status is Sent
     if estimate.status != "Sent":
@@ -1639,6 +1769,10 @@ def create_invoice_from_estimate(estimate):
             items=getattr(estimate, "items", []),
         )
 
+    log_activity(
+        f"Invoice Created [Invoice No: {invoice.invoice_number}]",
+        user=user,
+    )
     print("✅ Invoice created from estimate:", invoice.invoice_number)
 
 # ======================== Customer Pach =========================
@@ -1651,10 +1785,22 @@ def toggle_client_active(request, pk):
     except Client.DoesNotExist:
         return Response({"error": "Client not found"}, status=404)
 
-    is_active = request.data.get("is_active")
+    old_active = client.is_active
+    raw_active = request.data.get("is_active")
+    if isinstance(raw_active, str):
+        is_active = raw_active.strip().lower() in {"1", "true", "yes", "y"}
+    elif raw_active is None:
+        is_active = client.is_active
+    else:
+        is_active = bool(raw_active)
 
     client.is_active = is_active
     client.save()
+    name = getattr(client, "company", None) or "Unknown"
+    log_activity(
+        f"Customer Status Changed [Name: {name} | Active: {old_active} -> {is_active}]",
+        user=getattr(request, "user", None),
+    )
 
     # invoices
     Invoice.objects.filter(customer=client).update(
@@ -1857,6 +2003,8 @@ def staff_list_create(request):
     serializer = StaffSerializer(data=data)
     serializer.is_valid(raise_exception=True)
     staff = serializer.save(datecreated=timezone.now())
+    staff_name = f"{getattr(staff, 'firstname', '')} {getattr(staff, 'lastname', '')}".strip() or getattr(staff, "email", "") or "Staff"
+    log_activity(f"Staff Created [Name: {staff_name}]", user=getattr(request, "user", None))
     return Response(StaffSerializer(staff).data, status=status.HTTP_201_CREATED)
 
 
@@ -1878,6 +2026,8 @@ def staff_detail(request, pk):
         return Response(StaffSerializer(staff).data)
 
     if request.method == "DELETE":
+        staff_name = f"{getattr(staff, 'firstname', '')} {getattr(staff, 'lastname', '')}".strip() or getattr(staff, "email", "") or "Staff"
+        log_activity(f"Staff Deleted [Name: {staff_name}]", user=getattr(request, "user", None))
         staff.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -1890,9 +2040,16 @@ def staff_detail(request, pk):
         else:
             data.pop("password", None)
 
+    old_active = getattr(staff, "active", None)
     serializer = StaffSerializer(staff, data=data, partial=True)
     serializer.is_valid(raise_exception=True)
     staff = serializer.save()
+    if old_active is not None and old_active != getattr(staff, "active", None):
+        staff_name = f"{getattr(staff, 'firstname', '')} {getattr(staff, 'lastname', '')}".strip() or getattr(staff, "email", "") or "Staff"
+        log_activity(
+            f"Staff Status Changed [Name: {staff_name} | Active: {old_active} -> {staff.active}]",
+            user=getattr(request, "user", None),
+        )
     return Response(StaffSerializer(staff).data)
 
 
@@ -2233,7 +2390,7 @@ def creditnote_tasks(request, pk):
 
 # ========================= MEDIA FILE API =========================
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from django.conf import settings
 from rest_framework.parsers import MultiPartParser, FormParser
 
@@ -2310,5 +2467,639 @@ def media_file_delete(request, pk):
     global MEDIA_FILES
     MEDIA_FILES = [f for f in MEDIA_FILES if f["id"] != int(pk)]
     return Response({"status": "deleted"}, status=200)
+
+
+# ========================= UTILITIES APIs =========================
+def _apply_limit(qs, request):
+    limit = request.query_params.get("limit")
+    if limit:
+        try:
+            qs = qs[: int(limit)]
+        except (TypeError, ValueError):
+            pass
+    return qs
+
+
+def _safe_legacy_list(request, model, fields, order_by=None):
+    from core.middleware import get_current_db
+
+    db = get_current_db()
+    try:
+        qs = model.objects.using(db).all()
+        if order_by:
+            qs = qs.order_by(order_by)
+        qs = _apply_limit(qs, request)
+        return Response(list(qs.values(*fields)))
+    except (ProgrammingError, OperationalError) as exc:
+        print(f"Utilities list failed for {model.__name__}: {exc}")
+        return Response([])
+
+
+def _parse_sql_insert_values(values_text):
+    rows = []
+    i = 0
+    n = len(values_text)
+
+    while i < n:
+        c = values_text[i]
+        if c == "(":
+            i += 1
+            fields = []
+            current = []
+            in_string = False
+            escape = False
+
+            while i < n:
+                ch = values_text[i]
+                if in_string:
+                    if escape:
+                        current.append(ch)
+                        escape = False
+                    elif ch == "\\":
+                        escape = True
+                    elif ch == "'":
+                        in_string = False
+                    else:
+                        current.append(ch)
+                else:
+                    if ch == "'":
+                        in_string = True
+                    elif ch == ",":
+                        fields.append("".join(current).strip())
+                        current = []
+                    elif ch == ")":
+                        fields.append("".join(current).strip())
+                        rows.append(fields)
+                        break
+                    else:
+                        current.append(ch)
+                i += 1
+        i += 1
+
+    return rows
+
+
+def _coerce_staffid(value, staff_type, allow_null):
+    if value is None:
+        return None if allow_null else 0
+    if "int" in staff_type or "decimal" in staff_type or "numeric" in staff_type:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                return None if allow_null else 0
+        return None if allow_null else 0
+    return value
+
+
+def _seed_activity_log_if_empty(db_alias):
+    try:
+        with connections[db_alias].cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) FROM ms_activity_log")
+            row = cursor.fetchone()
+            if row and row[0] > 0:
+                return
+
+            cursor.execute("SHOW COLUMNS FROM ms_activity_log LIKE 'staffid'")
+            staff_col = cursor.fetchone()
+            staff_type = (staff_col[1] or "").lower() if staff_col else ""
+            allow_null = (staff_col[2] == "YES") if staff_col else True
+
+            sql_path = os.path.join(settings.BASE_DIR, "my_crm.sql")
+            if not os.path.exists(sql_path):
+                return
+
+            with open(sql_path, "r", encoding="utf-8", errors="ignore") as handle:
+                sql_text = handle.read()
+
+            match = re.search(r"INSERT INTO `ms_activity_log`.*?VALUES\s*(.*?);", sql_text, re.S)
+            if not match:
+                return
+
+            values_text = match.group(1)
+            rows = _parse_sql_insert_values(values_text)
+            if not rows:
+                return
+
+            payload = []
+            for row_vals in rows:
+                if len(row_vals) < 4:
+                    continue
+                def _parse_value(raw):
+                    if raw is None:
+                        return None
+                    raw = raw.strip()
+                    if raw.upper() == "NULL":
+                        return None
+                    if re.fullmatch(r"-?\d+", raw or ""):
+                        try:
+                            return int(raw)
+                        except ValueError:
+                            return raw
+                    return raw
+
+                parsed = [_parse_value(v) for v in row_vals[:4]]
+                parsed[3] = _coerce_staffid(parsed[3], staff_type, allow_null)
+                payload.append(tuple(parsed))
+
+            if payload:
+                cursor.executemany(
+                    "INSERT INTO ms_activity_log (id, description, date, staffid) VALUES (%s, %s, %s, %s)",
+                    payload,
+                )
+    except Exception as exc:
+        print("Activity log seed failed:", exc)
+
+
+def _seed_surveys_if_empty(db_alias):
+    try:
+        with connections[db_alias].cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) FROM ms_surveys")
+            row = cursor.fetchone()
+            if row and row[0] > 0:
+                return
+
+            sql_path = os.path.join(settings.BASE_DIR, "my_crm.sql")
+            if not os.path.exists(sql_path):
+                return
+
+            with open(sql_path, "r", encoding="utf-8", errors="ignore") as handle:
+                sql_text = handle.read()
+
+            match = re.search(r"INSERT INTO `ms_surveys`.*?VALUES\s*(.*?);", sql_text, re.S)
+            if not match:
+                return
+
+            values_text = match.group(1)
+            rows = _parse_sql_insert_values(values_text)
+            if not rows:
+                return
+
+            def _parse_value(raw):
+                if raw is None:
+                    return None
+                raw = raw.strip()
+                if raw.upper() == "NULL":
+                    return None
+                if re.fullmatch(r"-?\d+", raw or ""):
+                    try:
+                        return int(raw)
+                    except ValueError:
+                        return raw
+                return raw
+
+            payload = []
+            for row_vals in rows:
+                if len(row_vals) < 13:
+                    continue
+                parsed = [_parse_value(v) for v in row_vals[:13]]
+                payload.append(tuple(parsed))
+
+            if payload:
+                cursor.executemany(
+                    """
+                    INSERT INTO ms_surveys
+                    (surveyid, subject, slug, description, viewdescription, datecreated,
+                     redirect_url, send, onlyforloggedin, fromname, iprestrict, active, hash)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    payload,
+                )
+    except Exception as exc:
+        print("Surveys seed failed:", exc)
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def announcements_list(request):
+    fields = [
+        "announcementid",
+        "name",
+        "message",
+        "showtousers",
+        "showtostaff",
+        "showname",
+        "dateadded",
+        "userid",
+    ]
+
+    try:
+        ensure_announcements_table()
+    except Exception as exc:
+        print("Announcements table ensure failed:", exc)
+
+    if request.method == "GET":
+        return _safe_legacy_list(request, LegacyAnnouncements, fields, order_by="-dateadded")
+
+    data = request.data or {}
+    name = (data.get("name") or "").strip()
+    message = data.get("message") or ""
+    if not name:
+        return Response({"detail": "Title is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+    showtousers = int(bool(data.get("showtousers") or data.get("show_to_users")))
+    showtostaff = int(bool(data.get("showtostaff") or data.get("show_to_staff")))
+    showname = int(bool(data.get("showname", 1)))
+
+    if showtousers == 0 and showtostaff == 0:
+        return Response(
+            {"detail": "Select at least one audience (users or staff)."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    from core.middleware import get_current_db
+
+    db = get_current_db()
+    try:
+        announcement = LegacyAnnouncements.objects.using(db).create(
+            name=name,
+            message=message,
+            showtousers=showtousers,
+            showtostaff=showtostaff,
+            showname=showname,
+            dateadded=timezone.now(),
+            userid=getattr(request.user, "username", None)
+            or getattr(request.user, "email", None)
+            or "System",
+        )
+    except (ProgrammingError, OperationalError) as exc:
+        print("Announcement create failed:", exc)
+        return Response(
+            {"detail": "Unable to create announcement."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    return Response(
+        {
+            "announcementid": announcement.announcementid,
+            "name": announcement.name,
+            "message": announcement.message,
+            "showtousers": announcement.showtousers,
+            "showtostaff": announcement.showtostaff,
+            "showname": announcement.showname,
+            "dateadded": announcement.dateadded.isoformat() if announcement.dateadded else None,
+            "userid": announcement.userid,
+        },
+        status=status.HTTP_201_CREATED,
+    )
+
+
+@api_view(["PUT", "PATCH", "DELETE"])
+@permission_classes([IsAuthenticated])
+def announcements_detail(request, pk):
+    try:
+        ensure_announcements_table()
+    except Exception as exc:
+        print("Announcements table ensure failed:", exc)
+
+    from core.middleware import get_current_db
+
+    db = get_current_db()
+    announcement = LegacyAnnouncements.objects.using(db).filter(pk=pk).first()
+
+    if not announcement:
+        return Response({"detail": "Announcement not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    if request.method == "DELETE":
+        announcement.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    data = request.data or {}
+    name = data.get("name")
+    message = data.get("message")
+    showtousers = data.get("showtousers")
+    showtostaff = data.get("showtostaff")
+    showname = data.get("showname")
+
+    if name is not None:
+        announcement.name = str(name).strip()
+    if message is not None:
+        announcement.message = message
+    if showtousers is not None:
+        announcement.showtousers = int(bool(showtousers))
+    if showtostaff is not None:
+        announcement.showtostaff = int(bool(showtostaff))
+    if showname is not None:
+        announcement.showname = int(bool(showname))
+
+    if announcement.showtousers == 0 and announcement.showtostaff == 0:
+        return Response(
+            {"detail": "Select at least one audience (users or staff)."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    announcement.save()
+
+    return Response(
+        {
+            "announcementid": announcement.announcementid,
+            "name": announcement.name,
+            "message": announcement.message,
+            "showtousers": announcement.showtousers,
+            "showtostaff": announcement.showtostaff,
+            "showname": announcement.showname,
+            "dateadded": announcement.dateadded.isoformat() if announcement.dateadded else None,
+            "userid": announcement.userid,
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def goals_list(request):
+    fields = [
+        "id",
+        "subject",
+        "description",
+        "start_date",
+        "end_date",
+        "goal_type",
+        "contract_type",
+        "achievement",
+        "notify_when_fail",
+        "notify_when_achieve",
+        "notified",
+        "staff_id",
+    ]
+
+    try:
+        ensure_goals_table()
+    except Exception as exc:
+        print("Goals table ensure failed:", exc)
+
+    if request.method == "GET":
+        return _safe_legacy_list(request, LegacyGoals, fields, order_by="-end_date")
+
+    data = request.data or {}
+    subject = (data.get("subject") or "").strip()
+    description = data.get("description") or ""
+    start_date = data.get("start_date")
+    end_date = data.get("end_date")
+
+    if not subject or not start_date or not end_date:
+        return Response(
+            {"detail": "Subject, start date and end date are required."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    def _to_int(value, default=0):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    from core.middleware import get_current_db
+
+    db = get_current_db()
+    try:
+        goal = LegacyGoals.objects.using(db).create(
+            subject=subject,
+            description=description,
+            start_date=start_date,
+            end_date=end_date,
+            goal_type=_to_int(data.get("goal_type")),
+            contract_type=_to_int(data.get("contract_type")),
+            achievement=_to_int(data.get("achievement")),
+            notify_when_fail=_to_int(data.get("notify_when_fail")),
+            notify_when_achieve=_to_int(data.get("notify_when_achieve")),
+            notified=_to_int(data.get("notified")),
+            staff_id=_to_int(data.get("staff_id")),
+        )
+    except (ProgrammingError, OperationalError) as exc:
+        print("Goals create failed:", exc)
+        return Response(
+            {"detail": "Unable to create goal."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    return Response(
+        {
+            "id": goal.id,
+            "subject": goal.subject,
+            "description": goal.description,
+            "start_date": goal.start_date,
+            "end_date": goal.end_date,
+            "goal_type": goal.goal_type,
+            "contract_type": goal.contract_type,
+            "achievement": goal.achievement,
+            "notify_when_fail": goal.notify_when_fail,
+            "notify_when_achieve": goal.notify_when_achieve,
+            "notified": goal.notified,
+            "staff_id": goal.staff_id,
+        },
+        status=status.HTTP_201_CREATED,
+    )
+
+
+@api_view(["PUT", "PATCH", "DELETE"])
+@permission_classes([IsAuthenticated])
+def goals_detail(request, pk):
+    try:
+        ensure_goals_table()
+    except Exception as exc:
+        print("Goals table ensure failed:", exc)
+
+    from core.middleware import get_current_db
+
+    db = get_current_db()
+    goal = LegacyGoals.objects.using(db).filter(pk=pk).first()
+
+    if not goal:
+        return Response({"detail": "Goal not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    if request.method == "DELETE":
+        goal.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    data = request.data or {}
+
+    if "subject" in data:
+        goal.subject = (data.get("subject") or "").strip()
+    if "description" in data:
+        goal.description = data.get("description") or ""
+    if "start_date" in data:
+        goal.start_date = data.get("start_date") or goal.start_date
+    if "end_date" in data:
+        goal.end_date = data.get("end_date") or goal.end_date
+
+    def _to_int(value, default):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    if "goal_type" in data:
+        goal.goal_type = _to_int(data.get("goal_type"), goal.goal_type)
+    if "contract_type" in data:
+        goal.contract_type = _to_int(data.get("contract_type"), goal.contract_type)
+    if "achievement" in data:
+        goal.achievement = _to_int(data.get("achievement"), goal.achievement)
+    if "notify_when_fail" in data:
+        goal.notify_when_fail = _to_int(data.get("notify_when_fail"), goal.notify_when_fail)
+    if "notify_when_achieve" in data:
+        goal.notify_when_achieve = _to_int(data.get("notify_when_achieve"), goal.notify_when_achieve)
+    if "notified" in data:
+        goal.notified = _to_int(data.get("notified"), goal.notified)
+    if "staff_id" in data:
+        goal.staff_id = _to_int(data.get("staff_id"), goal.staff_id)
+
+    if not goal.subject or not goal.start_date or not goal.end_date:
+        return Response(
+            {"detail": "Subject, start date and end date are required."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    goal.save()
+
+    return Response(
+        {
+            "id": goal.id,
+            "subject": goal.subject,
+            "description": goal.description,
+            "start_date": goal.start_date,
+            "end_date": goal.end_date,
+            "goal_type": goal.goal_type,
+            "contract_type": goal.contract_type,
+            "achievement": goal.achievement,
+            "notify_when_fail": goal.notify_when_fail,
+            "notify_when_achieve": goal.notify_when_achieve,
+            "notified": goal.notified,
+            "staff_id": goal.staff_id,
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def activity_log_list(request):
+    return _activity_logs_response(request)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def activity_logs_api(request):
+    return _activity_logs_response(request)
+
+
+def _serialize_legacy_activity_log(log):
+    staff = getattr(log, "staff_name", None) or "-"
+    date_value = getattr(log, "date", None)
+    if date_value:
+        try:
+            date_value = timezone.localtime(date_value)
+        except Exception:
+            pass
+        date_value = date_value.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        date_value = "-"
+    return {
+        "id": getattr(log, "id", None),
+        "description": getattr(log, "description", "") or "",
+        "staff": staff,
+        "staff_name": staff,
+        "date": date_value,
+    }
+
+
+def _activity_logs_response(request):
+    try:
+        if CoreActivityLog.objects.exists():
+            qs = CoreActivityLog.objects.all().order_by("-created_at")
+            qs = _apply_limit(qs, request)
+            return Response([serialize_activity_log(log) for log in qs])
+    except (ProgrammingError, OperationalError) as exc:
+        print("Core activity log query failed:", exc)
+
+    try:
+        ensure_activity_log_table()
+    except Exception as exc:
+        print("Activity log table ensure failed:", exc)
+
+    from core.middleware import get_current_db
+
+    db = get_current_db()
+    _seed_activity_log_if_empty(db)
+    try:
+        qs = LegacyActivityLog.objects.using(db).all().order_by("-date")
+        qs = _apply_limit(qs, request)
+        return Response([_serialize_legacy_activity_log(log) for log in qs])
+    except (ProgrammingError, OperationalError) as exc:
+        print("Legacy activity log query failed:", exc)
+        return Response([])
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def surveys_list(request):
+    try:
+        ensure_surveys_table()
+    except Exception as exc:
+        print("Surveys table ensure failed:", exc)
+
+    from core.middleware import get_current_db
+
+    db = get_current_db()
+    _seed_surveys_if_empty(db)
+
+    fields = [
+        "surveyid",
+        "subject",
+        "description",
+        "datecreated",
+        "active",
+        "send",
+        "slug",
+    ]
+    return _safe_legacy_list(request, LegacySurveys, fields, order_by="-datecreated")
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def ticket_pipe_log_list(request):
+    try:
+        ensure_tickets_pipe_log_table()
+    except Exception as exc:
+        print("Ticket pipe log table ensure failed:", exc)
+
+    fields = [
+        "id",
+        "date",
+        "email_to",
+        "name",
+        "subject",
+        "email",
+        "status",
+    ]
+    return _safe_legacy_list(request, LegacyTicketsPipeLog, fields, order_by="-date")
+
+
+BACKUP_HISTORY = []
+BACKUP_ID_COUNTER = [0]
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def database_backups(request):
+    if request.method == "GET":
+        return Response(BACKUP_HISTORY)
+
+    BACKUP_ID_COUNTER[0] += 1
+    now = timezone.now()
+    name = (request.data or {}).get("name") or f"backup-{now.strftime('%Y%m%d-%H%M%S')}.sql"
+    record = {
+        "id": BACKUP_ID_COUNTER[0],
+        "name": name,
+        "created_at": now.isoformat(),
+        "status": "completed",
+        "size": None,
+        "created_by": getattr(request.user, "username", "") or getattr(request.user, "email", ""),
+        "notes": (request.data or {}).get("notes") or "",
+    }
+    BACKUP_HISTORY.insert(0, record)
+    return Response(record, status=status.HTTP_201_CREATED)
 
 

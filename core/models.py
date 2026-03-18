@@ -95,6 +95,19 @@ class StaffProfile(models.Model):
         return self.user.username
 
 
+class ActivityLog(models.Model):
+    description = models.TextField()
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = "core_activity_log"
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return self.description[:50]
+
+
 class Proposal(models.Model):
 
     STATUS_CHOICES = [

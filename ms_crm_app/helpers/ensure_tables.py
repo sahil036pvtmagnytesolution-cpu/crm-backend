@@ -172,3 +172,133 @@ def ensure_knowledge_base_tables():
                 "Welcome to the Knowledge Base. Add your first article to help your team.",
                 "getting-started",
             ])
+
+
+def ensure_announcements_table():
+    """Ensure ms_announcements table exists for the current DB."""
+    from django.db import connections
+    from core.middleware import get_current_db
+
+    db_name = get_current_db()
+    with connections[db_name].cursor() as cursor:
+        cursor.execute("SHOW TABLES LIKE 'ms_announcements'")
+        exists = cursor.fetchone()
+
+        if not exists:
+            cursor.execute("""
+                CREATE TABLE ms_announcements (
+                    announcementid INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(191) NOT NULL,
+                    message TEXT DEFAULT NULL,
+                    showtousers INT NOT NULL DEFAULT 0,
+                    showtostaff INT NOT NULL DEFAULT 0,
+                    showname INT NOT NULL DEFAULT 1,
+                    dateadded DATETIME NOT NULL,
+                    userid VARCHAR(100) NOT NULL
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3
+            """)
+
+
+def ensure_goals_table():
+    """Ensure ms_goals table exists for the current DB."""
+    from django.db import connections
+    from core.middleware import get_current_db
+
+    db_name = get_current_db()
+    with connections[db_name].cursor() as cursor:
+        cursor.execute("SHOW TABLES LIKE 'ms_goals'")
+        exists = cursor.fetchone()
+
+        if not exists:
+            cursor.execute("""
+                CREATE TABLE ms_goals (
+                    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    subject VARCHAR(191) NOT NULL,
+                    description TEXT NOT NULL,
+                    start_date DATE NOT NULL,
+                    end_date DATE NOT NULL,
+                    goal_type INT NOT NULL DEFAULT 0,
+                    contract_type INT NOT NULL DEFAULT 0,
+                    achievement INT NOT NULL DEFAULT 0,
+                    notify_when_fail INT NOT NULL DEFAULT 0,
+                    notify_when_achieve INT NOT NULL DEFAULT 0,
+                    notified INT NOT NULL DEFAULT 0,
+                    staff_id INT NOT NULL DEFAULT 0
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3
+            """)
+
+
+def ensure_surveys_table():
+    """Ensure ms_surveys table exists for the current DB."""
+    from django.db import connections
+    from core.middleware import get_current_db
+
+    db_name = get_current_db()
+    with connections[db_name].cursor() as cursor:
+        cursor.execute("SHOW TABLES LIKE 'ms_surveys'")
+        exists = cursor.fetchone()
+
+        if not exists:
+            cursor.execute("""
+                CREATE TABLE ms_surveys (
+                    surveyid INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    subject MEDIUMTEXT NOT NULL,
+                    slug MEDIUMTEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    viewdescription TEXT DEFAULT NULL,
+                    datecreated DATETIME NOT NULL,
+                    redirect_url VARCHAR(100) DEFAULT NULL,
+                    send TINYINT(1) NOT NULL DEFAULT 0,
+                    onlyforloggedin INT(11) DEFAULT 0,
+                    fromname VARCHAR(100) DEFAULT NULL,
+                    iprestrict TINYINT(1) NOT NULL,
+                    active TINYINT(1) NOT NULL DEFAULT 1,
+                    hash VARCHAR(32) NOT NULL
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3
+            """)
+
+
+def ensure_activity_log_table():
+    """Ensure ms_activity_log table exists for the current DB."""
+    from django.db import connections
+    from core.middleware import get_current_db
+
+    db_name = get_current_db()
+    with connections[db_name].cursor() as cursor:
+        cursor.execute("SHOW TABLES LIKE 'ms_activity_log'")
+        exists = cursor.fetchone()
+
+        if not exists:
+            cursor.execute("""
+                CREATE TABLE ms_activity_log (
+                    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    description MEDIUMTEXT NOT NULL,
+                    date DATETIME NOT NULL,
+                    staffid VARCHAR(100) DEFAULT NULL
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3
+            """)
+
+
+def ensure_tickets_pipe_log_table():
+    """Ensure ms_tickets_pipe_log table exists for the current DB."""
+    from django.db import connections
+    from core.middleware import get_current_db
+
+    db_name = get_current_db()
+    with connections[db_name].cursor() as cursor:
+        cursor.execute("SHOW TABLES LIKE 'ms_tickets_pipe_log'")
+        exists = cursor.fetchone()
+
+        if not exists:
+            cursor.execute("""
+                CREATE TABLE ms_tickets_pipe_log (
+                    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    date DATETIME NOT NULL,
+                    email_to VARCHAR(100) NOT NULL,
+                    name VARCHAR(191) NOT NULL,
+                    subject VARCHAR(191) NOT NULL,
+                    message MEDIUMTEXT NOT NULL,
+                    email VARCHAR(100) NOT NULL,
+                    status VARCHAR(100) NOT NULL
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3
+            """)
