@@ -299,6 +299,46 @@ def ensure_tickets_pipe_log_table():
                     subject VARCHAR(191) NOT NULL,
                     message MEDIUMTEXT NOT NULL,
                     email VARCHAR(100) NOT NULL,
-                    status VARCHAR(100) NOT NULL
+                    status VARCHAR(100) NOT NULL,
+                    group_name VARCHAR(100) DEFAULT NULL,
+                    log_filter VARCHAR(100) DEFAULT NULL,
+                    cc_emails MEDIUMTEXT DEFAULT NULL,
+                    mention_emails MEDIUMTEXT DEFAULT NULL,
+                    role_name VARCHAR(100) DEFAULT NULL,
+                    tag VARCHAR(100) DEFAULT NULL
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3
             """)
+            return
+
+        # Backward compatibility for existing DBs that already have the table.
+        cursor.execute("SHOW COLUMNS FROM ms_tickets_pipe_log")
+        existing_columns = {row[0] for row in cursor.fetchall()}
+
+        alter_statements = []
+        if "group_name" not in existing_columns:
+            alter_statements.append(
+                "ALTER TABLE ms_tickets_pipe_log ADD COLUMN group_name VARCHAR(100) DEFAULT NULL"
+            )
+        if "log_filter" not in existing_columns:
+            alter_statements.append(
+                "ALTER TABLE ms_tickets_pipe_log ADD COLUMN log_filter VARCHAR(100) DEFAULT NULL"
+            )
+        if "cc_emails" not in existing_columns:
+            alter_statements.append(
+                "ALTER TABLE ms_tickets_pipe_log ADD COLUMN cc_emails MEDIUMTEXT DEFAULT NULL"
+            )
+        if "mention_emails" not in existing_columns:
+            alter_statements.append(
+                "ALTER TABLE ms_tickets_pipe_log ADD COLUMN mention_emails MEDIUMTEXT DEFAULT NULL"
+            )
+        if "role_name" not in existing_columns:
+            alter_statements.append(
+                "ALTER TABLE ms_tickets_pipe_log ADD COLUMN role_name VARCHAR(100) DEFAULT NULL"
+            )
+        if "tag" not in existing_columns:
+            alter_statements.append(
+                "ALTER TABLE ms_tickets_pipe_log ADD COLUMN tag VARCHAR(100) DEFAULT NULL"
+            )
+
+        for sql in alter_statements:
+            cursor.execute(sql)

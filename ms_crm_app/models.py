@@ -1740,6 +1740,12 @@ class TicketsPipeLog(models.Model):
     message = models.TextField()
     email = models.CharField(max_length=100)
     status = models.CharField(max_length=100)
+    group_name = models.CharField(max_length=100, blank=True, null=True)
+    log_filter = models.CharField(max_length=100, blank=True, null=True)
+    cc_emails = models.TextField(blank=True, null=True)
+    mention_emails = models.TextField(blank=True, null=True)
+    role_name = models.CharField(max_length=100, blank=True, null=True)
+    tag = models.CharField(max_length=100, blank=True, null=True)
 
     class Meta:
         managed = False

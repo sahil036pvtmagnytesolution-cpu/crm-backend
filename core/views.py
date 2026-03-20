@@ -1,4 +1,5 @@
 import email
+import html
 import uuid
 import subprocess
 import binascii
@@ -3476,13 +3477,163 @@ def ticket_pipe_log_list(request):
     fields = [
         "id",
         "date",
-        "email_to",
+        "group_name",
+        "log_filter",
         "name",
+        "message",
+        "status",
+        "email_to",
         "subject",
         "email",
-        "status",
+        "cc_emails",
+        "mention_emails",
+        "role_name",
+        "tag",
     ]
     return _safe_legacy_list(request, LegacyTicketsPipeLog, fields, order_by="-date")
+
+
+def _extract_email_values(raw_value):
+    if raw_value is None:
+        return []
+
+    if isinstance(raw_value, list):
+        candidates = raw_value
+    else:
+        candidates = str(raw_value).replace(";", ",").split(",")
+
+    unique = []
+    seen = set()
+    for item in candidates:
+        if isinstance(item, dict):
+            value = (
+                item.get("email")
+                or item.get("value")
+                or item.get("label")
+                or ""
+            )
+        else:
+            value = item
+
+        email_value = str(value or "").strip()
+        if not email_value or "@" not in email_value:
+            continue
+
+        key = email_value.lower()
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique.append(email_value)
+
+    return unique
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def support_ticket_pipe_create(request):
+    from core.middleware import get_current_db
+
+    try:
+        ensure_tickets_pipe_log_table()
+    except Exception as exc:
+        print("Support ticket table ensure failed:", exc)
+
+    payload = request.data or {}
+
+    email_to = str(payload.get("email") or payload.get("email_to") or "").strip()
+    if not email_to or "@" not in email_to:
+        return Response(
+            {"detail": "Valid recipient Email is required."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    raw_html_message = str(payload.get("message") or "").strip()
+    raw_plain_message = str(payload.get("massage") or "").strip()
+
+    # Strip risky blocks but keep standard rich-text formatting from Support editor.
+    html_message = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "", raw_html_message).strip()
+
+    plain_source = raw_plain_message or html_message
+    plain_source = re.sub(r"(?i)<br\s*/?>", "\n", plain_source)
+    plain_source = re.sub(r"(?i)</p>", "\n", plain_source)
+
+    message = strip_tags(plain_source)
+    message = html.unescape(message)
+    message = message.replace("\r\n", "\n").replace("\r", "\n")
+    message = re.sub(r"[ \t]+\n", "\n", message)
+    message = re.sub(r"\n{3,}", "\n\n", message).strip()
+    if not message:
+        return Response(
+            {"detail": "Message is required."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    contact_value = str(payload.get("contact") or "").strip()
+    name = str(payload.get("name") or "").strip() or contact_value or email_to
+    group_name = str(payload.get("group") or payload.get("group_name") or "General").strip() or "General"
+    role_name = str(payload.get("role") or payload.get("role_name") or "").strip()
+    tag = str(payload.get("tag") or "").strip()
+    log_filter = str(payload.get("filter") or payload.get("log_filter") or tag).strip()
+    ticket_status = str(payload.get("status") or "Draft").strip() or "Draft"
+    subject = str(payload.get("subject") or f"Support Ticket - {group_name}").strip()
+
+    cc_emails = _extract_email_values(payload.get("cc"))
+    mention_emails = _extract_email_values(payload.get("mention"))
+
+    cc_recipients = []
+    seen_cc = {email_to.lower()}
+    for value in cc_emails + mention_emails:
+        key = value.lower()
+        if key in seen_cc:
+            continue
+        seen_cc.add(key)
+        cc_recipients.append(value)
+
+    mail_status = "sent"
+    try:
+        email_message = EmailMultiAlternatives(
+            subject=subject,
+            body=message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[email_to],
+            cc=cc_recipients,
+        )
+        if html_message:
+            email_message.attach_alternative(html_message, "text/html")
+        email_message.send(fail_silently=False)
+    except Exception as exc:
+        print("Support ticket email failed:", exc)
+        mail_status = "failed"
+
+    db = get_current_db()
+    record = LegacyTicketsPipeLog.objects.using(db).create(
+        date=timezone.now(),
+        email_to=email_to,
+        name=name,
+        subject=subject,
+        message=message,
+        email=",".join(cc_recipients),
+        status=ticket_status,
+        group_name=group_name,
+        log_filter=log_filter,
+        cc_emails=",".join(cc_emails),
+        mention_emails=",".join(mention_emails),
+        role_name=role_name,
+        tag=tag,
+    )
+
+    return Response(
+        {
+            "id": record.id,
+            "status": ticket_status,
+            "mail_status": mail_status,
+            "email_to": email_to,
+            "cc": cc_emails,
+            "mention": mention_emails,
+        },
+        status=status.HTTP_201_CREATED,
+    )
 
 
 BACKUP_HISTORY = []

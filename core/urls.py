@@ -60,6 +60,7 @@ from .views import (
     database_backup_detail,
     database_backup_download,
     ticket_pipe_log_list,
+    support_ticket_pipe_create,
 )
 from .views import ClientViewSet, ApprovedUsersView
 from .views import media_files_list, upload_media, media_file_delete
@@ -217,5 +218,6 @@ urlpatterns = [
     path("utilities/database-backups/<int:pk>/", database_backup_detail),
     path("utilities/database-backups/<int:pk>/download/", database_backup_download),
     path("utilities/ticket-pipe-log/", ticket_pipe_log_list),
+    path("support/ticket-pipe/", support_ticket_pipe_create),
     
     ]
