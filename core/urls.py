@@ -57,6 +57,8 @@ from .views import (
     activity_logs_api,
     surveys_list,
     database_backups,
+    database_backup_detail,
+    database_backup_download,
     ticket_pipe_log_list,
 )
 from .views import ClientViewSet, ApprovedUsersView
@@ -98,6 +100,9 @@ urlpatterns = [
 
     # Users list for assign dropdown
     path("users/", users_list),
+
+    # Timesheets overview (placeholder)
+    path("timesheets/", views.timesheets_overview),
 
     # Contacts
     path("contacts/", contacts_list_create),
@@ -207,7 +212,10 @@ urlpatterns = [
     path("utilities/activity-log/", activity_log_list),
     path("activity-logs/", activity_logs_api),
     path("utilities/surveys/", surveys_list),
+    path("utilities/surveys/<int:pk>/", views.surveys_detail),
     path("utilities/database-backups/", database_backups),
+    path("utilities/database-backups/<int:pk>/", database_backup_detail),
+    path("utilities/database-backups/<int:pk>/download/", database_backup_download),
     path("utilities/ticket-pipe-log/", ticket_pipe_log_list),
     
     ]

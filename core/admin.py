@@ -207,7 +207,7 @@ class BusinessAdmin(admin.ModelAdmin):
 # ROLE ADMIN (SAFE ADDITION)
 # ==============================
 
-from .models import Role
+from .models import Role, SalesProposal
 
 
 @admin.register(Role)
@@ -216,7 +216,34 @@ class RoleAdmin(admin.ModelAdmin):
     list_filter = ("is_approved",)
     search_fields = ("name",)
 
-admin.site.register(Proposal)
+@admin.register(SalesProposal)
+class SalesProposalAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "subject",
+        "proposal_to",
+        "address",
+        "city",
+        "state",
+        "zip",
+        "email",
+        "phone",
+        "status",
+        "total",
+        "created_at",
+    )
+    search_fields = (
+        "subject",
+        "proposal_to",
+        "address",
+        "city",
+        "state",
+        "zip",
+        "email",
+        "phone",
+    )
+    list_filter = ("status", "created_at")
+    ordering = ("-id",)
 
 
 

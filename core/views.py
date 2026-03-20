@@ -1,4 +1,9 @@
 import email
+import uuid
+import subprocess
+import binascii
+import json
+from datetime import datetime
 
 from django.contrib.auth.models import User
 from django.contrib.auth.hashers import check_password, make_password
@@ -6,6 +11,7 @@ from django.db import transaction
 import threading
 
 from django.core.mail import send_mail
+from django.http import FileResponse
 from django.conf import settings
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -27,9 +33,12 @@ from .models import (
     Proposal,
     StaffProfile,
     ActivityLog as CoreActivityLog,
+    LegacyBusiness,
 )
 from ms_crm_app.models import (
     Staff,
+    Contacts,
+    Notifications,
     KnowledgeBase,
     KnowledgeBaseGroups,
     ActivityLog as LegacyActivityLog,
@@ -146,6 +155,17 @@ from .serializers import ProjectSerializer
 from django.db.models import Count, Sum
 from django.db.utils import OperationalError, ProgrammingError
 from django.utils.text import slugify
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def timesheets_overview(request):
+    """
+    Timesheets overview API.
+    The frontend expects a list response from /core_api/timesheets/.
+    Since there is no backing model/table yet, return an empty list to
+    prevent 404/500 errors and allow the UI to show "No timesheets found".
+    """
+    return Response([])
 
 class ApprovedUsersView(APIView):
 
@@ -863,32 +883,25 @@ def sales_proposals(request):
     serializer = ProposalSerializer(proposals, many=True)
     return Response(serializer.data, status=200)
 
-# =========================
-# ASSIGN PROPOSAL
-# =========================
-@api_view(["POST"])
-@permission_classes([IsAuthenticated])
-def assign_proposal(request, pk):
+
+def send_proposal_assignment_email(proposal, user):
+    if not user:
+        return False
+    candidates = [
+        getattr(user, "email", None),
+        getattr(user, "username", None),
+        getattr(user, "first_name", None),
+        getattr(user, "last_name", None),
+    ]
+    recipient = next(
+        (value for value in candidates if value and "@" in str(value)),
+        None,
+    )
+    if not recipient:
+        return False
+
     try:
-        proposal = Proposal.objects.get(pk=pk)
-    except Proposal.DoesNotExist:
-        return Response({"error": "Proposal not found"}, status=404)
-
-    user_id = request.data.get("user_id")
-
-    if user_id is None:
-        proposal.assigned_to = None
-        proposal.save()
-        return Response({"message": "Unassigned successfully"})
-
-    try:
-        user = User.objects.get(pk=user_id)
-        proposal.assigned_to = user
-        proposal.save()
-
-        # ✅ Correct proposal page link
         frontend_url = f"http://localhost:3000/sales/proposals/{proposal.id}"
-
         subject = f"New Proposal Assigned - #{proposal.id}"
 
         html_content = f"""
@@ -915,7 +928,7 @@ def assign_proposal(request, pk):
                         </tr>
                         <tr>
                             <td style="padding:8px; border:1px solid #ddd;"><strong>Total</strong></td>
-                            <td style="padding:8px; border:1px solid #ddd;">₹{getattr(proposal, 'total', '0')}</td>
+                            <td style="padding:8px; border:1px solid #ddd;">â‚¹{getattr(proposal, 'total', '0')}</td>
                         </tr>
                     </table>
 
@@ -938,12 +951,11 @@ def assign_proposal(request, pk):
             subject,
             text_content,
             settings.DEFAULT_FROM_EMAIL,
-            [user.email],
+            [recipient],
         )
 
         email.attach_alternative(html_content, "text/html")
 
-        # ✅ Correct logo path
         logo_path = os.path.join(
             settings.BASE_DIR.parent,
             "crm-frontend",
@@ -957,16 +969,53 @@ def assign_proposal(request, pk):
                 logo.add_header("Content-ID", "<companylogo>")
                 logo.add_header("Content-Disposition", "inline", filename="ms.png")
                 email.attach(logo)
-            print("Logo attached successfully")
         else:
             print("Logo file not found at:", logo_path)
 
-        # ✅ IMPORTANT: Send email
         email.send()
+        print("HTML EMAIL SENT TO:", recipient)
+        return True
+    except Exception as e:
+        print("EMAIL ERROR:", str(e))
+        return False
 
-        print("HTML EMAIL SENT TO:", user.email)
+# =========================
+# ASSIGN PROPOSAL
+# =========================
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def assign_proposal(request, pk):
+    try:
+        proposal = Proposal.objects.get(pk=pk)
+    except Proposal.DoesNotExist:
+        return Response({"error": "Proposal not found"}, status=404)
 
-        return Response({"message": "Assigned & Professional Email Sent"})
+    user_id = request.data.get("user_id")
+
+    if user_id is None:
+        proposal.assigned_to = None
+        proposal.save()
+        return Response({"message": "Unassigned successfully"})
+
+    try:
+        user = User.objects.get(pk=user_id)
+        proposal.assigned_to = user
+        proposal.save()
+        email_sent = send_proposal_assignment_email(proposal, user)
+        recipient = (
+            getattr(user, "email", None)
+            or getattr(user, "username", None)
+            or getattr(user, "first_name", None)
+            or getattr(user, "last_name", None)
+            or ""
+        )
+        return Response(
+            {
+                "message": "Assigned successfully",
+                "email_sent": email_sent,
+                "email_to": recipient,
+            }
+        )
 
     except User.DoesNotExist:
         return Response({"error": "User not found"}, status=404)
@@ -984,7 +1033,9 @@ def assign_proposal(request, pk):
 def create_proposal(request):
     serializer = ProposalSerializer(data=request.data)
     if serializer.is_valid():
-        serializer.save(created_by=request.user)
+        proposal = serializer.save(created_by=request.user)
+        if proposal.assigned_to:
+            send_proposal_assignment_email(proposal, proposal.assigned_to)
         return Response(serializer.data, status=201)
     return Response(serializer.errors, status=400)
 
@@ -992,7 +1043,7 @@ def create_proposal(request):
 # =========================
 # PROPOSAL DETAIL (GET + PUT + DELETE)
 # =========================
-@api_view(["GET", "PUT", "DELETE"])
+@api_view(["GET", "PUT", "PATCH", "DELETE"])
 @permission_classes([IsAuthenticated])
 def proposal_detail(request, pk):
     try:
@@ -1005,7 +1056,17 @@ def proposal_detail(request, pk):
         return Response(serializer.data)
 
     if request.method == "PUT":
+        previous_assigned_id = proposal.assigned_to_id
         serializer = ProposalSerializer(proposal, data=request.data)
+        if serializer.is_valid():
+            proposal = serializer.save()
+            if proposal.assigned_to_id and proposal.assigned_to_id != previous_assigned_id:
+                send_proposal_assignment_email(proposal, proposal.assigned_to)
+            return Response(serializer.data)
+        return Response(serializer.errors, status=400)
+
+    if request.method == "PATCH":
+        serializer = ProposalSerializer(proposal, data=request.data, partial=True)
         if serializer.is_valid():
             serializer.save()
             return Response(serializer.data)
@@ -2495,6 +2556,32 @@ def _safe_legacy_list(request, model, fields, order_by=None):
         return Response([])
 
 
+def _purge_demo_ticket_pipe_log():
+    from core.middleware import get_current_db
+
+    db = get_current_db()
+    try:
+        sample_emails = {
+            "aarav.sharma@example.com",
+            "neha.patel@example.com",
+            "rohan.mehta@example.com",
+        }
+        sample_messages = {
+            "Facing login issue after password reset.",
+            "Invoice email received but PDF is missing.",
+            "Test email for ticket pipe log.",
+        }
+        LegacyTicketsPipeLog.objects.using(db).filter(
+            email__in=sample_emails,
+            email_to="support@magnyte.com",
+        ).delete()
+        LegacyTicketsPipeLog.objects.using(db).filter(
+            message__in=sample_messages
+        ).delete()
+    except (ProgrammingError, OperationalError) as exc:
+        print("Ticket pipe log demo purge failed:", exc)
+
+
 def _parse_sql_insert_values(values_text):
     rows = []
     i = 0
@@ -2693,6 +2780,86 @@ def announcements_list(request):
     if request.method == "GET":
         return _safe_legacy_list(request, LegacyAnnouncements, fields, order_by="-dateadded")
 
+    def _normalize_list(raw):
+        if raw is None:
+            return []
+        if isinstance(raw, (list, tuple, set)):
+            return list(raw)
+        if isinstance(raw, str):
+            raw = raw.strip()
+            if not raw:
+                return []
+            if raw.startswith("[") and raw.endswith("]"):
+                try:
+                    parsed = json.loads(raw)
+                    return _normalize_list(parsed)
+                except Exception:
+                    pass
+            return [item for item in re.split(r"[,\s;]+", raw) if item]
+        return [raw]
+
+    def _parse_int_list(raw):
+        items = _normalize_list(raw)
+        parsed = []
+        for item in items:
+            try:
+                parsed.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        return parsed
+
+    def _parse_email_list(raw):
+        items = _normalize_list(raw)
+        emails = []
+        for item in items:
+            if item is None:
+                continue
+            value = str(item).strip()
+            if not value or "@" not in value:
+                continue
+            emails.append(value)
+        return emails
+
+    def _resolve_owner_email():
+        try:
+            business = LegacyBusiness.objects.first()
+            if business and getattr(business, "email", None):
+                return business.email
+        except Exception as exc:
+            print("Owner lookup failed:", exc)
+        user = getattr(request, "user", None)
+        return getattr(user, "email", None) or getattr(user, "username", None)
+
+    def _resolve_sender_staff():
+        user = getattr(request, "user", None)
+        identifier = (
+            getattr(user, "email", None)
+            or getattr(user, "username", None)
+            or ""
+        ).strip()
+        if not identifier:
+            return None
+        try:
+            return Staff.objects.filter(email__iexact=identifier).first()
+        except Exception:
+            return None
+
+    def _resolve_sender_name(sender_staff):
+        if sender_staff:
+            full_name = f"{sender_staff.firstname} {sender_staff.lastname}".strip()
+            return full_name or getattr(sender_staff, "email", None) or "System"
+        user = getattr(request, "user", None)
+        if user:
+            try:
+                full_name = user.get_full_name()
+            except Exception:
+                full_name = ""
+            full_name = (full_name or "").strip()
+            if full_name:
+                return full_name
+            return getattr(user, "email", None) or getattr(user, "username", None) or "System"
+        return "System"
+
     data = request.data or {}
     name = (data.get("name") or "").strip()
     message = data.get("message") or ""
@@ -2730,6 +2897,114 @@ def announcements_list(request):
             {"detail": "Unable to create announcement."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
+
+    # -----------------------------
+    # Send announcement email + notifications
+    # -----------------------------
+    try:
+        notify_owner = bool(
+            data.get("notify_owner", True)
+            if not isinstance(data.get("notify_owner", True), str)
+            else str(data.get("notify_owner", "true")).lower() not in {"0", "false", "no"}
+        )
+
+        recipient_staff_ids = set(_parse_int_list(data.get("recipient_staff_ids") or data.get("staff_ids")))
+        recipient_contact_ids = set(_parse_int_list(data.get("recipient_contact_ids") or data.get("contact_ids")))
+        recipient_staff_emails = set(_parse_email_list(data.get("recipient_staff_emails")))
+        recipient_emails = set(_parse_email_list(data.get("recipient_emails") or data.get("emails")))
+
+        email_recipients = set()
+        notify_staff_ids = set()
+
+        if notify_owner:
+            owner_email = _resolve_owner_email()
+            if owner_email:
+                email_recipients.add(owner_email)
+                try:
+                    owner_staff = Staff.objects.filter(email__iexact=owner_email).first()
+                    if owner_staff:
+                        notify_staff_ids.add(owner_staff.staffid)
+                except Exception:
+                    pass
+
+        if recipient_staff_ids:
+            for staff in Staff.objects.filter(staffid__in=recipient_staff_ids):
+                if getattr(staff, "email", None):
+                    email_recipients.add(staff.email)
+                notify_staff_ids.add(staff.staffid)
+
+        if recipient_staff_emails:
+            email_recipients.update(recipient_staff_emails)
+            for staff in Staff.objects.filter(email__in=list(recipient_staff_emails)):
+                notify_staff_ids.add(staff.staffid)
+
+        if recipient_contact_ids:
+            for contact in Contacts.objects.filter(id__in=recipient_contact_ids):
+                if getattr(contact, "email", None):
+                    email_recipients.add(contact.email)
+
+        if recipient_emails:
+            email_recipients.update(recipient_emails)
+            for staff in Staff.objects.filter(email__in=list(recipient_emails)):
+                notify_staff_ids.add(staff.staffid)
+
+        sender_staff = _resolve_sender_staff()
+        sender_name = _resolve_sender_name(sender_staff)
+
+        if email_recipients:
+            html_message = f"""
+<h3>New Announcement</h3>
+<p><b>Title:</b> {announcement.name}</p>
+<p><b>By:</b> {sender_name}</p>
+<hr/>
+<p>{(announcement.message or '').replace('\n', '<br/>')}</p>
+"""
+            plain_message = strip_tags(html_message)
+            try:
+                send_mail(
+                    f"New Announcement: {announcement.name}",
+                    plain_message,
+                    settings.DEFAULT_FROM_EMAIL,
+                    sorted(email_recipients),
+                    fail_silently=False,
+                    html_message=html_message,
+                )
+            except Exception as exc:
+                print("Announcement email failed:", exc)
+
+        if notify_staff_ids:
+            from_user_id = sender_staff.staffid if sender_staff else 0
+            description = f"New Announcement: {announcement.name}"
+            link = f"/utilities/announcements/{announcement.announcementid}/"
+            additional_data = json.dumps(
+                {
+                    "announcement_id": announcement.announcementid,
+                    "title": announcement.name,
+                }
+            )
+            now = timezone.now()
+            payload = [
+                Notifications(
+                    isread=0,
+                    isread_inline=0,
+                    date=now,
+                    description=description,
+                    fromuserid=from_user_id,
+                    fromclientid=0,
+                    from_fullname=sender_name,
+                    touserid=staff_id,
+                    fromcompany=None,
+                    link=link,
+                    additional_data=additional_data,
+                )
+                for staff_id in sorted(notify_staff_ids)
+            ]
+            try:
+                Notifications.objects.bulk_create(payload, batch_size=200)
+            except Exception as exc:
+                print("Announcement notification failed:", exc)
+    except Exception as exc:
+        print("Announcement alert processing failed:", exc)
 
     return Response(
         {
@@ -3032,7 +3307,7 @@ def _activity_logs_response(request):
         return Response([])
 
 
-@api_view(["GET"])
+@api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def surveys_list(request):
     try:
@@ -3045,16 +3320,147 @@ def surveys_list(request):
     db = get_current_db()
     _seed_surveys_if_empty(db)
 
-    fields = [
-        "surveyid",
-        "subject",
-        "description",
-        "datecreated",
-        "active",
-        "send",
-        "slug",
-    ]
-    return _safe_legacy_list(request, LegacySurveys, fields, order_by="-datecreated")
+    if request.method == "GET":
+        fields = [
+            "surveyid",
+            "subject",
+            "description",
+            "datecreated",
+            "active",
+            "send",
+            "slug",
+        ]
+        return _safe_legacy_list(request, LegacySurveys, fields, order_by="-datecreated")
+
+    data = request.data or {}
+    subject = (data.get("subject") or "").strip()
+    description = (data.get("description") or "").strip()
+    viewdescription = (data.get("viewdescription") or "").strip()
+
+    if not subject:
+        return Response({"detail": "Subject is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+    slug = (data.get("slug") or "").strip()
+    if not slug:
+        slug = slugify(subject)
+    if not slug:
+        slug = f"survey-{uuid.uuid4().hex[:8]}"
+
+    base_slug = slug
+    suffix = 1
+    while LegacySurveys.objects.using(db).filter(slug=slug).exists():
+        slug = f"{base_slug}-{suffix}"
+        suffix += 1
+
+    active = 1 if bool(data.get("active", True)) else 0
+    send = 1 if bool(data.get("send", False)) else 0
+    onlyforloggedin = 1 if bool(data.get("onlyforloggedin", False)) else 0
+    fromname = (
+        data.get("fromname")
+        or getattr(request.user, "username", None)
+        or getattr(request.user, "email", None)
+        or ""
+    )
+    iprestrict = 1 if bool(data.get("iprestrict", False)) else 0
+    redirect_url = data.get("redirect_url") or None
+
+    try:
+        survey = LegacySurveys.objects.using(db).create(
+            subject=subject,
+            slug=slug,
+            description=description or "No description",
+            viewdescription=viewdescription or "",
+            datecreated=timezone.now(),
+            redirect_url=redirect_url,
+            send=send,
+            onlyforloggedin=onlyforloggedin,
+            fromname=fromname,
+            iprestrict=iprestrict,
+            active=active,
+            hash=uuid.uuid4().hex,
+        )
+    except (ProgrammingError, OperationalError) as exc:
+        print("Survey create failed:", exc)
+        return Response(
+            {"detail": "Unable to create survey."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    return Response(
+        {
+            "surveyid": survey.surveyid,
+            "subject": survey.subject,
+            "description": survey.description,
+            "datecreated": survey.datecreated,
+            "active": survey.active,
+            "send": survey.send,
+            "slug": survey.slug,
+        },
+        status=status.HTTP_201_CREATED,
+    )
+
+
+@api_view(["PUT", "PATCH"])
+@permission_classes([IsAuthenticated])
+def surveys_detail(request, pk):
+    try:
+        ensure_surveys_table()
+    except Exception as exc:
+        print("Surveys table ensure failed:", exc)
+
+    from core.middleware import get_current_db
+
+    db = get_current_db()
+    survey = LegacySurveys.objects.using(db).filter(pk=pk).first()
+    if not survey:
+        return Response({"detail": "Survey not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    data = request.data or {}
+    updated = False
+
+    if "active" in data:
+        survey.active = int(bool(data.get("active")))
+        updated = True
+
+    if "subject" in data:
+        subject = (data.get("subject") or "").strip()
+        if subject:
+            survey.subject = subject
+            updated = True
+
+    if "description" in data:
+        survey.description = (data.get("description") or "").strip()
+        updated = True
+
+    if "slug" in data:
+        slug = (data.get("slug") or "").strip()
+        if slug:
+            survey.slug = slug
+            updated = True
+
+    if not updated:
+        return Response(
+            {"detail": "No fields to update."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if not survey.subject:
+        return Response({"detail": "Subject is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+    survey.save()
+
+    return Response(
+        {
+            "surveyid": survey.surveyid,
+            "subject": survey.subject,
+            "description": survey.description,
+            "datecreated": survey.datecreated,
+            "active": survey.active,
+            "send": survey.send,
+            "slug": survey.slug,
+        },
+        status=status.HTTP_200_OK,
+    )
 
 
 @api_view(["GET"])
@@ -3064,6 +3470,8 @@ def ticket_pipe_log_list(request):
         ensure_tickets_pipe_log_table()
     except Exception as exc:
         print("Ticket pipe log table ensure failed:", exc)
+
+    _purge_demo_ticket_pipe_log()
 
     fields = [
         "id",
@@ -3081,25 +3489,322 @@ BACKUP_HISTORY = []
 BACKUP_ID_COUNTER = [0]
 
 
+def _backup_storage_dir():
+    base_dir = settings.MEDIA_ROOT
+    backup_dir = os.path.join(base_dir, "db_backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    return backup_dir
+
+
+def _load_backup_history_if_needed():
+    if BACKUP_HISTORY:
+        return
+
+    backup_dir = _backup_storage_dir()
+    if not os.path.isdir(backup_dir):
+        return
+
+    groups = {}
+    for entry in os.listdir(backup_dir):
+        path = os.path.join(backup_dir, entry)
+        if not os.path.isfile(path):
+            continue
+        base, ext = os.path.splitext(entry)
+        ext = ext.lower()
+        if ext not in {".sql", ".pdf"}:
+            continue
+        group = groups.setdefault(base, {})
+        if ext == ".sql":
+            group["sql"] = path
+        elif ext == ".pdf":
+            group["pdf"] = path
+
+    if not groups:
+        return
+
+    def group_mtime(group):
+        times = [os.path.getmtime(p) for p in group.values() if p]
+        return max(times) if times else 0
+
+    records = []
+    current_tz = timezone.get_current_timezone()
+    for base, group in sorted(groups.items(), key=lambda item: group_mtime(item[1]), reverse=True):
+        sql_path = group.get("sql")
+        pdf_path = group.get("pdf")
+        primary_path = sql_path or pdf_path
+        if not primary_path:
+            continue
+        created_at = datetime.fromtimestamp(group_mtime(group), tz=current_tz).isoformat()
+        download_type = "pdf" if pdf_path else "sql"
+        name = os.path.basename(sql_path or pdf_path)
+        records.append(
+            {
+                "id": len(records) + 1,
+                "name": name,
+                "created_at": created_at,
+                "status": "completed",
+                "size": os.path.getsize(primary_path) if os.path.exists(primary_path) else None,
+                "created_by": "",
+                "notes": "",
+                "download_type": download_type,
+                "file_path": sql_path,
+                "pdf_path": pdf_path,
+            }
+        )
+
+    BACKUP_HISTORY.extend(records)
+    BACKUP_ID_COUNTER[0] = max(BACKUP_ID_COUNTER[0], len(BACKUP_HISTORY))
+
+
+def _safe_backup_filename(raw_name, fallback):
+    cleaned = os.path.basename((raw_name or "").strip())
+    cleaned = cleaned.replace(" ", "_")
+    if not cleaned:
+        cleaned = fallback
+    if not cleaned.lower().endswith(".sql"):
+        cleaned = f"{cleaned}.sql"
+    return cleaned
+
+
+def _delete_backup_files(record):
+    for key in ("file_path", "pdf_path"):
+        path = record.get(key)
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception as exc:
+                print(f"Failed to delete backup file {path}: {exc}")
+
+
+def _run_mysqldump(db_conf, file_path):
+    host = db_conf.get("HOST") or "localhost"
+    user = db_conf.get("USER") or ""
+    password = db_conf.get("PASSWORD") or ""
+    port = str(db_conf.get("PORT") or "3306")
+    db_name = db_conf.get("NAME")
+    if not db_name:
+        raise ValueError("Database name is missing")
+
+    env = os.environ.copy()
+    if password:
+        env["MYSQL_PWD"] = password
+
+    cmd = [
+        "mysqldump",
+        f"--host={host}",
+        f"--user={user}",
+        f"--port={port}",
+        "--single-transaction",
+        "--skip-lock-tables",
+        db_name,
+    ]
+
+    with open(file_path, "w", encoding="utf-8") as output:
+        result = subprocess.run(
+            cmd,
+            stdout=output,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "mysqldump failed")
+
+
+def _dumpdata_fallback(file_path):
+    from django.core.management import call_command
+
+    with open(file_path, "w", encoding="utf-8") as output:
+        call_command("dumpdata", stdout=output)
+
+
+def _sanitize_pdf_line(value):
+    return "".join(ch if ch >= " " or ch == "\t" else " " for ch in value)
+
+
+def _pdf_hex_string(value):
+    data = value.encode("utf-8", errors="replace")
+    return binascii.hexlify(data).decode("ascii")
+
+
+def _create_simple_pdf(text, output_path):
+    page_width = 595
+    page_height = 842
+    margin = 40
+    font_size = 9
+    line_height = 12
+    max_lines = int((page_height - 2 * margin) / line_height)
+    raw_lines = text.splitlines() or [""]
+    lines = [_sanitize_pdf_line(line) for line in raw_lines]
+
+    content_objects = []
+
+    for idx in range(0, len(lines), max_lines):
+        chunk = lines[idx : idx + max_lines]
+        y = page_height - margin
+        content_lines = ["BT", f"/F1 {font_size} Tf"]
+        for line in chunk:
+            content_lines.append(
+                f"1 0 0 1 {margin} {y} Tm <{_pdf_hex_string(line)}> Tj"
+            )
+            y -= line_height
+        content_lines.append("ET")
+        content_stream = "\n".join(content_lines)
+        content_objects.append(content_stream)
+
+    objects = []
+    objects.append("<< /Type /Catalog /Pages 2 0 R >>")
+
+    page_refs = []
+    for page_index, _ in enumerate(content_objects):
+        page_obj_num = 4 + page_index * 2
+        page_refs.append(f"{page_obj_num} 0 R")
+    pages_dict = f"<< /Type /Pages /Kids [{' '.join(page_refs)}] /Count {len(content_objects)} >>"
+    objects.append(pages_dict)
+    objects.append("<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>")
+
+    for page_index, content in enumerate(content_objects):
+        page_obj_num = 4 + page_index * 2
+        content_obj_num = page_obj_num + 1
+        content_bytes = content.encode("utf-8")
+        content_obj = (
+            f"<< /Length {len(content_bytes)} >>\nstream\n{content}\nendstream"
+        )
+        objects.append(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] "
+            f"/Resources << /Font << /F1 3 0 R >> >> /Contents {content_obj_num} 0 R >>"
+        )
+        objects.append(content_obj)
+
+    pdf = bytearray()
+    pdf.extend(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for idx, obj in enumerate(objects, start=1):
+        offsets.append(len(pdf))
+        pdf.extend(f"{idx} 0 obj\n{obj}\nendobj\n".encode("utf-8"))
+
+    xref_offset = len(pdf)
+    pdf.extend(f"xref\n0 {len(objects) + 1}\n".encode("utf-8"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("utf-8"))
+    pdf.extend(
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n".encode(
+            "utf-8"
+        )
+    )
+
+    with open(output_path, "wb") as output:
+        output.write(pdf)
+
+
+def _public_backup_record(record, request=None):
+    safe_record = {
+        key: value
+        for key, value in record.items()
+        if key not in {"file_path", "pdf_path"}
+    }
+    if request and record.get("id"):
+        safe_record["download_url"] = request.build_absolute_uri(
+            f"/core_api/utilities/database-backups/{record['id']}/download/"
+        )
+    return safe_record
+
+
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def database_backups(request):
     if request.method == "GET":
-        return Response(BACKUP_HISTORY)
+        _load_backup_history_if_needed()
+        return Response([_public_backup_record(item, request) for item in BACKUP_HISTORY])
 
     BACKUP_ID_COUNTER[0] += 1
     now = timezone.now()
-    name = (request.data or {}).get("name") or f"backup-{now.strftime('%Y%m%d-%H%M%S')}.sql"
+    fallback_name = f"backup-{now.strftime('%Y%m%d-%H%M%S')}"
+    name = _safe_backup_filename((request.data or {}).get("name"), fallback_name)
+    backup_dir = _backup_storage_dir()
+    file_path = os.path.join(backup_dir, name)
+    pdf_path = None
+    download_type = "sql"
+    status_value = "completed"
+
+    from core.middleware import get_current_db
+
+    db_alias = get_current_db()
+    db_conf = settings.DATABASES.get(db_alias) or settings.DATABASES.get("default", {})
+
+    try:
+        _run_mysqldump(db_conf, file_path)
+    except Exception as exc:
+        try:
+            _dumpdata_fallback(file_path)
+            status_value = "generated"
+            print(f"mysqldump failed; fallback dumpdata used: {exc}")
+        except Exception as fallback_exc:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            return Response(
+                {"detail": f"Backup failed: {fallback_exc}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as output:
+            backup_text = output.read()
+        pdf_name = name.rsplit(".", 1)[0] + ".pdf"
+        pdf_path = os.path.join(backup_dir, pdf_name)
+        _create_simple_pdf(backup_text, pdf_path)
+        download_type = "pdf"
+    except Exception as exc:
+        print(f"PDF generation skipped: {exc}")
+        download_type = "sql"
+
     record = {
         "id": BACKUP_ID_COUNTER[0],
         "name": name,
         "created_at": now.isoformat(),
-        "status": "completed",
-        "size": None,
+        "status": status_value,
+        "size": os.path.getsize(file_path) if os.path.exists(file_path) else None,
         "created_by": getattr(request.user, "username", "") or getattr(request.user, "email", ""),
         "notes": (request.data or {}).get("notes") or "",
+        "download_type": download_type,
+        "file_path": file_path,
+        "pdf_path": pdf_path,
     }
+    record["download_url"] = request.build_absolute_uri(
+        f"/core_api/utilities/database-backups/{record['id']}/download/"
+    )
     BACKUP_HISTORY.insert(0, record)
-    return Response(record, status=status.HTTP_201_CREATED)
+    return Response(_public_backup_record(record, request), status=status.HTTP_201_CREATED)
+
+
+@api_view(["DELETE"])
+@permission_classes([IsAuthenticated])
+def database_backup_detail(request, pk):
+    _load_backup_history_if_needed()
+    record = next((item for item in BACKUP_HISTORY if item.get("id") == pk), None)
+    if not record:
+        return Response({"detail": "Backup not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    _delete_backup_files(record)
+    BACKUP_HISTORY[:] = [item for item in BACKUP_HISTORY if item.get("id") != pk]
+    return Response({"status": "deleted"}, status=status.HTTP_200_OK)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def database_backup_download(request, pk):
+    _load_backup_history_if_needed()
+    record = next((item for item in BACKUP_HISTORY if item.get("id") == pk), None)
+    if not record:
+        return Response({"detail": "Backup not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    path = record.get("pdf_path") or record.get("file_path")
+    if not path or not os.path.exists(path):
+        return Response({"detail": "File not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    filename = os.path.basename(path)
+    return FileResponse(open(path, "rb"), as_attachment=True, filename=filename)
 
 

@@ -136,6 +136,19 @@ class Proposal(models.Model):
 
     items = models.JSONField(default=list, blank=True)
 
+    proposal_to = models.CharField(max_length=191, blank=True, null=True)
+    address = models.CharField(max_length=200, blank=True, null=True)
+    city = models.CharField(max_length=100, blank=True, null=True)
+    state = models.CharField(max_length=100, blank=True, null=True)
+    country = models.CharField(max_length=100, blank=True, null=True)
+    zip = models.CharField(max_length=50, blank=True, null=True)
+    email = models.CharField(max_length=150, blank=True, null=True)
+    phone = models.CharField(max_length=50, blank=True, null=True)
+    comments = models.JSONField(default=list, blank=True, null=True)
+    reminders = models.JSONField(default=list, blank=True, null=True)
+    tasks = models.JSONField(default=list, blank=True, null=True)
+    notes = models.JSONField(default=list, blank=True, null=True)
+
     discount_total = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     adjustment = models.DecimalField(max_digits=10, decimal_places=2, default=0)
 
@@ -506,6 +519,13 @@ class Contract(models.Model):
 
     def __str__(self):
         return self.subject
+
+
+class SalesProposal(Proposal):
+    class Meta:
+        proxy = True
+        verbose_name = "Sales"
+        verbose_name_plural = "Sales"
 
 
 class ContractType(models.Model):
