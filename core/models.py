@@ -1,6 +1,7 @@
 from django.db import models
 from django.contrib.auth.models import User
 from django.utils import timezone
+from django.utils.text import slugify
 from datetime import date
 from ms_crm_app.models import (
     Staff as LegacyStaff,
@@ -47,7 +48,425 @@ class EmailTemplate(models.Model):
         return f"{self.module} - {self.slug}"
 
 
+class SetupModule(models.Model):
+    name = models.CharField(max_length=100)
+    slug = models.SlugField(max_length=120, unique=True, db_index=True)
+    description = models.TextField(blank=True, null=True)
+    route = models.CharField(max_length=255, blank=True, null=True)
+    icon = models.CharField(max_length=80, blank=True, null=True)
+    is_enabled = models.BooleanField(default=True, db_index=True)
+    sort_order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_module"
+        ordering = ["sort_order", "name", "id"]
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = slugify(self.name or "")
+        if not self.name:
+            self.name = (self.slug or "").replace("-", " ").title()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.name
+
+
+class SetupCustomField(models.Model):
+    FIELD_TYPE_CHOICES = [
+        ("text", "Text"),
+        ("textarea", "Textarea"),
+        ("number", "Number"),
+        ("email", "Email"),
+        ("date", "Date"),
+        ("select", "Select"),
+        ("checkbox", "Checkbox"),
+    ]
+
+    module_slug = models.SlugField(max_length=120, db_index=True)
+    label = models.CharField(max_length=191)
+    field_key = models.SlugField(max_length=191)
+    field_type = models.CharField(max_length=50, choices=FIELD_TYPE_CHOICES, default="text")
+    options = models.JSONField(default=list, blank=True)
+    default_value = models.CharField(max_length=255, blank=True, null=True)
+    is_required = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True, db_index=True)
+    sort_order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_custom_field"
+        unique_together = ("module_slug", "field_key")
+        ordering = ["module_slug", "sort_order", "id"]
+
+    def save(self, *args, **kwargs):
+        if not self.field_key:
+            self.field_key = slugify(self.label or "")
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.module_slug} - {self.label}"
+
+
+class SetupGDPRRequest(models.Model):
+    REQUEST_TYPE_CHOICES = [
+        ("export", "Data Export"),
+        ("delete", "Data Deletion"),
+        ("rectify", "Data Rectification"),
+        ("consent", "Consent Update"),
+    ]
+
+    STATUS_CHOICES = [
+        ("pending", "Pending"),
+        ("in_progress", "In Progress"),
+        ("completed", "Completed"),
+        ("rejected", "Rejected"),
+    ]
+
+    customer_name = models.CharField(max_length=191)
+    email = models.EmailField()
+    module_slug = models.SlugField(max_length=120, blank=True, null=True)
+    request_type = models.CharField(max_length=30, choices=REQUEST_TYPE_CHOICES, default="export")
+    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default="pending", db_index=True)
+    details = models.TextField(blank=True, null=True)
+    resolution_notes = models.TextField(blank=True, null=True)
+    resolved_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_gdpr_request"
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return f"{self.customer_name} ({self.request_type})"
+
+
+class SetupSetting(models.Model):
+    INPUT_TYPE_CHOICES = [
+        ("text", "Text"),
+        ("textarea", "Textarea"),
+        ("number", "Number"),
+        ("email", "Email"),
+        ("url", "URL"),
+        ("boolean", "Boolean"),
+        ("json", "JSON"),
+    ]
+
+    category = models.CharField(max_length=100, db_index=True)
+    key = models.CharField(max_length=120)
+    display_name = models.CharField(max_length=191)
+    value = models.TextField(blank=True, null=True)
+    input_type = models.CharField(max_length=30, choices=INPUT_TYPE_CHOICES, default="text")
+    description = models.TextField(blank=True, null=True)
+    is_public = models.BooleanField(default=False)
+    is_editable = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_setting"
+        unique_together = ("category", "key")
+        ordering = ["category", "display_name", "id"]
+
+    def __str__(self):
+        return f"{self.category} / {self.key}"
+
+
+class SetupHelpArticle(models.Model):
+    title = models.CharField(max_length=191)
+    slug = models.SlugField(max_length=191, unique=True, db_index=True)
+    module_slug = models.SlugField(max_length=120, blank=True, null=True, db_index=True)
+    summary = models.CharField(max_length=255, blank=True, null=True)
+    content = models.TextField()
+    is_published = models.BooleanField(default=True, db_index=True)
+    sort_order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_help_article"
+        ordering = ["module_slug", "sort_order", "title", "id"]
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = slugify(self.title or "")
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.title
+
+
+class SetupCustomerGroup(models.Model):
+    name = models.CharField(max_length=191, unique=True, db_index=True)
+    description = models.TextField(blank=True, null=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_customer_group"
+        ordering = ["name", "id"]
+
+    def __str__(self):
+        return self.name
+
+
+class SetupCustomerGroupAssignment(models.Model):
+    customer = models.ForeignKey(
+        "Client",
+        on_delete=models.CASCADE,
+        related_name="setup_group_assignments",
+    )
+    group = models.ForeignKey(
+        SetupCustomerGroup,
+        on_delete=models.CASCADE,
+        related_name="customer_assignments",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_customer_group_assignment"
+        unique_together = ("customer",)
+        ordering = ["-updated_at", "-id"]
+
+    def __str__(self):
+        return f"{self.customer_id} -> {self.group_id}"
+
+
 # ⚠️ renamed (duplicate model avoid)
+class SetupThemeStyle(models.Model):
+    name = models.CharField(max_length=120, unique=True, db_index=True)
+    primary_color = models.CharField(max_length=7, default="#0d6efd")
+    secondary_color = models.CharField(max_length=7, default="#6c757d")
+    accent_color = models.CharField(max_length=7, default="#198754")
+    ui_settings = models.JSONField(default=dict, blank=True)
+    is_default = models.BooleanField(default=False, db_index=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_theme_style"
+        ordering = ["name", "id"]
+
+    def __str__(self):
+        return self.name
+
+
+class SetupTax(models.Model):
+    name = models.CharField(max_length=120, unique=True, db_index=True)
+    rate = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_tax"
+        ordering = ["name", "id"]
+
+    def __str__(self):
+        return f"{self.name} ({self.rate}%)"
+
+
+class SetupCurrency(models.Model):
+    code = models.CharField(max_length=10, unique=True, db_index=True)
+    symbol = models.CharField(max_length=8, blank=True, null=True)
+    name = models.CharField(max_length=80)
+    is_default = models.BooleanField(default=False, db_index=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_currency"
+        ordering = ["code", "id"]
+
+    def save(self, *args, **kwargs):
+        if self.code:
+            self.code = self.code.upper()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.code
+
+
+class SetupPaymentMode(models.Model):
+    name = models.CharField(max_length=100, unique=True, db_index=True)
+    description = models.CharField(max_length=255, blank=True, null=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_payment_mode"
+        ordering = ["name", "id"]
+
+    def __str__(self):
+        return self.name
+
+
+class SetupExpenseCategory(models.Model):
+    name = models.CharField(max_length=120, unique=True, db_index=True)
+    description = models.TextField(blank=True, null=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_expense_category"
+        ordering = ["name", "id"]
+
+    def __str__(self):
+        return self.name
+
+
+class SetupSupportDepartment(models.Model):
+    name = models.CharField(max_length=120, unique=True, db_index=True)
+    email = models.EmailField(blank=True, null=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_support_department"
+        ordering = ["name", "id"]
+
+    def __str__(self):
+        return self.name
+
+
+class SetupTicketPriority(models.Model):
+    name = models.CharField(max_length=80, unique=True, db_index=True)
+    level = models.PositiveSmallIntegerField(default=1)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_ticket_priority"
+        ordering = ["level", "name", "id"]
+
+    def __str__(self):
+        return self.name
+
+
+class SetupTicketStatus(models.Model):
+    name = models.CharField(max_length=80, unique=True, db_index=True)
+    color = models.CharField(max_length=7, default="#0d6efd")
+    is_closed = models.BooleanField(default=False, db_index=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_ticket_status"
+        ordering = ["name", "id"]
+
+    def __str__(self):
+        return self.name
+
+
+class SetupPredefinedReply(models.Model):
+    title = models.CharField(max_length=191, db_index=True)
+    body = models.TextField()
+    department = models.ForeignKey(
+        SetupSupportDepartment,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="predefined_replies",
+    )
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_predefined_reply"
+        ordering = ["title", "id"]
+
+    def __str__(self):
+        return self.title
+
+
+class SetupLeadSource(models.Model):
+    name = models.CharField(max_length=120, unique=True, db_index=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_lead_source"
+        ordering = ["name", "id"]
+
+    def __str__(self):
+        return self.name
+
+
+class SetupLeadStatus(models.Model):
+    name = models.CharField(max_length=120, unique=True, db_index=True)
+    sequence = models.PositiveSmallIntegerField(default=1)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_lead_status"
+        ordering = ["sequence", "name", "id"]
+
+    def __str__(self):
+        return self.name
+
+
+class SetupContractTemplate(models.Model):
+    name = models.CharField(max_length=191, unique=True, db_index=True)
+    slug = models.SlugField(max_length=191, unique=True, db_index=True)
+    content = models.TextField()
+    variable_keys = models.JSONField(default=list, blank=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_contract_template"
+        ordering = ["name", "id"]
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = slugify(self.name or "")
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.name
+
+
+class SetupRolePermission(models.Model):
+    role = models.ForeignKey(
+        "Role",
+        on_delete=models.CASCADE,
+        related_name="setup_permissions",
+    )
+    module_slug = models.SlugField(max_length=120, db_index=True)
+    can_view = models.BooleanField(default=False)
+    can_create = models.BooleanField(default=False)
+    can_edit = models.BooleanField(default=False)
+    can_delete = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_role_permission"
+        unique_together = ("role", "module_slug")
+        ordering = ["role_id", "module_slug", "id"]
+
+    def __str__(self):
+        return f"{self.role_id}:{self.module_slug}"
+
+
 class Business(models.Model):
     name = models.CharField(max_length=100, unique=True, db_index=True)
     email = models.EmailField(unique=True, db_index=True)

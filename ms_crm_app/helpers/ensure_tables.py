@@ -342,3 +342,60 @@ def ensure_tickets_pipe_log_table():
 
         for sql in alter_statements:
             cursor.execute(sql)
+
+
+def ensure_setup_tables():
+    """
+    Ensure Setup module tables exist for the current DB.
+    Uses schema_editor to create Django-managed tables without requiring migrations.
+    """
+    from django.apps import apps
+    from django.db import connections
+    from core.middleware import get_current_db
+
+    db_alias = get_current_db()
+    connection = connections[db_alias]
+    existing_tables = set(connection.introspection.table_names())
+
+    model_names = [
+        "SetupModule",
+        "SetupCustomField",
+        "SetupGDPRRequest",
+        "SetupSetting",
+        "SetupHelpArticle",
+        "SetupCustomerGroup",
+        "SetupCustomerGroupAssignment",
+        "SetupThemeStyle",
+        "SetupTax",
+        "SetupCurrency",
+        "SetupPaymentMode",
+        "SetupExpenseCategory",
+        "SetupSupportDepartment",
+        "SetupTicketPriority",
+        "SetupTicketStatus",
+        "SetupPredefinedReply",
+        "SetupLeadSource",
+        "SetupLeadStatus",
+        "SetupContractTemplate",
+        "SetupRolePermission",
+    ]
+
+    for model_name in model_names:
+        model = apps.get_model("core", model_name)
+        table_name = model._meta.db_table
+        if table_name in existing_tables:
+            continue
+
+        with connection.schema_editor() as schema_editor:
+            schema_editor.create_model(model)
+
+        existing_tables.add(table_name)
+
+    # Email templates are global (default DB in router), ensure table there as well.
+    default_connection = connections["default"]
+    default_existing = set(default_connection.introspection.table_names())
+    email_template_model = apps.get_model("core", "EmailTemplate")
+    email_table = email_template_model._meta.db_table
+    if email_table not in default_existing:
+        with default_connection.schema_editor() as schema_editor:
+            schema_editor.create_model(email_template_model)

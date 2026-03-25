@@ -19,6 +19,29 @@ from .models import Invoice, InvoiceReminder, InvoiceTask, InvoiceEmailLog, Invo
 from .models import Contract
 from .models import ContractType
 from .models import ContractAttachment, ContractComment, ContractRenewal, ContractTask, ContractNote
+from .models import (
+    EmailTemplate,
+    SetupModule,
+    SetupCustomField,
+    SetupGDPRRequest,
+    SetupSetting,
+    SetupHelpArticle,
+    SetupCustomerGroup,
+    SetupCustomerGroupAssignment,
+    SetupThemeStyle,
+    SetupTax,
+    SetupCurrency,
+    SetupPaymentMode,
+    SetupExpenseCategory,
+    SetupSupportDepartment,
+    SetupTicketPriority,
+    SetupTicketStatus,
+    SetupPredefinedReply,
+    SetupLeadSource,
+    SetupLeadStatus,
+    SetupContractTemplate,
+    SetupRolePermission,
+)
 from .item_master import sync_items_to_master
 from .models import Project
 from ms_crm_app.models import Staff
@@ -720,6 +743,195 @@ class EmailCampaignSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = EmailCampaign
+        fields = "__all__"
+
+
+class EmailTemplateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EmailTemplate
+        fields = "__all__"
+        extra_kwargs = {
+            "slug": {"required": False, "allow_blank": True},
+            "language": {"required": False},
+        }
+
+
+class SetupModuleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SetupModule
+        fields = "__all__"
+
+
+class SetupCustomFieldSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SetupCustomField
+        fields = "__all__"
+        extra_kwargs = {
+            "field_key": {"required": False, "allow_blank": True},
+            "options": {"required": False},
+        }
+
+
+class SetupGDPRRequestSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SetupGDPRRequest
+        fields = "__all__"
+
+    def update(self, instance, validated_data):
+        next_status = validated_data.get("status")
+        if next_status == "completed" and not instance.resolved_at:
+            validated_data["resolved_at"] = timezone.now()
+        return super().update(instance, validated_data)
+
+
+class SetupSettingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SetupSetting
+        fields = "__all__"
+
+
+class SetupHelpArticleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SetupHelpArticle
+        fields = "__all__"
+        extra_kwargs = {
+            "slug": {"required": False, "allow_blank": True},
+        }
+
+
+class SetupCustomerGroupSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SetupCustomerGroup
+        fields = "__all__"
+
+
+class SetupCustomerGroupAssignmentSerializer(serializers.ModelSerializer):
+    customer_name = serializers.CharField(source="customer.company", read_only=True)
+    group_name = serializers.CharField(source="group.name", read_only=True)
+
+    class Meta:
+        model = SetupCustomerGroupAssignment
+        fields = "__all__"
+
+
+class SetupThemeStyleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SetupThemeStyle
+        fields = "__all__"
+
+    def validate(self, attrs):
+        is_default = attrs.get("is_default")
+        if is_default:
+            qs = SetupThemeStyle.objects.filter(is_default=True)
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError("Only one default theme is allowed.")
+        return attrs
+
+
+class SetupTaxSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SetupTax
+        fields = "__all__"
+
+    def validate_rate(self, value):
+        if value < 0:
+            raise serializers.ValidationError("Tax rate must be greater than or equal to 0.")
+        return value
+
+
+class SetupCurrencySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SetupCurrency
+        fields = "__all__"
+
+    def validate(self, attrs):
+        code = attrs.get("code")
+        if code:
+            attrs["code"] = str(code).upper()
+
+        is_default = attrs.get("is_default")
+        if is_default:
+            qs = SetupCurrency.objects.filter(is_default=True)
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError("Only one default currency is allowed.")
+        return attrs
+
+
+class SetupPaymentModeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SetupPaymentMode
+        fields = "__all__"
+
+
+class SetupExpenseCategorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SetupExpenseCategory
+        fields = "__all__"
+
+
+class SetupSupportDepartmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SetupSupportDepartment
+        fields = "__all__"
+
+
+class SetupTicketPrioritySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SetupTicketPriority
+        fields = "__all__"
+
+
+class SetupTicketStatusSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SetupTicketStatus
+        fields = "__all__"
+
+    def validate_color(self, value):
+        val = str(value or "")
+        if len(val) != 7 or not val.startswith("#"):
+            raise serializers.ValidationError("Color must be in #RRGGBB format.")
+        return val
+
+
+class SetupPredefinedReplySerializer(serializers.ModelSerializer):
+    department_name = serializers.CharField(source="department.name", read_only=True)
+
+    class Meta:
+        model = SetupPredefinedReply
+        fields = "__all__"
+
+
+class SetupLeadSourceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SetupLeadSource
+        fields = "__all__"
+
+
+class SetupLeadStatusSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SetupLeadStatus
+        fields = "__all__"
+
+
+class SetupContractTemplateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SetupContractTemplate
+        fields = "__all__"
+        extra_kwargs = {
+            "slug": {"required": False, "allow_blank": True},
+            "variable_keys": {"required": False},
+        }
+
+
+class SetupRolePermissionSerializer(serializers.ModelSerializer):
+    role_name = serializers.CharField(source="role.name", read_only=True)
+
+    class Meta:
+        model = SetupRolePermission
         fields = "__all__"
 
 

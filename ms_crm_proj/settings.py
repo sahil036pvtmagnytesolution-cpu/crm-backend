@@ -151,6 +151,7 @@ EMAIL_HOST_PASSWORD = 'hyfr kswo qfgf penq'
 
 DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
 SUPERADMIN_EMAIL = 'magnytesolution@gmail.com'
+EMAIL_LOGO_PATH = BASE_DIR / "core" / "static" / "mss.png"
 
 CORS_ALLOW_CREDENTIALS = True
 

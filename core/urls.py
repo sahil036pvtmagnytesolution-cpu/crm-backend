@@ -65,6 +65,29 @@ from .views import (
 from .views import ClientViewSet, ApprovedUsersView
 from .views import media_files_list, upload_media, media_file_delete
 from . import views
+from .views import (
+    SetupModuleViewSet,
+    EmailTemplateViewSet,
+    SetupCustomFieldViewSet,
+    SetupCurrencyViewSet,
+    SetupContractTemplateViewSet,
+    SetupGDPRRequestViewSet,
+    SetupExpenseCategoryViewSet,
+    SetupSettingViewSet,
+    SetupHelpArticleViewSet,
+    SetupLeadSourceViewSet,
+    SetupLeadStatusViewSet,
+    SetupPaymentModeViewSet,
+    SetupPredefinedReplyViewSet,
+    SetupRolePermissionViewSet,
+    SetupSupportDepartmentViewSet,
+    SetupTaxViewSet,
+    SetupThemeStyleViewSet,
+    SetupTicketPriorityViewSet,
+    SetupTicketStatusViewSet,
+    SetupCustomerGroupViewSet,
+    SetupCustomerGroupAssignmentViewSet,
+)
 
 router = DefaultRouter()
 
@@ -82,6 +105,27 @@ router.register(r'calendar-events', CalendarEventViewSet, basename="calendar-eve
 router.register(r'estimates', EstimateViewSet, basename='estimates')
 router.register(r'proposals', ProposalViewSet)
 router.register(r'projects', ProjectViewSet, basename="projects")
+router.register(r'setup/modules', SetupModuleViewSet, basename="setup-modules")
+router.register(r'setup/email-templates', EmailTemplateViewSet, basename="setup-email-templates")
+router.register(r'setup/custom-fields', SetupCustomFieldViewSet, basename="setup-custom-fields")
+router.register(r'setup/gdpr-requests', SetupGDPRRequestViewSet, basename="setup-gdpr-requests")
+router.register(r'setup/settings', SetupSettingViewSet, basename="setup-settings")
+router.register(r'setup/help-articles', SetupHelpArticleViewSet, basename="setup-help-articles")
+router.register(r'setup/customer-groups', SetupCustomerGroupViewSet, basename="setup-customer-groups")
+router.register(r'setup/customer-group-assignments', SetupCustomerGroupAssignmentViewSet, basename="setup-customer-group-assignments")
+router.register(r'setup/theme-styles', SetupThemeStyleViewSet, basename="setup-theme-styles")
+router.register(r'setup/taxes', SetupTaxViewSet, basename="setup-taxes")
+router.register(r'setup/currencies', SetupCurrencyViewSet, basename="setup-currencies")
+router.register(r'setup/payment-modes', SetupPaymentModeViewSet, basename="setup-payment-modes")
+router.register(r'setup/expense-categories', SetupExpenseCategoryViewSet, basename="setup-expense-categories")
+router.register(r'setup/support-departments', SetupSupportDepartmentViewSet, basename="setup-support-departments")
+router.register(r'setup/ticket-priorities', SetupTicketPriorityViewSet, basename="setup-ticket-priorities")
+router.register(r'setup/ticket-statuses', SetupTicketStatusViewSet, basename="setup-ticket-statuses")
+router.register(r'setup/predefined-replies', SetupPredefinedReplyViewSet, basename="setup-predefined-replies")
+router.register(r'setup/lead-sources', SetupLeadSourceViewSet, basename="setup-lead-sources")
+router.register(r'setup/lead-statuses', SetupLeadStatusViewSet, basename="setup-lead-statuses")
+router.register(r'setup/contract-templates', SetupContractTemplateViewSet, basename="setup-contract-templates")
+router.register(r'setup/role-permissions', SetupRolePermissionViewSet, basename="setup-role-permissions")
 
 urlpatterns = [
 

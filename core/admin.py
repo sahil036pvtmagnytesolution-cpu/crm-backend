@@ -2,8 +2,6 @@ from django.contrib import admin, messages
 from django.utils.html import format_html
 from django.urls import path
 from django.shortcuts import redirect
-from django.conf import settings
-from django.contrib.auth.models import User
 
 from .models import (
     Business,
@@ -12,8 +10,6 @@ from .models import (
     KnowledgeBaseProxy,
     KnowledgeBaseGroupProxy,
 )
-from django.db import connection
-
 from django.contrib import admin
 from .models import Proposal
 
@@ -30,17 +26,19 @@ from ms_crm_app.helpers.ensure_tables import (
     ensure_project_tables,
     ensure_knowledge_base_tables,
 )
-
-import MySQLdb
+from .business_onboarding import (
+    approve_business_and_activate_user,
+    generate_unique_business_db_name,
+    _is_valid_db_name,
+)
 
 
 @admin.register(Business)
 class BusinessAdmin(admin.ModelAdmin):
-    list_display = ("name", "email", "owner_name", "is_approved", "created_at")
+    list_display = ("name", "email", "owner_name", "db_name", "is_approved", "created_at")
     list_filter = ("is_approved", "created_at")
-    search_fields = ("name", "email", "owner_name")
+    search_fields = ("name", "email", "owner_name", "db_name")
 
-    # 👇 IMPORTANT: approve_button ko form me dikhane ke liye
     readonly_fields = ("approve_button",)
     fields = (
         "name",
@@ -51,9 +49,8 @@ class BusinessAdmin(admin.ModelAdmin):
         "approve_button",
     )
 
-    # =============================
-    # CUSTOM URL
-    # =============================
+    actions = ["approve_selected_businesses"]
+
     def get_urls(self):
         urls = super().get_urls()
         custom_urls = [
@@ -65,79 +62,43 @@ class BusinessAdmin(admin.ModelAdmin):
         ]
         return custom_urls + urls
 
-    # =============================
-    # APPROVE BUTTON
-    # =============================
     def approve_button(self, obj):
         if obj.is_approved:
-            return "✅ Approved"
-
+            return "Approved"
         return format_html(
             '<a class="button" href="/admin/core/business/{}/approve/">Approve</a>',
             obj.id,
-    )
-
+        )
 
     approve_button.short_description = "Approval"
 
-    # =============================
-    # APPROVE BUSINESS (FAST & SAFE)
-    # =============================
+    def _approve_and_notify(self, request, business):
+        result = approve_business_and_activate_user(business)
+        if result["email_sent"]:
+            self.message_user(
+                request,
+                f"Business '{business.name}' approved. Login email sent.",
+                level=messages.SUCCESS,
+            )
+        else:
+            self.message_user(
+                request,
+                f"Business '{business.name}' approved but email failed: {result['email_error']}",
+                level=messages.WARNING,
+            )
+
     def approve_business(self, request, business_id):
         try:
             business = Business.objects.get(id=business_id)
-
-            if business.is_approved:
+            if business.is_approved and business.db_name:
                 self.message_user(
                     request,
                     "Business already approved",
                     level=messages.WARNING,
                 )
-                return redirect(
-                    f"/admin/core/business/{business.id}/change/"
-                )
+                return redirect(f"/admin/core/business/{business.id}/change/")
 
-            # -----------------------------
-            # CREATE TENANT DB (OPTIONAL, SAFE)
-            # -----------------------------
-            db_name = f"ms_crm_{business.id}"
-            business.db_name = db_name
-
-            root_conn = MySQLdb.connect(
-                host=settings.DATABASES["default"]["HOST"],
-                user=settings.DATABASES["default"]["USER"],
-                passwd=settings.DATABASES["default"]["PASSWORD"],
-                charset="utf8mb4",
-                autocommit=True,
-            )
-
-            with root_conn.cursor() as cursor:
-                cursor.execute(
-                    f"CREATE DATABASE IF NOT EXISTS `{db_name}`"
-                )
-            root_conn.close()
-
-            # -----------------------------
-            # 🔥 INSTANT APPROVAL (NO DELAY)
-            # -----------------------------
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    "UPDATE core_business SET is_approved = 1 WHERE id = %s",
-                    [business_id],
-            )
-
-            # -----------------------------
-            # ACTIVATE USER (OPTIONAL)
-            # -----------------------------
-            User.objects.filter(
-                username=business.email
-            ).update(is_active=True)
-
-            self.message_user(
-                request,
-                f"Business '{business.name}' approved successfully ✅",
-                level=messages.SUCCESS,
-            )
+            self._approve_and_notify(request, business)
 
         except Business.DoesNotExist:
             self.message_user(
@@ -145,64 +106,73 @@ class BusinessAdmin(admin.ModelAdmin):
                 "Business not found",
                 level=messages.ERROR,
             )
-
-        except Exception as e:
+        except Exception as exc:
             self.message_user(
                 request,
-                f"Approval failed: {e}",
+                f"Approval failed: {exc}",
                 level=messages.ERROR,
             )
 
-        return redirect(
-            f"/admin/core/business/{business_id}/change/"
-        )
-
-    # ==================================================
-    # PERMANENT BACKUP APPROVAL (ADMIN ACTION)
-    # ==================================================
-    actions = ["approve_selected_businesses"]
+        return redirect(f"/admin/core/business/{business_id}/change/")
 
     def approve_selected_businesses(self, request, queryset):
         approved_count = 0
+        warning_count = 0
 
         for business in queryset:
-            if business.is_approved:
+            if business.is_approved and business.db_name:
                 continue
 
-            # Same logic as button (NO CHANGE)
-            db_name = f"ms_crm_{business.id}"
-            business.db_name = db_name
-
-            root_conn = MySQLdb.connect(
-                host=settings.DATABASES["default"]["HOST"],
-                user=settings.DATABASES["default"]["USER"],
-                passwd=settings.DATABASES["default"]["PASSWORD"],
-                charset="utf8mb4",
-                autocommit=True,
-            )
-
-            with root_conn.cursor() as cursor:
-                cursor.execute(
-                    f"CREATE DATABASE IF NOT EXISTS `{db_name}`"
+            try:
+                result = approve_business_and_activate_user(business)
+                approved_count += 1
+                if not result["email_sent"]:
+                    warning_count += 1
+            except Exception as exc:
+                warning_count += 1
+                self.message_user(
+                    request,
+                    f"Approval failed for '{business.name}': {exc}",
+                    level=messages.ERROR,
                 )
-            root_conn.close()
-
-            business.is_approved = True
-            business.save(update_fields=["is_approved", "db_name"])
-
-            User.objects.filter(
-                username=business.email
-            ).update(is_active=True)
-
-            approved_count += 1
 
         self.message_user(
             request,
-            f"{approved_count} business(es) approved successfully ✅",
+            f"{approved_count} business(es) approved successfully.",
             level=messages.SUCCESS,
         )
 
-    approve_selected_businesses.short_description = "✅ Approve selected businesses (Permanent)"
+        if warning_count:
+            self.message_user(
+                request,
+                f"{warning_count} business(es) had email or approval issues. Check messages above.",
+                level=messages.WARNING,
+            )
+
+    approve_selected_businesses.short_description = "Approve selected businesses"
+
+    def save_model(self, request, obj, form, change):
+        if not _is_valid_db_name(obj.db_name):
+            obj.db_name = generate_unique_business_db_name(obj.name, exclude_pk=obj.pk)
+
+        was_approved = False
+        had_db_name = False
+        if change and obj.pk:
+            previous = Business.objects.filter(pk=obj.pk).only("is_approved", "db_name").first()
+            was_approved = bool(previous and previous.is_approved)
+            had_db_name = bool(previous and previous.db_name)
+
+        super().save_model(request, obj, form, change)
+
+        if obj.is_approved and (not was_approved or not had_db_name):
+            try:
+                self._approve_and_notify(request, obj)
+            except Exception as exc:
+                self.message_user(
+                    request,
+                    f"Business saved but approval flow failed: {exc}",
+                    level=messages.ERROR,
+                )
 # ==============================
 # ROLE ADMIN (SAFE ADDITION)
 # ==============================

@@ -11,7 +11,6 @@ from django.contrib.auth.hashers import check_password, make_password
 from django.db import transaction
 import threading
 
-from django.core.mail import send_mail
 from django.http import FileResponse
 from django.conf import settings
 from rest_framework.decorators import action
@@ -61,6 +60,12 @@ from ms_crm_app.helpers.ensure_tables import (
 from core.utils.activity_log import log_activity, serialize_activity_log
 from .serializers import BusinessSerializer, RoleSerializer, ProposalSerializer, StaffSerializer
 from core.seeders.email_templates import seed_email_templates_optimized
+from core.business_onboarding import (
+    ensure_business_runtime_ready,
+    generate_unique_business_db_name,
+    send_login_success_email,
+    send_signup_received_email,
+)
 from rest_framework.permissions import AllowAny
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -121,14 +126,12 @@ from rest_framework.views import APIView
 from django.contrib.auth import get_user_model
 from rest_framework.response import Response
 
-from django.core.mail import EmailMultiAlternatives
 from django.utils.html import strip_tags
 from django.utils.encoding import force_bytes
 from django.core.mail import EmailMessage
 from django.contrib.staticfiles import finders
 from django.core.files.base import ContentFile
 from django.core.mail import get_connection
-from email.mime.image import MIMEImage
 import os
 import pandas as pd
 from django.utils import timezone
@@ -151,9 +154,10 @@ from .serializers import ContactSerializer
 from .serializers import CreditNoteReminderSerializer, CreditNoteSerializer, CreditNoteTaskSerializer
 from .serializers import ItemGroupSerializer, ItemSerializer
 from .item_master import sync_item_to_master, sync_items_to_master
+from .email_branding import send_branded_email
 from .models import Project
 from .serializers import ProjectSerializer
-from django.db.models import Count, Sum
+from django.db.models import Count, Sum, Q
 from django.db.utils import OperationalError, ProgrammingError
 from django.utils.text import slugify
 
@@ -230,11 +234,10 @@ Regards,
 CRM Team
             """
 
-            send_mail(
-                subject,
-                message,
-                settings.DEFAULT_FROM_EMAIL,
-                [user.email],
+            send_branded_email(
+                subject=subject,
+                message=message,
+                to_emails=[user.email],
                 fail_silently=False,
             )
 
@@ -453,13 +456,12 @@ class ProjectViewSet(ModelViewSet):
         message = strip_tags(html_message)
 
         try:
-            send_mail(
-                subject,
-                message,
-                settings.DEFAULT_FROM_EMAIL,
-                recipients,
-                fail_silently=False,
+            send_branded_email(
+                subject=subject,
+                message=message,
+                to_emails=recipients,
                 html_message=html_message,
+                fail_silently=False,
             )
         except Exception as e:
             # Don't fail project creation because of email.
@@ -509,13 +511,12 @@ class ProjectViewSet(ModelViewSet):
         message = strip_tags(html_message)
 
         try:
-            send_mail(
-                subject,
-                message,
-                settings.DEFAULT_FROM_EMAIL,
-                recipients,
-                fail_silently=False,
+            send_branded_email(
+                subject=subject,
+                message=message,
+                to_emails=recipients,
                 html_message=html_message,
+                fail_silently=False,
             )
         except Exception as e:
             return Response({"detail": f"Email failed: {e}"}, status=status.HTTP_400_BAD_REQUEST)
@@ -750,6 +751,16 @@ def register_business(request):
             {"status": False, "message": "User already exists"},
             status=400,
         )
+    if Business.objects.filter(email__iexact=data["email"]).exists():
+        return Response(
+            {"status": False, "message": "Business email already exists"},
+            status=400,
+        )
+    if Business.objects.filter(name__iexact=data["name"]).exists():
+        return Response(
+            {"status": False, "message": "Business name already exists"},
+            status=400,
+        )
 
     with transaction.atomic():
         user = User(
@@ -760,18 +771,26 @@ def register_business(request):
         user.set_password(data["password"])
         user.save()
 
-        Business.objects.create(
+        business = Business.objects.create(
             name=data["name"],
             email=data["email"],
             owner_name=data["owner_name"],
+            db_name=generate_unique_business_db_name(data["name"]),
         )
 
     run_async(seed_email_templates_optimized)
+    run_async(send_signup_received_email, business)
 
     return Response(
         {
             "status": True,
-            "message": "Signup successful. Please wait for admin approval.",
+            "message": "Signup successful. Approval request email sent. Please wait for super admin approval.",
+            "business": {
+                "name": business.name,
+                "email": business.email,
+                "db_name": business.db_name,
+                "is_approved": business.is_approved,
+            },
         },
         status=201,
     )
@@ -787,25 +806,42 @@ def login(request):
     email = request.data.get("email")
     password = request.data.get("password")
 
-    try:
-        user = User.objects.get(username=email)
-    except User.DoesNotExist:
+    if not email or not password:
+        return Response({"message": "Email and password are required"}, status=400)
+
+    user = User.objects.filter(username__iexact=email).first()
+    if not user:
         log_activity(f"Failed Login Attempt [Email: {email or '-'}]", user=None)
         return Response({"message": "Invalid credentials"}, status=401)
-
-    if not user.is_active:
-        log_activity(f"Failed Login Attempt [Email: {email or '-'}]", user=None)
-        return Response(
-            {"message": "Business not approved by admin yet"},
-            status=403,
-        )
 
     if not check_password(password, user.password):
         log_activity(f"Failed Login Attempt [Email: {email or '-'}]", user=None)
         return Response({"message": "Invalid credentials"}, status=401)
 
+    business = Business.objects.filter(email__iexact=email).order_by("-created_at").first()
+    if not business:
+        log_activity(f"Failed Login Attempt [Email: {email or '-'}]", user=None)
+        return Response({"message": "Business profile not found"}, status=403)
+
+    if not business.is_approved or not user.is_active:
+        log_activity(f"Failed Login Attempt [Email: {email or '-'}]", user=None)
+        return Response(
+            {"message": "Business not approved by super admin yet"},
+            status=403,
+        )
+
+    try:
+        ensure_business_runtime_ready(business)
+    except Exception as exc:
+        log_activity(f"Failed Login Attempt [Email: {email or '-'} | Tenant setup failed]", user=None)
+        return Response(
+            {"message": f"Business tenant setup failed: {exc}"},
+            status=500,
+        )
+
     refresh = RefreshToken.for_user(user)
     log_activity(f"Staff Login [Email: {user.email or user.username}]", user=user)
+    login_mail_sent, login_mail_error = send_login_success_email(business)
 
     return Response(
         {
@@ -815,6 +851,17 @@ def login(request):
                 "id": user.id,
                 "email": user.email,
                 "is_superuser": user.is_superuser,
+            },
+            "business": {
+                "id": business.id,
+                "name": business.name,
+                "owner_name": business.owner_name,
+                "db_name": business.db_name,
+                "is_approved": business.is_approved,
+            },
+            "login_mail": {
+                "sent": login_mail_sent,
+                "error": login_mail_error,
             },
         },
         status=200,
@@ -906,74 +953,40 @@ def send_proposal_assignment_email(proposal, user):
         subject = f"New Proposal Assigned - #{proposal.id}"
 
         html_content = f"""
-        <div style="font-family: Arial, sans-serif; background:#f4f6f9; padding:20px;">
-            <div style="max-width:600px; margin:auto; background:#ffffff; border-radius:8px; overflow:hidden; box-shadow:0 4px 12px rgba(0,0,0,0.1);">
-
-                <div style="background:#2c3e50; padding:20px; text-align:center;">
-                    <img src="cid:companylogo" style="max-height:60px;"><br>
-                    <h2 style="color:#ffffff; margin:10px 0 0;">New Proposal Assigned</h2>
-                </div>
-
-                <div style="padding:20px;">
-                    <p>Hello <strong>{user.first_name or user.username}</strong>,</p>
-                    <p>You have been assigned a new proposal. Details are below:</p>
-
-                    <table style="width:100%; border-collapse: collapse; margin-top:15px;">
-                        <tr>
-                            <td style="padding:8px; border:1px solid #ddd;"><strong>Proposal ID</strong></td>
-                            <td style="padding:8px; border:1px solid #ddd;">#{proposal.id}</td>
-                        </tr>
-                        <tr>
-                            <td style="padding:8px; border:1px solid #ddd;"><strong>Subject</strong></td>
-                            <td style="padding:8px; border:1px solid #ddd;">{getattr(proposal, 'subject', 'N/A')}</td>
-                        </tr>
-                        <tr>
-                            <td style="padding:8px; border:1px solid #ddd;"><strong>Total</strong></td>
-                            <td style="padding:8px; border:1px solid #ddd;">â‚¹{getattr(proposal, 'total', '0')}</td>
-                        </tr>
-                    </table>
-
-                    <div style="text-align:center; margin-top:25px;">
-                        <a href="{frontend_url}" 
-                           style="background:#27ae60; color:#ffffff; padding:12px 25px; text-decoration:none; border-radius:5px; display:inline-block;">
-                           View Proposal
-                        </a>
-                    </div>
-
-                    <p style="margin-top:30px;">Regards,<br><strong>Magnyte Solution CRM Team</strong></p>
-                </div>
-            </div>
-        </div>
-        """
+<h3 style="margin:0 0 10px 0;color:#0f172a;">New Proposal Assigned</h3>
+<p>Hello <strong>{user.first_name or user.username}</strong>,</p>
+<p>You have been assigned a new proposal. Details are below:</p>
+<table style="width:100%; border-collapse: collapse; margin-top:15px;">
+    <tr>
+        <td style="padding:8px; border:1px solid #d1d5db;"><strong>Proposal ID</strong></td>
+        <td style="padding:8px; border:1px solid #d1d5db;">#{proposal.id}</td>
+    </tr>
+    <tr>
+        <td style="padding:8px; border:1px solid #d1d5db;"><strong>Subject</strong></td>
+        <td style="padding:8px; border:1px solid #d1d5db;">{getattr(proposal, 'subject', 'N/A')}</td>
+    </tr>
+    <tr>
+        <td style="padding:8px; border:1px solid #d1d5db;"><strong>Total</strong></td>
+        <td style="padding:8px; border:1px solid #d1d5db;">{getattr(proposal, 'total', '0')}</td>
+    </tr>
+</table>
+<div style="text-align:center; margin-top:25px;">
+    <a href="{frontend_url}" 
+       style="background:#27ae60; color:#ffffff; padding:12px 25px; text-decoration:none; border-radius:5px; display:inline-block;">
+       View Proposal
+    </a>
+</div>
+<p style="margin-top:24px;">Regards,<br/><strong>Magnyte Solution CRM Team</strong></p>
+"""
 
         text_content = strip_tags(html_content)
-
-        email = EmailMultiAlternatives(
-            subject,
-            text_content,
-            settings.DEFAULT_FROM_EMAIL,
-            [recipient],
+        send_branded_email(
+            subject=subject,
+            message=text_content,
+            to_emails=[recipient],
+            html_message=html_content,
+            fail_silently=False,
         )
-
-        email.attach_alternative(html_content, "text/html")
-
-        logo_path = os.path.join(
-            settings.BASE_DIR.parent,
-            "crm-frontend",
-            "public",
-            "ms.png"
-        )
-
-        if os.path.exists(logo_path):
-            with open(logo_path, "rb") as f:
-                logo = MIMEImage(f.read())
-                logo.add_header("Content-ID", "<companylogo>")
-                logo.add_header("Content-Disposition", "inline", filename="ms.png")
-                email.attach(logo)
-        else:
-            print("Logo file not found at:", logo_path)
-
-        email.send()
         print("HTML EMAIL SENT TO:", recipient)
         return True
     except Exception as e:
@@ -1281,11 +1294,10 @@ def upload_and_send_emails(request):
         )
 
         try:
-            send_mail(
-                subject,
-                message,
-                settings.DEFAULT_FROM_EMAIL,
-                [email],
+            send_branded_email(
+                subject=subject,
+                message=message,
+                to_emails=[email],
                 fail_silently=False,
             )
 
@@ -1318,11 +1330,10 @@ def send_single_email(request):
         return Response({"error": "All fields required"}, status=400)
 
     try:
-        send_mail(
-            subject,
-            message,
-            settings.DEFAULT_FROM_EMAIL,
-            [email],
+        send_branded_email(
+            subject=subject,
+            message=message,
+            to_emails=[email],
             fail_silently=False,
         )
 
@@ -1549,11 +1560,10 @@ def send_invoice_email(request):
         subject = f"Invoice #{invoice.invoice_number}"
 
         # SEND EMAIL
-        send_mail(
-            subject,
-            message,
-            settings.DEFAULT_FROM_EMAIL,
-            [email],
+        send_branded_email(
+            subject=subject,
+            message=message,
+            to_emails=[email],
             fail_silently=False,
         )
 
@@ -2962,13 +2972,12 @@ def announcements_list(request):
 """
             plain_message = strip_tags(html_message)
             try:
-                send_mail(
-                    f"New Announcement: {announcement.name}",
-                    plain_message,
-                    settings.DEFAULT_FROM_EMAIL,
-                    sorted(email_recipients),
-                    fail_silently=False,
+                send_branded_email(
+                    subject=f"New Announcement: {announcement.name}",
+                    message=plain_message,
+                    to_emails=sorted(email_recipients),
                     html_message=html_message,
+                    fail_silently=False,
                 )
             except Exception as exc:
                 print("Announcement email failed:", exc)
@@ -3282,9 +3291,10 @@ def _serialize_legacy_activity_log(log):
 
 
 def _activity_logs_response(request):
+    current_user = getattr(request, "user", None)
     try:
         if CoreActivityLog.objects.exists():
-            qs = CoreActivityLog.objects.all().order_by("-created_at")
+            qs = CoreActivityLog.objects.filter(user=current_user).order_by("-created_at")
             qs = _apply_limit(qs, request)
             return Response([serialize_activity_log(log) for log in qs])
     except (ProgrammingError, OperationalError) as exc:
@@ -3298,9 +3308,27 @@ def _activity_logs_response(request):
     from core.middleware import get_current_db
 
     db = get_current_db()
-    _seed_activity_log_if_empty(db)
     try:
-        qs = LegacyActivityLog.objects.using(db).all().order_by("-date")
+        candidate_staff_ids = []
+        if current_user is not None:
+            candidate_staff_ids.extend([
+                str(getattr(current_user, "id", "")).strip(),
+                str(getattr(current_user, "username", "")).strip(),
+                str(getattr(current_user, "email", "")).strip(),
+                str(getattr(current_user, "get_full_name", lambda: "")()).strip(),
+            ])
+        candidate_staff_ids = [x for x in candidate_staff_ids if x]
+
+        qs = LegacyActivityLog.objects.using(db).all()
+        if candidate_staff_ids:
+            staff_filter = Q()
+            for value in candidate_staff_ids:
+                staff_filter |= Q(staff_name__iexact=value)
+            qs = qs.filter(staff_filter)
+        else:
+            qs = qs.none()
+
+        qs = qs.order_by("-date")
         qs = _apply_limit(qs, request)
         return Response([_serialize_legacy_activity_log(log) for log in qs])
     except (ProgrammingError, OperationalError) as exc:
@@ -3592,16 +3620,14 @@ def support_ticket_pipe_create(request):
 
     mail_status = "sent"
     try:
-        email_message = EmailMultiAlternatives(
+        send_branded_email(
             subject=subject,
-            body=message,
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            to=[email_to],
+            message=message,
+            to_emails=[email_to],
             cc=cc_recipients,
+            html_message=html_message or None,
+            fail_silently=False,
         )
-        if html_message:
-            email_message.attach_alternative(html_message, "text/html")
-        email_message.send(fail_silently=False)
     except Exception as exc:
         print("Support ticket email failed:", exc)
         mail_status = "failed"
@@ -3957,5 +3983,860 @@ def database_backup_download(request, pk):
 
     filename = os.path.basename(path)
     return FileResponse(open(path, "rb"), as_attachment=True, filename=filename)
+
+
+from ms_crm_app.helpers.ensure_tables import ensure_setup_tables
+from .models import (
+    EmailTemplate,
+    SetupCustomField,
+    SetupContractTemplate,
+    SetupCurrency,
+    SetupCustomerGroup,
+    SetupCustomerGroupAssignment,
+    SetupExpenseCategory,
+    SetupGDPRRequest,
+    SetupHelpArticle,
+    SetupLeadSource,
+    SetupLeadStatus,
+    SetupModule,
+    SetupPaymentMode,
+    SetupPredefinedReply,
+    SetupRolePermission,
+    SetupSetting,
+    SetupSupportDepartment,
+    SetupTax,
+    SetupThemeStyle,
+    SetupTicketPriority,
+    SetupTicketStatus,
+)
+from .serializers import (
+    EmailTemplateSerializer,
+    SetupContractTemplateSerializer,
+    SetupCurrencySerializer,
+    SetupCustomFieldSerializer,
+    SetupCustomerGroupAssignmentSerializer,
+    SetupCustomerGroupSerializer,
+    SetupExpenseCategorySerializer,
+    SetupGDPRRequestSerializer,
+    SetupHelpArticleSerializer,
+    SetupLeadSourceSerializer,
+    SetupLeadStatusSerializer,
+    SetupModuleSerializer,
+    SetupPaymentModeSerializer,
+    SetupPredefinedReplySerializer,
+    SetupRolePermissionSerializer,
+    SetupSettingSerializer,
+    SetupSupportDepartmentSerializer,
+    SetupTaxSerializer,
+    SetupThemeStyleSerializer,
+    SetupTicketPrioritySerializer,
+    SetupTicketStatusSerializer,
+)
+
+
+DEFAULT_SETUP_MODULES = [
+    {
+        "name": "Staff",
+        "slug": "staff",
+        "description": "Manage staff members, roles, active status and assignments.",
+        "route": "/staff",
+        "icon": "users",
+        "sort_order": 1,
+    },
+    {
+        "name": "Customer",
+        "slug": "customer",
+        "description": "Manage customers, contacts and account status.",
+        "route": "/customer",
+        "icon": "building",
+        "sort_order": 2,
+    },
+    {
+        "name": "Support",
+        "slug": "support",
+        "description": "Support ticket pipe, routing and service mailbox operations.",
+        "route": "/support",
+        "icon": "headset",
+        "sort_order": 3,
+    },
+    {
+        "name": "Leads",
+        "slug": "leads",
+        "description": "Lead capture, lifecycle and status tracking.",
+        "route": "/leads",
+        "icon": "bullseye",
+        "sort_order": 4,
+    },
+    {
+        "name": "Finance",
+        "slug": "finance",
+        "description": "Expense and payment related controls and reporting links.",
+        "route": "/reports/expenses",
+        "icon": "coins",
+        "sort_order": 5,
+    },
+    {
+        "name": "Contracts",
+        "slug": "contracts",
+        "description": "Contract master data, terms and renewal tracking.",
+        "route": "/Sale/ContractsDashboard/",
+        "icon": "file-contract",
+        "sort_order": 6,
+    },
+    {
+        "name": "Modules",
+        "slug": "modules",
+        "description": "Enable or disable modules visible in setup and app navigation.",
+        "route": "/setup?tab=modules",
+        "icon": "layer-group",
+        "sort_order": 7,
+    },
+    {
+        "name": "Email Template",
+        "slug": "email-template",
+        "description": "Centralized email templates for notifications and transactional emails.",
+        "route": "/setup?tab=email-template",
+        "icon": "envelope",
+        "sort_order": 8,
+    },
+    {
+        "name": "Custom Fields",
+        "slug": "custom-fields",
+        "description": "Create module-wise custom fields without code changes.",
+        "route": "/setup?tab=custom-fields",
+        "icon": "table-columns",
+        "sort_order": 9,
+    },
+    {
+        "name": "GDPR",
+        "slug": "gdpr",
+        "description": "Track GDPR requests, processing and completion timeline.",
+        "route": "/setup?tab=gdpr",
+        "icon": "shield-check",
+        "sort_order": 10,
+    },
+    {
+        "name": "Roles",
+        "slug": "roles",
+        "description": "Role and permission definition.",
+        "route": "/role/save",
+        "icon": "user-shield",
+        "sort_order": 11,
+    },
+    {
+        "name": "Theme Style",
+        "slug": "theme-style",
+        "description": "Customize brand colors and shared UI style options.",
+        "route": "/setup?tab=theme-style",
+        "icon": "palette",
+        "sort_order": 12,
+    },
+    {
+        "name": "Settings",
+        "slug": "settings",
+        "description": "System preferences and default operational values.",
+        "route": "/setup?tab=settings",
+        "icon": "gear",
+        "sort_order": 13,
+    },
+    {
+        "name": "Help",
+        "slug": "help",
+        "description": "Setup module documentation and team self-help knowledge.",
+        "route": "/setup?tab=help",
+        "icon": "circle-info",
+        "sort_order": 14,
+    },
+]
+
+
+DEFAULT_SETUP_SETTINGS = [
+    {
+        "category": "company",
+        "key": "company_name",
+        "display_name": "Company Name",
+        "value": "Magnyte CRM",
+        "input_type": "text",
+        "description": "Display company name across setup and emails.",
+        "is_public": True,
+        "is_editable": True,
+    },
+    {
+        "category": "company",
+        "key": "company_email",
+        "display_name": "Company Email",
+        "value": "support@magnyte.com",
+        "input_type": "email",
+        "description": "Primary support and notification sender email.",
+        "is_public": True,
+        "is_editable": True,
+    },
+    {
+        "category": "localization",
+        "key": "default_timezone",
+        "display_name": "Default Timezone",
+        "value": "Asia/Kolkata",
+        "input_type": "text",
+        "description": "Default timezone for new records and reminders.",
+        "is_public": True,
+        "is_editable": True,
+    },
+    {
+        "category": "localization",
+        "key": "currency",
+        "display_name": "Currency",
+        "value": "INR",
+        "input_type": "text",
+        "description": "Default currency for finance module.",
+        "is_public": True,
+        "is_editable": True,
+    },
+    {
+        "category": "compliance",
+        "key": "gdpr_auto_acknowledge",
+        "display_name": "GDPR Auto Acknowledge",
+        "value": "true",
+        "input_type": "boolean",
+        "description": "Send automated acknowledgement for GDPR requests.",
+        "is_public": False,
+        "is_editable": True,
+    },
+]
+
+
+DEFAULT_HELP_ARTICLES = [
+    {
+        "title": "Setup Overview",
+        "slug": "setup-overview",
+        "module_slug": "modules",
+        "summary": "How setup module controls all CRM sub-modules.",
+        "content": (
+            "Use Setup to control module availability and maintain core operational "
+            "entities such as email templates, custom fields and settings."
+        ),
+        "sort_order": 1,
+        "is_published": True,
+    },
+    {
+        "title": "Managing Email Templates",
+        "slug": "setup-email-templates",
+        "module_slug": "email-template",
+        "summary": "Create and edit templates used in CRM workflows.",
+        "content": (
+            "Each template is identified by module + slug + language. "
+            "Keep subject concise and include reusable placeholders in the body."
+        ),
+        "sort_order": 2,
+        "is_published": True,
+    },
+    {
+        "title": "GDPR Request Handling",
+        "slug": "setup-gdpr-handling",
+        "module_slug": "gdpr",
+        "summary": "Track data export and delete requests safely.",
+        "content": (
+            "Create a GDPR request for each customer demand, move status as work "
+            "progresses, and capture resolution notes before completion."
+        ),
+        "sort_order": 3,
+        "is_published": True,
+    },
+]
+
+
+def _seed_setup_modules():
+    existing = {obj.slug: obj for obj in SetupModule.objects.all()}
+
+    for item in DEFAULT_SETUP_MODULES:
+        slug = item["slug"]
+        module = existing.get(slug)
+        if module:
+            changed = False
+            for field in ("name", "description", "route", "icon", "sort_order"):
+                next_value = item.get(field)
+                if getattr(module, field) != next_value:
+                    setattr(module, field, next_value)
+                    changed = True
+            if changed:
+                module.save(
+                    update_fields=[
+                        "name",
+                        "description",
+                        "route",
+                        "icon",
+                        "sort_order",
+                        "updated_at",
+                    ]
+                )
+            continue
+
+        SetupModule.objects.create(**item, is_enabled=True)
+
+
+def _seed_setup_settings():
+    for item in DEFAULT_SETUP_SETTINGS:
+        SetupSetting.objects.update_or_create(
+            category=item["category"],
+            key=item["key"],
+            defaults=item,
+        )
+
+
+def _seed_help_articles():
+    for item in DEFAULT_HELP_ARTICLES:
+        SetupHelpArticle.objects.update_or_create(
+            slug=item["slug"],
+            defaults=item,
+        )
+
+
+class SetupBaseViewSet(viewsets.ModelViewSet):
+    authentication_classes = [JWTAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def initial(self, request, *args, **kwargs):
+        try:
+            ensure_setup_tables()
+        except Exception as exc:
+            print("Setup tables ensure failed:", exc)
+        super().initial(request, *args, **kwargs)
+
+    def _handle_missing_table(self, exc, *, empty_ok):
+        msg = str(exc).lower()
+        if "doesn't exist" in msg or "1146" in msg:
+            if empty_ok:
+                return Response([])
+            return Response(
+                {"detail": "Setup table not found. Run migrations or setup table bootstrap."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        return None
+
+    def list(self, request, *args, **kwargs):
+        try:
+            return super().list(request, *args, **kwargs)
+        except (ProgrammingError, OperationalError) as exc:
+            handled = self._handle_missing_table(exc, empty_ok=True)
+            if handled is not None:
+                return handled
+            raise
+
+    def create(self, request, *args, **kwargs):
+        try:
+            return super().create(request, *args, **kwargs)
+        except (ProgrammingError, OperationalError) as exc:
+            handled = self._handle_missing_table(exc, empty_ok=False)
+            if handled is not None:
+                return handled
+            raise
+
+    def update(self, request, *args, **kwargs):
+        try:
+            return super().update(request, *args, **kwargs)
+        except (ProgrammingError, OperationalError) as exc:
+            handled = self._handle_missing_table(exc, empty_ok=False)
+            if handled is not None:
+                return handled
+            raise
+
+
+class SetupModuleViewSet(SetupBaseViewSet):
+    serializer_class = SetupModuleSerializer
+
+    def get_queryset(self):
+        _seed_setup_modules()
+        queryset = SetupModule.objects.all()
+
+        enabled = str(self.request.query_params.get("enabled", "")).strip().lower()
+        if enabled in {"1", "true", "yes"}:
+            queryset = queryset.filter(is_enabled=True)
+        elif enabled in {"0", "false", "no"}:
+            queryset = queryset.filter(is_enabled=False)
+
+        search = str(self.request.query_params.get("search", "")).strip()
+        if search:
+            queryset = queryset.filter(
+                Q(name__icontains=search)
+                | Q(description__icontains=search)
+                | Q(slug__icontains=search)
+            )
+
+        return queryset.order_by("sort_order", "name", "id")
+
+    @action(detail=False, methods=["post"], url_path="bulk-toggle")
+    def bulk_toggle(self, request):
+        payload = request.data if isinstance(request.data, list) else request.data.get("items", [])
+        if not isinstance(payload, list) or not payload:
+            return Response(
+                {"detail": "items list is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        updated = []
+        with transaction.atomic():
+            for item in payload:
+                module_id = item.get("id")
+                if module_id is None:
+                    continue
+                module = SetupModule.objects.filter(pk=module_id).first()
+                if not module:
+                    continue
+                module.is_enabled = bool(item.get("is_enabled", module.is_enabled))
+                module.save(update_fields=["is_enabled", "updated_at"])
+                updated.append(module)
+
+        data = SetupModuleSerializer(updated, many=True).data
+        return Response(data, status=status.HTTP_200_OK)
+
+
+class EmailTemplateViewSet(SetupBaseViewSet):
+    serializer_class = EmailTemplateSerializer
+
+    def get_queryset(self):
+        try:
+            seed_email_templates_optimized()
+        except Exception as exc:
+            print("Email template seed failed:", exc)
+
+        queryset = EmailTemplate.objects.all()
+
+        module = str(self.request.query_params.get("module", "")).strip()
+        language = str(self.request.query_params.get("language", "")).strip()
+        search = str(self.request.query_params.get("search", "")).strip()
+
+        if module:
+            queryset = queryset.filter(module__iexact=module)
+        if language:
+            queryset = queryset.filter(language__iexact=language)
+        if search:
+            queryset = queryset.filter(
+                Q(module__icontains=search)
+                | Q(slug__icontains=search)
+                | Q(subject__icontains=search)
+                | Q(body__icontains=search)
+            )
+
+        return queryset.order_by("module", "slug", "language", "id")
+
+    def perform_create(self, serializer):
+        subject = serializer.validated_data.get("subject")
+        slug_value = serializer.validated_data.get("slug")
+        if not slug_value and subject:
+            serializer.save(slug=slugify(subject))
+            return
+        serializer.save()
+
+    def perform_update(self, serializer):
+        subject = serializer.validated_data.get("subject")
+        slug_value = serializer.validated_data.get("slug")
+        if (slug_value is None or slug_value == "") and subject:
+            serializer.save(slug=slugify(subject))
+            return
+        serializer.save()
+
+
+class SetupCustomFieldViewSet(SetupBaseViewSet):
+    serializer_class = SetupCustomFieldSerializer
+
+    def get_queryset(self):
+        queryset = SetupCustomField.objects.all()
+        module_slug = str(self.request.query_params.get("module", "")).strip()
+        active = str(self.request.query_params.get("active", "")).strip().lower()
+
+        if module_slug:
+            queryset = queryset.filter(module_slug__iexact=module_slug)
+        if active in {"1", "true", "yes"}:
+            queryset = queryset.filter(is_active=True)
+        elif active in {"0", "false", "no"}:
+            queryset = queryset.filter(is_active=False)
+
+        return queryset.order_by("module_slug", "sort_order", "id")
+
+
+class SetupGDPRRequestViewSet(SetupBaseViewSet):
+    serializer_class = SetupGDPRRequestSerializer
+
+    def get_queryset(self):
+        queryset = SetupGDPRRequest.objects.all()
+        request_type = str(self.request.query_params.get("request_type", "")).strip().lower()
+        status_filter = str(self.request.query_params.get("status", "")).strip().lower()
+        search = str(self.request.query_params.get("search", "")).strip()
+
+        if request_type:
+            queryset = queryset.filter(request_type=request_type)
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        if search:
+            queryset = queryset.filter(
+                Q(customer_name__icontains=search)
+                | Q(email__icontains=search)
+                | Q(details__icontains=search)
+            )
+
+        return queryset.order_by("-created_at", "-id")
+
+    @action(detail=True, methods=["post"], url_path="mark-completed")
+    def mark_completed(self, request, pk=None):
+        instance = self.get_object()
+        instance.status = "completed"
+        instance.resolved_at = timezone.now()
+        instance.resolution_notes = request.data.get("resolution_notes", instance.resolution_notes)
+        instance.save(update_fields=["status", "resolution_notes", "resolved_at", "updated_at"])
+        serializer = self.get_serializer(instance)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class SetupSettingViewSet(SetupBaseViewSet):
+    serializer_class = SetupSettingSerializer
+
+    def get_queryset(self):
+        _seed_setup_settings()
+        queryset = SetupSetting.objects.all()
+        category = str(self.request.query_params.get("category", "")).strip()
+        if category:
+            queryset = queryset.filter(category__iexact=category)
+        return queryset.order_by("category", "display_name", "id")
+
+    @action(detail=False, methods=["post"], url_path="bulk-upsert")
+    def bulk_upsert(self, request):
+        items = request.data if isinstance(request.data, list) else request.data.get("items", [])
+        if not isinstance(items, list) or not items:
+            return Response(
+                {"detail": "items list is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        saved = []
+        with transaction.atomic():
+            for raw in items:
+                category = str(raw.get("category", "")).strip()
+                key = str(raw.get("key", "")).strip()
+                display_name = str(raw.get("display_name", "")).strip() or key.replace("_", " ").title()
+                if not category or not key:
+                    continue
+
+                setting, _ = SetupSetting.objects.update_or_create(
+                    category=category,
+                    key=key,
+                    defaults={
+                        "display_name": display_name,
+                        "value": raw.get("value", ""),
+                        "input_type": raw.get("input_type", "text"),
+                        "description": raw.get("description", ""),
+                        "is_public": bool(raw.get("is_public", False)),
+                        "is_editable": bool(raw.get("is_editable", True)),
+                    },
+                )
+                saved.append(setting)
+
+        serializer = self.get_serializer(saved, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class SetupHelpArticleViewSet(SetupBaseViewSet):
+    serializer_class = SetupHelpArticleSerializer
+
+    def get_queryset(self):
+        _seed_help_articles()
+        queryset = SetupHelpArticle.objects.all()
+
+        module_slug = str(self.request.query_params.get("module", "")).strip()
+        published = str(self.request.query_params.get("published", "")).strip().lower()
+        search = str(self.request.query_params.get("search", "")).strip()
+
+        if module_slug:
+            queryset = queryset.filter(module_slug__iexact=module_slug)
+        if published in {"1", "true", "yes"}:
+            queryset = queryset.filter(is_published=True)
+        elif published in {"0", "false", "no"}:
+            queryset = queryset.filter(is_published=False)
+        if search:
+            queryset = queryset.filter(
+                Q(title__icontains=search)
+                | Q(summary__icontains=search)
+                | Q(content__icontains=search)
+            )
+
+        return queryset.order_by("module_slug", "sort_order", "title", "id")
+
+
+class SetupCustomerGroupViewSet(SetupBaseViewSet):
+    serializer_class = SetupCustomerGroupSerializer
+
+    def get_queryset(self):
+        queryset = SetupCustomerGroup.objects.all()
+        active = str(self.request.query_params.get("active", "")).strip().lower()
+        search = str(self.request.query_params.get("search", "")).strip()
+
+        if active in {"1", "true", "yes"}:
+            queryset = queryset.filter(is_active=True)
+        elif active in {"0", "false", "no"}:
+            queryset = queryset.filter(is_active=False)
+
+        if search:
+            queryset = queryset.filter(
+                Q(name__icontains=search) | Q(description__icontains=search)
+            )
+
+        return queryset.order_by("name", "id")
+
+
+class SetupCustomerGroupAssignmentViewSet(SetupBaseViewSet):
+    serializer_class = SetupCustomerGroupAssignmentSerializer
+
+    def get_queryset(self):
+        queryset = SetupCustomerGroupAssignment.objects.select_related(
+            "customer", "group"
+        ).all()
+        customer_id = self.request.query_params.get("customer")
+        if customer_id:
+            try:
+                queryset = queryset.filter(customer_id=int(customer_id))
+            except (TypeError, ValueError):
+                pass
+        return queryset.order_by("-updated_at", "-id")
+
+    @action(detail=False, methods=["post"], url_path="upsert")
+    def upsert(self, request):
+        customer_id = request.data.get("customer_id") or request.data.get("customer")
+        group_id = request.data.get("group_id") or request.data.get("group")
+
+        try:
+            customer_id = int(customer_id)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "Valid customer_id is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not group_id:
+            SetupCustomerGroupAssignment.objects.filter(customer_id=customer_id).delete()
+            return Response(
+                {"status": "unassigned", "customer_id": customer_id},
+                status=status.HTTP_200_OK,
+            )
+
+        try:
+            group_id = int(group_id)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "Valid group_id is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not SetupCustomerGroup.objects.filter(pk=group_id).exists():
+            return Response(
+                {"detail": "Customer group not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not Client.objects.filter(pk=customer_id).exists():
+            return Response(
+                {"detail": "Customer not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        assignment, _ = SetupCustomerGroupAssignment.objects.update_or_create(
+            customer_id=customer_id,
+            defaults={"group_id": group_id},
+        )
+        serializer = self.get_serializer(assignment)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class SetupThemeStyleViewSet(SetupBaseViewSet):
+    serializer_class = SetupThemeStyleSerializer
+
+    def get_queryset(self):
+        queryset = SetupThemeStyle.objects.all()
+        active = str(self.request.query_params.get("active", "")).strip().lower()
+        if active in {"1", "true", "yes"}:
+            queryset = queryset.filter(is_active=True)
+        elif active in {"0", "false", "no"}:
+            queryset = queryset.filter(is_active=False)
+        return queryset.order_by("name", "id")
+
+
+class SetupTaxViewSet(SetupBaseViewSet):
+    serializer_class = SetupTaxSerializer
+
+    def get_queryset(self):
+        queryset = SetupTax.objects.all()
+        active = str(self.request.query_params.get("active", "")).strip().lower()
+        if active in {"1", "true", "yes"}:
+            queryset = queryset.filter(is_active=True)
+        elif active in {"0", "false", "no"}:
+            queryset = queryset.filter(is_active=False)
+        return queryset.order_by("name", "id")
+
+
+class SetupCurrencyViewSet(SetupBaseViewSet):
+    serializer_class = SetupCurrencySerializer
+
+    def get_queryset(self):
+        queryset = SetupCurrency.objects.all()
+        active = str(self.request.query_params.get("active", "")).strip().lower()
+        if active in {"1", "true", "yes"}:
+            queryset = queryset.filter(is_active=True)
+        elif active in {"0", "false", "no"}:
+            queryset = queryset.filter(is_active=False)
+        return queryset.order_by("code", "id")
+
+
+class SetupPaymentModeViewSet(SetupBaseViewSet):
+    serializer_class = SetupPaymentModeSerializer
+
+    def get_queryset(self):
+        queryset = SetupPaymentMode.objects.all()
+        active = str(self.request.query_params.get("active", "")).strip().lower()
+        if active in {"1", "true", "yes"}:
+            queryset = queryset.filter(is_active=True)
+        elif active in {"0", "false", "no"}:
+            queryset = queryset.filter(is_active=False)
+        return queryset.order_by("name", "id")
+
+
+class SetupExpenseCategoryViewSet(SetupBaseViewSet):
+    serializer_class = SetupExpenseCategorySerializer
+
+    def get_queryset(self):
+        queryset = SetupExpenseCategory.objects.all()
+        active = str(self.request.query_params.get("active", "")).strip().lower()
+        if active in {"1", "true", "yes"}:
+            queryset = queryset.filter(is_active=True)
+        elif active in {"0", "false", "no"}:
+            queryset = queryset.filter(is_active=False)
+        return queryset.order_by("name", "id")
+
+
+class SetupSupportDepartmentViewSet(SetupBaseViewSet):
+    serializer_class = SetupSupportDepartmentSerializer
+
+    def get_queryset(self):
+        queryset = SetupSupportDepartment.objects.all()
+        active = str(self.request.query_params.get("active", "")).strip().lower()
+        if active in {"1", "true", "yes"}:
+            queryset = queryset.filter(is_active=True)
+        elif active in {"0", "false", "no"}:
+            queryset = queryset.filter(is_active=False)
+        return queryset.order_by("name", "id")
+
+
+class SetupTicketPriorityViewSet(SetupBaseViewSet):
+    serializer_class = SetupTicketPrioritySerializer
+
+    def get_queryset(self):
+        queryset = SetupTicketPriority.objects.all()
+        active = str(self.request.query_params.get("active", "")).strip().lower()
+        if active in {"1", "true", "yes"}:
+            queryset = queryset.filter(is_active=True)
+        elif active in {"0", "false", "no"}:
+            queryset = queryset.filter(is_active=False)
+        return queryset.order_by("level", "name", "id")
+
+
+class SetupTicketStatusViewSet(SetupBaseViewSet):
+    serializer_class = SetupTicketStatusSerializer
+
+    def get_queryset(self):
+        queryset = SetupTicketStatus.objects.all()
+        active = str(self.request.query_params.get("active", "")).strip().lower()
+        if active in {"1", "true", "yes"}:
+            queryset = queryset.filter(is_active=True)
+        elif active in {"0", "false", "no"}:
+            queryset = queryset.filter(is_active=False)
+        return queryset.order_by("name", "id")
+
+
+class SetupPredefinedReplyViewSet(SetupBaseViewSet):
+    serializer_class = SetupPredefinedReplySerializer
+
+    def get_queryset(self):
+        queryset = SetupPredefinedReply.objects.select_related("department").all()
+        department_id = self.request.query_params.get("department")
+        active = str(self.request.query_params.get("active", "")).strip().lower()
+        if department_id:
+            try:
+                queryset = queryset.filter(department_id=int(department_id))
+            except (TypeError, ValueError):
+                pass
+        if active in {"1", "true", "yes"}:
+            queryset = queryset.filter(is_active=True)
+        elif active in {"0", "false", "no"}:
+            queryset = queryset.filter(is_active=False)
+        return queryset.order_by("title", "id")
+
+
+class SetupLeadSourceViewSet(SetupBaseViewSet):
+    serializer_class = SetupLeadSourceSerializer
+
+    def get_queryset(self):
+        queryset = SetupLeadSource.objects.all()
+        active = str(self.request.query_params.get("active", "")).strip().lower()
+        if active in {"1", "true", "yes"}:
+            queryset = queryset.filter(is_active=True)
+        elif active in {"0", "false", "no"}:
+            queryset = queryset.filter(is_active=False)
+        return queryset.order_by("name", "id")
+
+
+class SetupLeadStatusViewSet(SetupBaseViewSet):
+    serializer_class = SetupLeadStatusSerializer
+
+    def get_queryset(self):
+        queryset = SetupLeadStatus.objects.all()
+        active = str(self.request.query_params.get("active", "")).strip().lower()
+        if active in {"1", "true", "yes"}:
+            queryset = queryset.filter(is_active=True)
+        elif active in {"0", "false", "no"}:
+            queryset = queryset.filter(is_active=False)
+        return queryset.order_by("sequence", "name", "id")
+
+
+class SetupContractTemplateViewSet(SetupBaseViewSet):
+    serializer_class = SetupContractTemplateSerializer
+
+    def get_queryset(self):
+        queryset = SetupContractTemplate.objects.all()
+        active = str(self.request.query_params.get("active", "")).strip().lower()
+        if active in {"1", "true", "yes"}:
+            queryset = queryset.filter(is_active=True)
+        elif active in {"0", "false", "no"}:
+            queryset = queryset.filter(is_active=False)
+        return queryset.order_by("name", "id")
+
+    def perform_create(self, serializer):
+        name = serializer.validated_data.get("name")
+        slug_value = serializer.validated_data.get("slug")
+        if not slug_value and name:
+            serializer.save(slug=slugify(name))
+            return
+        serializer.save()
+
+    def perform_update(self, serializer):
+        name = serializer.validated_data.get("name")
+        slug_value = serializer.validated_data.get("slug")
+        if (slug_value is None or slug_value == "") and name:
+            serializer.save(slug=slugify(name))
+            return
+        serializer.save()
+
+
+class SetupRolePermissionViewSet(SetupBaseViewSet):
+    serializer_class = SetupRolePermissionSerializer
+
+    def get_queryset(self):
+        queryset = SetupRolePermission.objects.select_related("role").all()
+        role_id = self.request.query_params.get("role")
+        module_slug = str(self.request.query_params.get("module", "")).strip()
+        if role_id:
+            try:
+                queryset = queryset.filter(role_id=int(role_id))
+            except (TypeError, ValueError):
+                pass
+        if module_slug:
+            queryset = queryset.filter(module_slug__iexact=module_slug)
+        return queryset.order_by("role_id", "module_slug", "id")
+
 
 
