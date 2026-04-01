@@ -4619,6 +4619,21 @@ class SetupModuleViewSet(SetupBaseViewSet):
         _seed_setup_modules()
         queryset = SetupModule.objects.all()
 
+        include_deleted = str(self.request.query_params.get("include_deleted", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        deleted_only = str(self.request.query_params.get("deleted", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if deleted_only:
+            queryset = queryset.filter(is_deleted=True)
+        elif not include_deleted:
+            queryset = queryset.filter(is_deleted=False)
+
         enabled = str(self.request.query_params.get("enabled", "")).strip().lower()
         if enabled in {"1", "true", "yes"}:
             queryset = queryset.filter(is_enabled=True)
@@ -4634,6 +4649,29 @@ class SetupModuleViewSet(SetupBaseViewSet):
             )
 
         return queryset.order_by("sort_order", "name", "id")
+
+    def destroy(self, request, *args, **kwargs):
+        module = self.get_object()
+        if not module.is_deleted:
+            module.is_deleted = True
+            module.deleted_at = timezone.now()
+            module.save(update_fields=["is_deleted", "deleted_at", "updated_at"])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=["post"], url_path="restore")
+    def restore(self, request, pk=None):
+        module = SetupModule.objects.filter(pk=pk).first()
+        if not module:
+            return Response({"detail": "Module not found."}, status=status.HTTP_404_NOT_FOUND)
+        if not module.is_deleted:
+            serializer = self.get_serializer(module)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        module.is_deleted = False
+        module.deleted_at = None
+        module.save(update_fields=["is_deleted", "deleted_at", "updated_at"])
+        serializer = self.get_serializer(module)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=["post"], url_path="bulk-toggle")
     def bulk_toggle(self, request):

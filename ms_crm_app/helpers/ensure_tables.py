@@ -417,6 +417,25 @@ def ensure_setup_tables():
 
         existing_tables.add(table_name)
 
+    # Backward-compatible schema patch:
+    # If setup module table already exists, ensure soft-delete columns are present.
+    setup_module_model = apps.get_model("core", "SetupModule")
+    setup_module_table = setup_module_model._meta.db_table
+    if setup_module_table in existing_tables:
+        with connection.cursor() as cursor:
+            existing_columns = {
+                column.name
+                for column in connection.introspection.get_table_description(cursor, setup_module_table)
+            }
+
+        for field_name in ("is_deleted", "deleted_at"):
+            if field_name in existing_columns:
+                continue
+            field = setup_module_model._meta.get_field(field_name)
+            with connection.schema_editor() as schema_editor:
+                schema_editor.add_field(setup_module_model, field)
+            existing_columns.add(field_name)
+
     # Email templates are global (default DB in router), ensure table there as well.
     default_connection = connections["default"]
     default_existing = set(default_connection.introspection.table_names())
