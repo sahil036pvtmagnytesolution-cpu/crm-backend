@@ -3,12 +3,15 @@ from django.utils.html import format_html
 from django.urls import path
 from django.shortcuts import redirect
 
+# Import core models needed for admin registration. Proxy models for legacy
+# tables have been removed to resolve circular dependencies, so they are no
+# longer imported.
 from .models import (
     Business,
     Project,
-    StaffProxy,
-    KnowledgeBaseProxy,
-    KnowledgeBaseGroupProxy,
+    # StaffProxy,
+    # KnowledgeBaseProxy,
+    # KnowledgeBaseGroupProxy,
 )
 from django.contrib import admin
 from .models import Proposal
@@ -177,14 +180,48 @@ class BusinessAdmin(admin.ModelAdmin):
 # ROLE ADMIN (SAFE ADDITION)
 # ==============================
 
-from .models import Role, SalesProposal
+from .models import Permission, Role, RolePermission, RoleAuditLog, SalesProposal, UserRole
 
 
 @admin.register(Role)
 class RoleAdmin(admin.ModelAdmin):
-    list_display = ("id", "name", "is_approved", "created_at")
-    list_filter = ("is_approved",)
+    list_display = ("id", "name", "is_active", "is_super_admin", "level", "is_approved", "created_at")
+    list_filter = ("is_active", "is_super_admin", "is_approved")
     search_fields = ("name",)
+
+
+@admin.register(Permission)
+class PermissionAdmin(admin.ModelAdmin):
+    list_display = ("id", "module", "action", "code", "is_active")
+    list_filter = ("module", "action", "is_active")
+    search_fields = ("module", "action", "code")
+
+
+@admin.register(RolePermission)
+class RolePermissionAdmin(admin.ModelAdmin):
+    list_display = ("id", "role", "permission", "is_allowed", "created_at")
+    list_filter = ("is_allowed", "permission__module", "permission__action")
+    search_fields = ("role__name", "permission__module", "permission__action", "permission__code")
+
+
+@admin.register(UserRole)
+class UserRoleAdmin(admin.ModelAdmin):
+    list_display = ("id", "user", "role", "is_active", "assigned_by", "assigned_at")
+    list_filter = ("is_active", "role__name", "role__is_super_admin")
+    search_fields = ("user__username", "user__email", "role__name")
+
+
+@admin.register(RoleAuditLog)
+class RoleAuditLogAdmin(admin.ModelAdmin):
+    list_display = ("id", "event_type", "role", "actor", "target_user", "created_at")
+    list_filter = ("event_type", "created_at")
+    search_fields = (
+        "role__name",
+        "actor__username",
+        "actor__email",
+        "target_user__username",
+        "target_user__email",
+    )
 
 @admin.register(SalesProposal)
 class SalesProposalAdmin(admin.ModelAdmin):
@@ -346,46 +383,11 @@ class ProjectAdmin(admin.ModelAdmin):
         return super().get_queryset(request)
 
 
-@admin.register(StaffProxy)
-class StaffAdmin(admin.ModelAdmin):
-    list_display = ("staffid", "firstname", "lastname", "email", "phonenumber", "admin", "active", "datecreated")
-    list_filter = ("admin", "active")
-    search_fields = ("firstname", "lastname", "email", "phonenumber")
-    ordering = ("-staffid",)
-
-    def get_queryset(self, request):
-        try:
-            ensure_staff_table()
-        except Exception as exc:
-            print("Staff table ensure failed (admin):", exc)
-        return super().get_queryset(request)
+# The StaffProxy admin has been removed because the proxy model no longer
+# exists after fixing circular imports.
 
 
-@admin.register(KnowledgeBaseGroupProxy)
-class KnowledgeBaseGroupAdmin(admin.ModelAdmin):
-    list_display = ("groupid", "name", "active", "group_order", "color")
-    list_filter = ("active",)
-    search_fields = ("name", "group_slug")
-    ordering = ("group_order", "groupid")
-
-    def get_queryset(self, request):
-        try:
-            ensure_knowledge_base_tables()
-        except Exception as exc:
-            print("Knowledge base tables ensure failed (admin):", exc)
-        return super().get_queryset(request)
+# KnowledgeBaseGroupProxy admin removed for the same reason.
 
 
-@admin.register(KnowledgeBaseProxy)
-class KnowledgeBaseAdmin(admin.ModelAdmin):
-    list_display = ("articleid", "subject", "articlegroup", "active", "datecreated")
-    list_filter = ("active",)
-    search_fields = ("subject", "slug")
-    ordering = ("-articleid",)
-
-    def get_queryset(self, request):
-        try:
-            ensure_knowledge_base_tables()
-        except Exception as exc:
-            print("Knowledge base tables ensure failed (admin):", exc)
-        return super().get_queryset(request)
+# KnowledgeBaseProxy admin also removed.

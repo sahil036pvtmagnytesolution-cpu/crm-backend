@@ -656,6 +656,50 @@ class GdprRequests(models.Model):
         managed = False
         db_table = 'ms_gdpr_requests'
 
+# New GDPR Request model with expanded fields as per requirements
+class GdprRequest(models.Model):
+    """Model representing a GDPR data request.
+    This replaces the legacy ``GdprRequests`` with a richer schema.
+    """
+    id = models.AutoField(primary_key=True)
+    customer_name = models.CharField(max_length=191)
+    email = models.EmailField()
+    USER_TYPE_CHOICES = [
+        ("customer", "Customer"),
+        ("lead", "Lead"),
+        ("staff", "Staff"),
+    ]
+    user_type = models.CharField(max_length=20, choices=USER_TYPE_CHOICES)
+    REQUEST_TYPE_CHOICES = [
+        ("access", "Data Access"),
+        ("export", "Data Export"),
+        ("deletion", "Data Deletion"),
+    ]
+    request_type = models.CharField(max_length=20, choices=REQUEST_TYPE_CHOICES)
+    STATUS_CHOICES = [
+        ("pending", "Pending"),
+        ("in_progress", "In Progress"),
+        ("completed", "Completed"),
+        ("rejected", "Rejected"),
+    ]
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="pending")
+    details = models.TextField(blank=True, null=True)
+    request_id = models.CharField(max_length=64, unique=True, editable=False)
+    requested_at = models.DateTimeField(auto_now_add=True)
+    processed_by = models.ForeignKey('Staff', null=True, blank=True, on_delete=models.SET_NULL)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    verification_status = models.CharField(max_length=20, default="pending")
+    DATA_FORMAT_CHOICES = [
+        ("csv", "CSV"),
+        ("json", "JSON"),
+        ("pdf", "PDF"),
+    ]
+    data_format = models.CharField(max_length=10, choices=DATA_FORMAT_CHOICES, default="json")
+
+    class Meta:
+        db_table = "gdpr_requests"
+
+
 
 class Goals(models.Model):
     subject = models.CharField(max_length=191)

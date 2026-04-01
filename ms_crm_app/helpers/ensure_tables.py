@@ -344,6 +344,31 @@ def ensure_tickets_pipe_log_table():
             cursor.execute(sql)
 
 
+def ensure_gdpr_requests_table():
+    """Ensure gdpr_requests table exists for the current DB."""
+    from django.apps import apps
+    from django.db import connections
+    from core.middleware import get_current_db
+
+    db_alias = get_current_db()
+    db_connection = connections[db_alias]
+    gdpr_model = apps.get_model("ms_crm_app", "GdprRequest")
+    table_name = gdpr_model._meta.db_table
+    existing_tables = set(db_connection.introspection.table_names())
+
+    if table_name in existing_tables:
+        return
+
+    # Foreign key target for processed_by; make sure legacy staff table exists first.
+    try:
+        ensure_staff_table()
+    except Exception:
+        pass
+
+    with db_connection.schema_editor() as schema_editor:
+        schema_editor.create_model(gdpr_model)
+
+
 def ensure_setup_tables():
     """
     Ensure Setup module tables exist for the current DB.
@@ -360,6 +385,7 @@ def ensure_setup_tables():
     model_names = [
         "SetupModule",
         "SetupCustomField",
+        "CustomFieldValue",
         "SetupGDPRRequest",
         "SetupSetting",
         "SetupHelpArticle",
@@ -399,3 +425,32 @@ def ensure_setup_tables():
     if email_table not in default_existing:
         with default_connection.schema_editor() as schema_editor:
             schema_editor.create_model(email_template_model)
+
+
+def ensure_setup_management_tables():
+    """
+    Ensure lightweight setup management tables exist for the current DB.
+    """
+    from django.apps import apps
+    from django.db import connections
+    from core.middleware import get_current_db
+
+    db_alias = get_current_db()
+    db_connection = connections[db_alias]
+    existing_tables = set(db_connection.introspection.table_names())
+
+    model_names = [
+        "CompanyInfo",
+        "SMSTask",
+        "SetupTask",
+    ]
+
+    for model_name in model_names:
+        model = apps.get_model("core", model_name)
+        table_name = model._meta.db_table
+        if table_name in existing_tables:
+            continue
+
+        with db_connection.schema_editor() as schema_editor:
+            schema_editor.create_model(model)
+        existing_tables.add(table_name)

@@ -7,7 +7,6 @@ from .views import (
     register_business,
     login,
     logout,
-    roles_api,
     approve_role,
     sales_proposals,
     assign_proposal,
@@ -61,6 +60,8 @@ from .views import (
     database_backup_download,
     ticket_pipe_log_list,
     support_ticket_pipe_create,
+    # Custom field value API
+    CustomFieldValueViewSet,
 )
 from .views import ClientViewSet, ApprovedUsersView
 from .views import media_files_list, upload_media, media_file_delete
@@ -87,6 +88,16 @@ from .views import (
     SetupTicketStatusViewSet,
     SetupCustomerGroupViewSet,
     SetupCustomerGroupAssignmentViewSet,
+)
+from ms_crm_app.views import manage_data as legacy_manage_data
+from .views import (
+    assign_role_to_user_api,
+    legacy_roles_api,
+    my_permissions_api,
+    permissions_catalog_api,
+    role_detail_api,
+    roles_create_api,
+    roles_list_api,
 )
 
 router = DefaultRouter()
@@ -126,6 +137,8 @@ router.register(r'setup/lead-sources', SetupLeadSourceViewSet, basename="setup-l
 router.register(r'setup/lead-statuses', SetupLeadStatusViewSet, basename="setup-lead-statuses")
 router.register(r'setup/contract-templates', SetupContractTemplateViewSet, basename="setup-contract-templates")
 router.register(r'setup/role-permissions', SetupRolePermissionViewSet, basename="setup-role-permissions")
+# Custom field values endpoint
+router.register(r'custom-field-values', CustomFieldValueViewSet, basename="custom-field-values")
 
 urlpatterns = [
 
@@ -135,8 +148,20 @@ urlpatterns = [
     path("logout/", logout),
 
     # Roles
-    path("Roles/", roles_api),
+    path("Roles/", legacy_roles_api),
     path("Roles/approve/<int:pk>/", approve_role),
+    path("api/roles/create/", roles_create_api),
+    path("api/roles/create", roles_create_api),
+    path("api/roles/", roles_list_api),
+    path("api/roles", roles_list_api),
+    path("api/roles/<int:pk>/", role_detail_api),
+    path("api/roles/<int:pk>", role_detail_api),
+    path("api/roles/assign-to-user/", assign_role_to_user_api),
+    path("api/roles/assign-to-user", assign_role_to_user_api),
+    path("api/roles/permissions/", permissions_catalog_api),
+    path("api/roles/permissions", permissions_catalog_api),
+    path("api/roles/my-permissions/", my_permissions_api),
+    path("api/roles/my-permissions", my_permissions_api),
 
     # Proposals
     path("proposals/<int:pk>/assign/", assign_proposal),
@@ -197,6 +222,11 @@ urlpatterns = [
 
     # Router URLs
     path("", include(router.urls)),
+
+    # Legacy manage-data endpoints used by frontend setup pages
+    path("manage/<str:model_name>/", legacy_manage_data),
+    path("manage/<str:model_name>/<str:field>/<str:value>/", legacy_manage_data),
+    path("manage/<str:model_name>/<int:item_id>/", legacy_manage_data),
 
     # Dashboard
     path("dashboard/small-stats/", SmallStatsView.as_view()),

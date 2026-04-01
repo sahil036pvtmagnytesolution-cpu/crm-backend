@@ -4,10 +4,13 @@ import uuid
 import subprocess
 import binascii
 import json
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
 
 from django.contrib.auth.models import User
 from django.contrib.auth.hashers import check_password, make_password
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.validators import validate_email
 from django.db import transaction
 import threading
 
@@ -29,12 +32,16 @@ from .models import (
     Customer,
     Item,
     ItemGroup,
+    Permission,
     Role,
+    RoleAuditLog,
     Proposal,
     StaffProfile,
     ActivityLog as CoreActivityLog,
     LegacyBusiness,
+    CustomFieldValue,
 )
+from django.contrib.contenttypes.models import ContentType
 from ms_crm_app.models import (
     Staff,
     Contacts,
@@ -58,7 +65,17 @@ from ms_crm_app.helpers.ensure_tables import (
     ensure_tickets_pipe_log_table,
 )
 from core.utils.activity_log import log_activity, serialize_activity_log
-from .serializers import BusinessSerializer, RoleSerializer, ProposalSerializer, StaffSerializer
+from .serializers import (
+    BusinessSerializer,
+    RoleSerializer,
+    ProposalSerializer,
+    StaffSerializer,
+    CustomFieldValueSerializer,
+    PermissionDefinitionSerializer,
+    RoleReadSerializer,
+    RoleWriteSerializer,
+    UserRoleAssignmentSerializer,
+)
 from core.seeders.email_templates import seed_email_templates_optimized
 from core.business_onboarding import (
     ensure_business_runtime_ready,
@@ -128,6 +145,7 @@ from rest_framework.response import Response
 
 from django.utils.html import strip_tags
 from django.utils.encoding import force_bytes
+from django.utils.dateparse import parse_date
 from django.core.mail import EmailMessage
 from django.contrib.staticfiles import finders
 from django.core.files.base import ContentFile
@@ -160,6 +178,12 @@ from .serializers import ProjectSerializer
 from django.db.models import Count, Sum, Q
 from django.db.utils import OperationalError, ProgrammingError
 from django.utils.text import slugify
+from .middleware import (
+    build_user_access_payload,
+    is_super_admin,
+    sync_default_permissions,
+    user_has_permission,
+)
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -839,6 +863,8 @@ def login(request):
             status=500,
         )
 
+    sync_default_permissions()
+    rbac_payload = build_user_access_payload(user)
     refresh = RefreshToken.for_user(user)
     log_activity(f"Staff Login [Email: {user.email or user.username}]", user=user)
     login_mail_sent, login_mail_error = send_login_success_email(business)
@@ -851,6 +877,9 @@ def login(request):
                 "id": user.id,
                 "email": user.email,
                 "is_superuser": user.is_superuser,
+                "roles": rbac_payload.get("roles", []),
+                "permissions": rbac_payload.get("permissions", {}),
+                "is_super_admin": rbac_payload.get("is_super_admin", False),
             },
             "business": {
                 "id": business.id,
@@ -863,6 +892,7 @@ def login(request):
                 "sent": login_mail_sent,
                 "error": login_mail_error,
             },
+            "rbac": rbac_payload,
         },
         status=200,
     )
@@ -919,6 +949,210 @@ def approve_role(request, pk):
             {"success": False, "message": "Role not found"},
             status=404,
         )
+
+
+RBAC_SETTINGS_MODULE = "Settings"
+
+
+def _has_settings_permission(user, action):
+    if is_super_admin(user):
+        return True
+    return user_has_permission(user, RBAC_SETTINGS_MODULE, action)
+
+
+def _deny_response(module_name, action_name):
+    return Response(
+        {
+            "detail": "Permission denied.",
+            "required": {
+                "module": module_name,
+                "action": action_name,
+            },
+        },
+        status=status.HTTP_403_FORBIDDEN,
+    )
+
+
+def _write_audit(*, actor=None, role=None, target_user=None, event_type, changes=None):
+    try:
+        RoleAuditLog.objects.create(
+            actor=actor if getattr(actor, "is_authenticated", False) else None,
+            role=role,
+            target_user=target_user,
+            event_type=event_type,
+            changes=changes or {},
+        )
+    except Exception:
+        pass
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def permissions_catalog_api(request):
+    if not _has_settings_permission(request.user, Permission.ACTION_VIEW):
+        return _deny_response(RBAC_SETTINGS_MODULE, Permission.ACTION_VIEW)
+
+    sync_default_permissions()
+    queryset = Permission.objects.filter(is_active=True).order_by("module", "action")
+    serializer = PermissionDefinitionSerializer(queryset, many=True)
+    return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def roles_list_api(request):
+    if not _has_settings_permission(request.user, Permission.ACTION_VIEW):
+        return _deny_response(RBAC_SETTINGS_MODULE, Permission.ACTION_VIEW)
+
+    sync_default_permissions()
+    queryset = Role.objects.prefetch_related("role_permissions__permission", "user_roles").all().order_by("-id")
+    serializer = RoleReadSerializer(queryset, many=True)
+    return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def roles_create_api(request):
+    if not _has_settings_permission(request.user, Permission.ACTION_CREATE):
+        return _deny_response(RBAC_SETTINGS_MODULE, Permission.ACTION_CREATE)
+
+    serializer = RoleWriteSerializer(data=request.data, context={"actor": request.user})
+    serializer.is_valid(raise_exception=True)
+    role = serializer.save()
+
+    _write_audit(
+        actor=request.user,
+        role=role,
+        event_type=RoleAuditLog.EVENT_CREATE,
+        changes={"name": role.name},
+    )
+
+    return Response(RoleReadSerializer(role).data, status=status.HTTP_201_CREATED)
+
+
+@api_view(["GET", "PUT", "PATCH", "DELETE"])
+@permission_classes([IsAuthenticated])
+def role_detail_api(request, pk):
+    role = Role.objects.filter(pk=pk).first()
+    if not role:
+        return Response({"detail": "Role not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    if request.method == "GET":
+        required_action = Permission.ACTION_VIEW
+    elif request.method == "DELETE":
+        required_action = Permission.ACTION_DELETE
+    else:
+        required_action = Permission.ACTION_EDIT
+
+    if not _has_settings_permission(request.user, required_action):
+        return _deny_response(RBAC_SETTINGS_MODULE, required_action)
+
+    if request.method == "GET":
+        return Response(RoleReadSerializer(role).data, status=status.HTTP_200_OK)
+
+    if request.method in {"PUT", "PATCH"}:
+        partial = request.method == "PATCH"
+        serializer = RoleWriteSerializer(
+            instance=role,
+            data=request.data,
+            partial=partial,
+            context={"actor": request.user},
+        )
+        serializer.is_valid(raise_exception=True)
+        updated_role = serializer.save()
+
+        _write_audit(
+            actor=request.user,
+            role=updated_role,
+            event_type=RoleAuditLog.EVENT_UPDATE,
+            changes={"name": updated_role.name, "is_active": updated_role.is_active},
+        )
+
+        return Response(RoleReadSerializer(updated_role).data, status=status.HTTP_200_OK)
+
+    if role.is_super_admin and not is_super_admin(request.user):
+        return Response(
+            {"detail": "Only Super Admin can delete a Super Admin role."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    if role.is_super_admin:
+        active_super_admin_count = Role.objects.filter(is_super_admin=True, is_active=True).count()
+        if active_super_admin_count <= 1:
+            return Response(
+                {"detail": "Cannot delete the last active Super Admin role."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    role_data = {
+        "id": role.id,
+        "name": role.name,
+        "is_super_admin": role.is_super_admin,
+    }
+    role.delete()
+    _write_audit(
+        actor=request.user,
+        role=None,
+        event_type=RoleAuditLog.EVENT_DELETE,
+        changes=role_data,
+    )
+    return Response({"success": True, "message": "Role deleted."}, status=status.HTTP_200_OK)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def assign_role_to_user_api(request):
+    if not _has_settings_permission(request.user, Permission.ACTION_EDIT):
+        return _deny_response(RBAC_SETTINGS_MODULE, Permission.ACTION_EDIT)
+
+    serializer = UserRoleAssignmentSerializer(data=request.data, context={"actor": request.user})
+    serializer.is_valid(raise_exception=True)
+    result = serializer.save()
+
+    user_obj = result["user"]
+    active_role_ids = result["active_role_ids"]
+    assigned_role_names = list(
+        Role.objects.filter(id__in=active_role_ids).order_by("-is_super_admin", "-level", "name").values_list(
+            "name", flat=True
+        )
+    )
+
+    _write_audit(
+        actor=request.user,
+        role=None,
+        target_user=user_obj,
+        event_type=RoleAuditLog.EVENT_ASSIGN,
+        changes={"role_ids": active_role_ids},
+    )
+
+    return Response(
+        {
+            "success": True,
+            "user": {
+                "id": user_obj.id,
+                "email": user_obj.email,
+                "username": user_obj.username,
+            },
+            "assigned_roles": assigned_role_names,
+            "rbac": build_user_access_payload(user_obj),
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def my_permissions_api(request):
+    sync_default_permissions()
+    return Response(build_user_access_payload(request.user), status=status.HTTP_200_OK)
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def legacy_roles_api(request):
+    if request.method == "GET":
+        return roles_list_api(request)
+    return roles_create_api(request)
 
 
 # =========================
@@ -1941,8 +2175,46 @@ def _get_or_create_client(company_name, phonenumber=""):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def contacts_list_create(request):
+    """List or create contacts.
+
+    The original implementation queried *all* fields of the ``Contact`` model.
+    In environments where the address columns (``street``, ``city``, ``state``,
+    ``zip_code`` and ``country``) have not been created yet, this resulted in an
+    ``OperationalError`` ("Unknown column 'core_contact.street'"). The address
+    fields are not used by the API response – ``_serialize_contact`` deliberately
+    omits them – so we can safely restrict the query to the columns that are
+    required for the serialization. Using ``only()`` ensures Django does *not*
+    include the missing columns in the SELECT statement, preventing the error
+    while keeping the existing behaviour intact.
+    """
     if request.method == "GET":
-        contacts = Contact.objects.all().order_by("-created_at", "-id")
+        # Explicitly fetch only the fields that ``_serialize_contact`` needs.
+        # This guards against missing address columns in the database.
+        contacts = (
+            Contact.objects.only(
+                "id",
+                "is_primary",
+                "firstname",
+                "lastname",
+                "email",
+                "phonenumber",
+                "title",
+                "password",
+                "last_login",
+                "active",
+                "direction",
+                "invoice_emails",
+                "estimate_emails",
+                "credit_note_emails",
+                "contract_emails",
+                "task_emails",
+                "project_emails",
+                "ticket_emails",
+                "company",
+                "created_at",
+            )
+            .order_by("-created_at", "-id")
+        )
         return Response([_serialize_contact(contact) for contact in contacts])
 
     data = request.data
@@ -4435,12 +4707,125 @@ class EmailTemplateViewSet(SetupBaseViewSet):
         serializer.save()
 
 
+CUSTOM_FIELD_MODULE_ALIASES = {
+    "customer": "customer",
+    "customers": "customer",
+    "lead": "leads",
+    "leads": "leads",
+    "staff": "staff",
+    "support": "support",
+    "finance": "finance",
+    "contract": "contracts",
+    "contracts": "contracts",
+}
+
+CUSTOM_FIELD_MODULE_MODEL_MAP = {
+    "customer": ("core", "client"),
+    "leads": ("core", "lead"),
+    "staff": ("ms_crm_app", "staff"),
+    "support": ("ms_crm_app", "ticketspipelog"),
+    "finance": ("core", "expense"),
+    "contracts": ("core", "contract"),
+}
+
+
+def _normalize_custom_field_module_slug(raw_module):
+    module = str(raw_module or "").strip().lower()
+    return CUSTOM_FIELD_MODULE_ALIASES.get(module, module)
+
+
+def _is_empty_custom_value(value):
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    if isinstance(value, list) and len(value) == 0:
+        return True
+    return False
+
+
+def _coerce_custom_field_value(field, raw_value):
+    if _is_empty_custom_value(raw_value):
+        return None
+
+    field_type = str(getattr(field, "field_type", "text") or "text").strip().lower()
+    options = getattr(field, "options", None) or []
+
+    if field_type in {"text", "textarea"}:
+        return str(raw_value)
+
+    if field_type == "number":
+        value = Decimal(str(raw_value))
+        if value % 1 == 0:
+            return int(value)
+        return float(value)
+
+    if field_type == "email":
+        email_text = str(raw_value).strip()
+        validate_email(email_text)
+        return email_text
+
+    if field_type == "date":
+        parsed = parse_date(str(raw_value).strip())
+        if not parsed:
+            raise ValueError("Date must be in YYYY-MM-DD format.")
+        return parsed.isoformat()
+
+    if field_type == "select":
+        selected = str(raw_value)
+        if options and selected not in options:
+            raise ValueError("Value must be one of the configured options.")
+        return selected
+
+    if field_type == "checkbox":
+        if isinstance(raw_value, bool):
+            return raw_value
+        if isinstance(raw_value, (int, float)):
+            return bool(raw_value)
+        lowered = str(raw_value).strip().lower()
+        truthy = {"1", "true", "yes", "y", "on"}
+        falsy = {"0", "false", "no", "n", "off"}
+        if lowered in truthy:
+            return True
+        if lowered in falsy:
+            return False
+        raise ValueError("Checkbox value must be true/false or 1/0.")
+
+    return raw_value
+
+
+def _resolve_custom_field_content_type(module_slug=None, model_name=None, content_type_name=None):
+    if model_name:
+        try:
+            app_label, model = str(model_name).strip().lower().split(".", 1)
+            return ContentType.objects.get(app_label=app_label, model=model)
+        except Exception:
+            return None
+
+    if content_type_name:
+        try:
+            app_label, model = str(content_type_name).strip().lower().split(".", 1)
+            return ContentType.objects.get(app_label=app_label, model=model)
+        except Exception:
+            return None
+
+    app_model = CUSTOM_FIELD_MODULE_MODEL_MAP.get(module_slug or "")
+    if not app_model:
+        return None
+
+    try:
+        app_label, model = app_model
+        return ContentType.objects.get(app_label=app_label, model=model)
+    except Exception:
+        return None
+
+
 class SetupCustomFieldViewSet(SetupBaseViewSet):
     serializer_class = SetupCustomFieldSerializer
 
     def get_queryset(self):
         queryset = SetupCustomField.objects.all()
-        module_slug = str(self.request.query_params.get("module", "")).strip()
+        module_slug = _normalize_custom_field_module_slug(self.request.query_params.get("module", ""))
         active = str(self.request.query_params.get("active", "")).strip().lower()
 
         if module_slug:
@@ -4451,6 +4836,217 @@ class SetupCustomFieldViewSet(SetupBaseViewSet):
             queryset = queryset.filter(is_active=False)
 
         return queryset.order_by("module_slug", "sort_order", "id")
+
+
+class CustomFieldValueViewSet(SetupBaseViewSet):
+    serializer_class = CustomFieldValueSerializer
+
+    def get_queryset(self):
+        qs = CustomFieldValue.objects.select_related("custom_field", "content_type")
+
+        module_slug = _normalize_custom_field_module_slug(self.request.query_params.get("module", ""))
+        if module_slug:
+            qs = qs.filter(custom_field__module_slug__iexact=module_slug)
+
+        cf_id = self.request.query_params.get("custom_field")
+        if cf_id:
+            try:
+                qs = qs.filter(custom_field_id=int(cf_id))
+            except (TypeError, ValueError):
+                pass
+        else:
+            cf_key = self.request.query_params.get("custom_field_key")
+            if cf_key:
+                qs = qs.filter(custom_field__field_key=cf_key)
+
+        ct_param = self.request.query_params.get("content_type")
+        model_param = self.request.query_params.get("model")
+        obj_id = self.request.query_params.get("object_id")
+        ct = _resolve_custom_field_content_type(module_slug, model_param, ct_param)
+        if ct is not None:
+            qs = qs.filter(content_type=ct)
+        if obj_id:
+            try:
+                qs = qs.filter(object_id=int(obj_id))
+            except (TypeError, ValueError):
+                pass
+
+        raw_value = self.request.query_params.get("value")
+        if raw_value is not None:
+            try:
+                decoded = json.loads(raw_value)
+                qs = qs.filter(value=decoded)
+            except Exception:
+                qs = qs.filter(value=raw_value)
+
+        return qs.order_by("custom_field", "content_type", "object_id")
+
+    @action(detail=False, methods=["get"], url_path="fetch-values")
+    def fetch_values(self, request):
+        module_slug = _normalize_custom_field_module_slug(
+            request.query_params.get("module") or request.query_params.get("module_slug")
+        )
+        object_id = request.query_params.get("object_id")
+        if not module_slug:
+            return Response({"detail": "module is required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            object_id = int(object_id)
+        except (TypeError, ValueError):
+            return Response({"detail": "Valid object_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        include_inactive = str(request.query_params.get("include_inactive", "")).strip().lower() in {
+            "1", "true", "yes"
+        }
+        fields = SetupCustomField.objects.filter(module_slug__iexact=module_slug)
+        if not include_inactive:
+            fields = fields.filter(is_active=True)
+        fields = list(fields.order_by("sort_order", "id"))
+
+        ct = _resolve_custom_field_content_type(
+            module_slug,
+            request.query_params.get("model"),
+            request.query_params.get("content_type"),
+        )
+        if ct is None:
+            return Response({"detail": "Unable to resolve model/content_type for module."}, status=400)
+
+        saved_values = CustomFieldValue.objects.filter(
+            custom_field__in=fields,
+            content_type=ct,
+            object_id=object_id,
+        ).select_related("custom_field")
+        saved_map = {item.custom_field_id: item.value for item in saved_values}
+
+        values = {}
+        field_rows = []
+        for field in fields:
+            value = saved_map.get(field.id, field.default_value)
+            values[field.field_key] = value
+            field_rows.append(
+                {
+                    "id": field.id,
+                    "module_slug": field.module_slug,
+                    "label": field.label,
+                    "field_key": field.field_key,
+                    "field_type": field.field_type,
+                    "options": field.options or [],
+                    "default_value": field.default_value,
+                    "is_required": field.is_required,
+                    "is_active": field.is_active,
+                    "sort_order": field.sort_order,
+                    "value": value,
+                }
+            )
+
+        return Response(
+            {
+                "module_slug": module_slug,
+                "object_id": object_id,
+                "content_type": f"{ct.app_label}.{ct.model}",
+                "fields": field_rows,
+                "values": values,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=["post"], url_path="save-values")
+    def save_values(self, request):
+        payload = request.data if isinstance(request.data, dict) else {}
+        module_slug = _normalize_custom_field_module_slug(
+            payload.get("module") or payload.get("module_slug")
+        )
+        object_id = payload.get("object_id")
+        values_payload = payload.get("values") or payload.get("custom_fields") or {}
+
+        if not module_slug:
+            return Response({"detail": "module is required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            object_id = int(object_id)
+            if object_id <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return Response({"detail": "Valid object_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not isinstance(values_payload, dict):
+            return Response({"detail": "values must be an object."}, status=status.HTTP_400_BAD_REQUEST)
+
+        ct = _resolve_custom_field_content_type(
+            module_slug,
+            payload.get("model"),
+            payload.get("content_type"),
+        )
+        if ct is None:
+            return Response({"detail": "Unable to resolve model/content_type for module."}, status=400)
+
+        fields = list(
+            SetupCustomField.objects.filter(module_slug__iexact=module_slug, is_active=True)
+            .order_by("sort_order", "id")
+        )
+        if not fields:
+            return Response(
+                {
+                    "module_slug": module_slug,
+                    "object_id": object_id,
+                    "saved_count": 0,
+                    "values": {},
+                    "results": [],
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        errors = {}
+        normalized_values = {}
+        for field in fields:
+            incoming = values_payload.get(field.field_key, None)
+            value_to_validate = incoming
+            if _is_empty_custom_value(value_to_validate) and not _is_empty_custom_value(field.default_value):
+                value_to_validate = field.default_value
+
+            if field.is_required and _is_empty_custom_value(value_to_validate):
+                errors[field.field_key] = "This field is required."
+                continue
+
+            try:
+                coerced = _coerce_custom_field_value(field, value_to_validate)
+            except (ValueError, InvalidOperation, TypeError, DjangoValidationError) as exc:
+                errors[field.field_key] = str(exc) or f"Invalid value for {field.label}."
+                continue
+
+            normalized_values[field.field_key] = coerced
+
+        if errors:
+            return Response(
+                {
+                    "detail": "Custom field validation failed.",
+                    "errors": errors,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        saved = []
+        with transaction.atomic():
+            for field in fields:
+                value = normalized_values.get(field.field_key, None)
+                obj, _ = CustomFieldValue.objects.update_or_create(
+                    custom_field=field,
+                    content_type=ct,
+                    object_id=object_id,
+                    defaults={"value": value},
+                )
+                saved.append(obj)
+
+        serializer = self.get_serializer(saved, many=True)
+        return Response(
+            {
+                "module_slug": module_slug,
+                "object_id": object_id,
+                "content_type": f"{ct.app_label}.{ct.model}",
+                "saved_count": len(saved),
+                "values": normalized_values,
+                "results": serializer.data,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class SetupGDPRRequestViewSet(SetupBaseViewSet):
@@ -4559,6 +5155,125 @@ class SetupHelpArticleViewSet(SetupBaseViewSet):
 
         return queryset.order_by("module_slug", "sort_order", "title", "id")
 
+    # ------------------------------------------------------------
+    # Email notification on create / update
+    # ------------------------------------------------------------
+    def _resolve_review_recipients(self):
+        """Resolve company review recipient emails for Help article submissions."""
+        recipients = []
+        seen = set()
+
+        def add_email(value):
+            email_value = str(value or "").strip()
+            if not email_value or "@" not in email_value:
+                return
+            key = email_value.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            recipients.append(email_value)
+
+        # 1) Primary source: setup setting (company/company_email).
+        try:
+            configured_company_email = SetupSetting.objects.filter(
+                category__iexact="company",
+                key__iexact="company_email",
+            ).values_list("value", flat=True).first()
+            add_email(configured_company_email)
+        except Exception:
+            pass
+
+        # 2) Business profile email for logged-in user.
+        try:
+            user = getattr(self.request, "user", None)
+            user_identifier = (
+                str(getattr(user, "email", "") or getattr(user, "username", "")).strip()
+            )
+            if user_identifier:
+                business = (
+                    Business.objects.filter(email__iexact=user_identifier)
+                    .order_by("-created_at")
+                    .first()
+                )
+                if business:
+                    add_email(getattr(business, "email", None))
+        except Exception:
+            pass
+
+        # 3) Legacy business email fallback (for older datasets).
+        try:
+            legacy_business = LegacyBusiness.objects.first()
+            if legacy_business:
+                add_email(getattr(legacy_business, "email", None))
+        except Exception:
+            pass
+
+        # 4) Final personal fallback from authenticated user.
+        user = getattr(self.request, "user", None)
+        add_email(getattr(user, "email", None))
+        add_email(getattr(user, "username", None))
+
+        if not recipients:
+            recipients.append("support@magnyte.com")
+
+        return recipients
+
+    def _send_review_email(self, article, *, action="created"):
+        """Send a review email for a created/updated help article."""
+        recipients = self._resolve_review_recipients()
+        verb = "created" if action == "created" else "updated"
+        subject = f"Help Article {verb.title()} for Review: {article.title}"
+        message = (
+            f"A help article has been {verb} in the system.\n\n"
+            f"Title: {article.title}\n"
+            f"Module: {article.module_slug or '-'}\n"
+            f"Published: {'Yes' if article.is_published else 'No'}\n"
+            f"\nSummary:\n{article.summary or ''}\n\n"
+            f"Content preview (first 200 chars):\n{(article.content or '')[:200]}"
+        )
+        try:
+            send_branded_email(
+                subject=subject,
+                message=message,
+                to_emails=recipients,
+                fail_silently=False,
+            )
+            return {
+                "sent": True,
+                "to": recipients,
+            }
+        except Exception as exc:
+            # Logging failure should not break the API response.
+            print(f"Help article review email failed: {exc}")
+            return {
+                "sent": False,
+                "to": recipients,
+                "error": str(exc),
+            }
+
+    def perform_create(self, serializer):
+        """Create a Help article and trigger the review email."""
+        article = serializer.save()
+        self._last_review_email = self._send_review_email(article, action="created")
+
+    def perform_update(self, serializer):
+        """Update a Help article and trigger the review email."""
+        article = serializer.save()
+        self._last_review_email = self._send_review_email(article, action="updated")
+
+    def create(self, request, *args, **kwargs):
+        self._last_review_email = {"sent": False, "to": []}
+        response = super().create(request, *args, **kwargs)
+        if isinstance(response.data, dict):
+            response.data["review_email"] = self._last_review_email
+        return response
+
+    def update(self, request, *args, **kwargs):
+        self._last_review_email = {"sent": False, "to": []}
+        response = super().update(request, *args, **kwargs)
+        if isinstance(response.data, dict):
+            response.data["review_email"] = self._last_review_email
+        return response
 
 class SetupCustomerGroupViewSet(SetupBaseViewSet):
     serializer_class = SetupCustomerGroupSerializer
@@ -4837,6 +5552,16 @@ class SetupRolePermissionViewSet(SetupBaseViewSet):
         if module_slug:
             queryset = queryset.filter(module_slug__iexact=module_slug)
         return queryset.order_by("role_id", "module_slug", "id")
+
+
+
+
+
+
+
+
+
+
 
 
 

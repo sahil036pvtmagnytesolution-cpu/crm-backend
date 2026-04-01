@@ -1,8 +1,17 @@
+import json
+from decimal import Decimal, InvalidOperation
+
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.validators import validate_email
 from django.utils import timezone
+from django.utils.dateparse import parse_date
+from django.utils.text import slugify
+from django.db import transaction
 from rest_framework import serializers
-from .models import Business, Contact, CreditNote, CreditNoteReminder, CreditNoteTask, Customer, Item, ItemGroup, Role, Proposal
+from .models import Business, Contact, CreditNote, CreditNoteReminder, CreditNoteTask, Customer, Item, ItemGroup, Role, Proposal, CustomFieldValue
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from django.contrib.auth.models import User
+from django.contrib.auth import get_user_model
 from core.models import Proposal
 from .models import Proposal
 from .models import Expense
@@ -21,6 +30,8 @@ from .models import ContractType
 from .models import ContractAttachment, ContractComment, ContractRenewal, ContractTask, ContractNote
 from .models import (
     EmailTemplate,
+    Permission,
+    RolePermission,
     SetupModule,
     SetupCustomField,
     SetupGDPRRequest,
@@ -41,10 +52,18 @@ from .models import (
     SetupLeadStatus,
     SetupContractTemplate,
     SetupRolePermission,
+    UserRole,
 )
 from .item_master import sync_items_to_master
 from .models import Project
 from ms_crm_app.models import Staff
+from .middleware import (
+    RBAC_ACTIONS,
+    canonicalize_module,
+    ensure_permission,
+    is_super_admin,
+    sync_default_permissions,
+)
 
 
 def _normalize_items_payload(items):
@@ -362,6 +381,14 @@ class ContactSerializer(serializers.ModelSerializer):
             "last_login",
             "active",
             "direction",
+            # ------------------------------------------------------------
+            # Address fields (added to Contact model)
+            # ------------------------------------------------------------
+            "street",
+            "city",
+            "state",
+            "zip_code",
+            "country",
             "invoice_emails",
             "estimate_emails",
             "credit_note_emails",
@@ -757,12 +784,31 @@ class EmailTemplateSerializer(serializers.ModelSerializer):
 
 
 class SetupModuleSerializer(serializers.ModelSerializer):
+    # Add an alias field `is_active` that maps to the model's `is_enabled` flag.
+    # This aligns the backend representation with the frontend expectations,
+    # which checks for `is_active`, `active`, or `enabled` to determine module status.
+    is_active = serializers.BooleanField(source="is_enabled", required=False)
+
     class Meta:
         model = SetupModule
+        # Include all model fields plus the alias. Using "__all__" already brings
+        # `is_enabled`; adding `is_active` provides a convenient duplicate name.
         fields = "__all__"
 
 
 class SetupCustomFieldSerializer(serializers.ModelSerializer):
+    MODULE_ALIASES = {
+        "customer": "customer",
+        "customers": "customer",
+        "lead": "leads",
+        "leads": "leads",
+        "staff": "staff",
+        "support": "support",
+        "finance": "finance",
+        "contract": "contracts",
+        "contracts": "contracts",
+    }
+
     class Meta:
         model = SetupCustomField
         fields = "__all__"
@@ -770,6 +816,91 @@ class SetupCustomFieldSerializer(serializers.ModelSerializer):
             "field_key": {"required": False, "allow_blank": True},
             "options": {"required": False},
         }
+
+    def validate_module_slug(self, value):
+        raw = str(value or "").strip().lower()
+        return self.MODULE_ALIASES.get(raw, raw)
+
+    def validate_options(self, value):
+        if value in (None, ""):
+            return []
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        if isinstance(value, list):
+            out = []
+            for item in value:
+                text = str(item or "").strip()
+                if text:
+                    out.append(text)
+            return out
+        raise serializers.ValidationError("Options must be a list or comma separated string.")
+
+    def validate(self, attrs):
+        field_type = attrs.get("field_type")
+        if field_type is None and self.instance:
+            field_type = self.instance.field_type
+
+        options = attrs.get("options")
+        if options is None and self.instance:
+            options = self.instance.options or []
+        options = options or []
+
+        label_value = attrs.get("label")
+        if label_value is None and self.instance:
+            label_value = self.instance.label
+
+        field_key = attrs.get("field_key")
+        if (field_key is None or str(field_key).strip() == "") and label_value:
+            attrs["field_key"] = slugify(label_value)
+
+        if field_type == "select" and not options:
+            raise serializers.ValidationError({"options": "Options are required for select type fields."})
+
+        default_value = attrs.get("default_value")
+        if default_value is None and self.instance:
+            default_value = self.instance.default_value
+
+        if default_value not in (None, "") and field_type:
+            try:
+                if field_type in {"text", "textarea"}:
+                    default_value = str(default_value)
+                elif field_type == "number":
+                    Decimal(str(default_value))
+                    default_value = str(default_value)
+                elif field_type == "email":
+                    validate_email(str(default_value))
+                    default_value = str(default_value).strip()
+                elif field_type == "date":
+                    parsed = parse_date(str(default_value))
+                    if not parsed:
+                        raise serializers.ValidationError({"default_value": "Default value must be YYYY-MM-DD."})
+                    default_value = parsed.isoformat()
+                elif field_type == "select":
+                    default_text = str(default_value)
+                    if options and default_text not in options:
+                        raise serializers.ValidationError(
+                            {"default_value": "Default value must be one of the available options."}
+                        )
+                    default_value = default_text
+                elif field_type == "checkbox":
+                    raw = str(default_value).strip().lower()
+                    truthy = {"1", "true", "yes", "y", "on"}
+                    falsy = {"0", "false", "no", "n", "off"}
+                    if raw in truthy:
+                        default_value = "1"
+                    elif raw in falsy:
+                        default_value = "0"
+                    else:
+                        raise serializers.ValidationError(
+                            {"default_value": "Checkbox default must be true/false or 1/0."}
+                        )
+            except (InvalidOperation, ValueError, TypeError, DjangoValidationError):
+                raise serializers.ValidationError(
+                    {"default_value": f"Invalid default value for field type '{field_type}'."}
+                )
+
+        attrs["default_value"] = default_value
+        return attrs
 
 
 class SetupGDPRRequestSerializer(serializers.ModelSerializer):
@@ -977,4 +1108,363 @@ class StaffSerializer(serializers.ModelSerializer):
             "new_pass_key_requested": {"read_only": True},
             "two_factor_auth_code": {"write_only": True},
             "two_factor_auth_code_requested": {"read_only": True},
+        }
+
+# ---------------------------------------------------------------------------
+# Custom Field Value Serializer
+# ---------------------------------------------------------------------------
+class CustomFieldValueSerializer(serializers.ModelSerializer):
+    """Serializer for :class:`core.models.CustomFieldValue`.
+
+    The ``content_type`` field is represented by its PK; the frontend can
+    resolve the model name from that if needed. ``custom_field`` is a nested
+    representation using its primary key.
+    """
+
+    # Expose useful read‑only fields for frontend consumption:
+    # - `content_type` – a string like "app_label.model" identifying the target model.
+    # - `object_id` – the primary key of the target instance (already present).
+    # - `object_repr` – a simple textual representation of the target object.
+    content_type_name = serializers.SerializerMethodField(read_only=True)
+    object_repr = serializers.SerializerMethodField(read_only=True)
+    custom_field_key = serializers.CharField(source="custom_field.field_key", read_only=True)
+    custom_field_label = serializers.CharField(source="custom_field.label", read_only=True)
+    module_slug = serializers.CharField(source="custom_field.module_slug", read_only=True)
+
+    class Meta:
+        model = CustomFieldValue
+        fields = "__all__"
+
+    def get_content_type_name(self, obj):
+        """Return a human‑readable ``app_label.model`` string for the content type."""
+        if obj.content_type:
+            return f"{obj.content_type.app_label}.{obj.content_type.model}"
+        return None
+
+    def get_object_repr(self, obj):
+        """Return ``str()`` of the related object if it exists, else ``None``."""
+        try:
+            return str(obj.content_object) if obj.content_object else None
+        except Exception:
+            return None
+
+
+def _legacy_permissions_text(permission_rows):
+    try:
+        return json.dumps(permission_rows)
+    except Exception:
+        return "[]"
+
+
+def normalize_permission_payload(payload):
+    if payload in (None, ""):
+        return []
+
+    rows = []
+    if isinstance(payload, dict):
+        iterable = []
+        for module_name, actions in payload.items():
+            iterable.append({"module": module_name, "permissions": actions})
+    elif isinstance(payload, list):
+        iterable = payload
+    else:
+        raise serializers.ValidationError("permissions must be a list or object.")
+
+    for item in iterable:
+        if not isinstance(item, dict):
+            raise serializers.ValidationError("Each permission row must be an object.")
+
+        module = canonicalize_module(item.get("module") or item.get("module_slug"))
+        if not module:
+            raise serializers.ValidationError("Each permission row requires module.")
+
+        raw_actions = (
+            item.get("permissions")
+            if item.get("permissions") is not None
+            else item.get("actions")
+        )
+        if raw_actions is None:
+            raw_actions = []
+        if not isinstance(raw_actions, list):
+            raise serializers.ValidationError("permissions/actions must be a list.")
+
+        actions = []
+        seen = set()
+        for action in raw_actions:
+            action_name = str(action or "").strip().lower()
+            if not action_name:
+                continue
+            if action_name not in RBAC_ACTIONS:
+                raise serializers.ValidationError(
+                    f"Invalid action '{action_name}'. Allowed: {', '.join(RBAC_ACTIONS)}."
+                )
+            if action_name in seen:
+                continue
+            seen.add(action_name)
+            actions.append(action_name)
+
+        rows.append({"module": module, "permissions": actions})
+    return rows
+
+
+class PermissionDefinitionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Permission
+        fields = ["id", "module", "action", "code", "description", "is_active"]
+
+
+class RoleReadSerializer(serializers.ModelSerializer):
+    permissions = serializers.SerializerMethodField()
+    users_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Role
+        fields = [
+            "id",
+            "name",
+            "description",
+            "is_active",
+            "is_super_admin",
+            "level",
+            "permissions",
+            "users_count",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_permissions(self, obj):
+        matrix = {}
+        links = (
+            obj.role_permissions.select_related("permission")
+            .filter(is_allowed=True, permission__is_active=True)
+            .order_by("permission__module", "permission__action")
+        )
+        for link in links:
+            module = link.permission.module
+            matrix.setdefault(module, [])
+            matrix[module].append(link.permission.action)
+        return [
+            {"module": module, "permissions": actions}
+            for module, actions in sorted(matrix.items(), key=lambda row: row[0].lower())
+        ]
+
+    def get_users_count(self, obj):
+        return obj.user_roles.filter(is_active=True).count()
+
+
+class RoleWriteSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=100)
+    description = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    is_active = serializers.BooleanField(required=False, default=True)
+    is_super_admin = serializers.BooleanField(required=False, default=False)
+    level = serializers.IntegerField(required=False, min_value=1, default=1)
+    permissions = serializers.JSONField(required=False)
+
+    def validate_name(self, value):
+        trimmed = str(value or "").strip()
+        if not trimmed:
+            raise serializers.ValidationError("name is required.")
+
+        qs = Role.objects.filter(name__iexact=trimmed)
+        instance = getattr(self, "instance", None)
+        if instance is not None:
+            qs = qs.exclude(pk=instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError("Role with this name already exists.")
+        return trimmed
+
+    def validate_permissions(self, value):
+        return normalize_permission_payload(value)
+
+    def validate(self, attrs):
+        actor = self.context.get("actor")
+        instance = getattr(self, "instance", None)
+        next_is_super_admin = attrs.get(
+            "is_super_admin",
+            instance.is_super_admin if instance is not None else False,
+        )
+        next_is_active = attrs.get(
+            "is_active",
+            instance.is_active if instance is not None else True,
+        )
+
+        if next_is_super_admin and not is_super_admin(actor):
+            raise serializers.ValidationError(
+                {"is_super_admin": "Only Super Admin can create/update Super Admin roles."}
+            )
+
+        if instance is not None and instance.is_super_admin and not is_super_admin(actor):
+            raise serializers.ValidationError(
+                {"detail": "Only Super Admin can modify a Super Admin role."}
+            )
+
+        if instance is not None and instance.is_super_admin and (not next_is_super_admin or not next_is_active):
+            remaining_active_super_admins = Role.objects.filter(
+                is_super_admin=True,
+                is_active=True,
+            ).exclude(pk=instance.pk)
+            if not remaining_active_super_admins.exists():
+                raise serializers.ValidationError(
+                    {"detail": "At least one active Super Admin role is required."}
+                )
+        return attrs
+
+    def _replace_permissions(self, role, permission_rows):
+        permission_ids = []
+        for row in permission_rows:
+            module = row["module"]
+            for action in row["permissions"]:
+                permission_obj = ensure_permission(module, action)
+                permission_ids.append(permission_obj.id)
+
+        RolePermission.objects.filter(role=role).exclude(permission_id__in=permission_ids).delete()
+
+        existing = set(
+            RolePermission.objects.filter(role=role, permission_id__in=permission_ids).values_list(
+                "permission_id",
+                flat=True,
+            )
+        )
+        to_create = []
+        for permission_id in permission_ids:
+            if permission_id in existing:
+                continue
+            to_create.append(
+                RolePermission(
+                    role=role,
+                    permission_id=permission_id,
+                    is_allowed=True,
+                )
+            )
+        if to_create:
+            RolePermission.objects.bulk_create(to_create, ignore_conflicts=True)
+
+    @transaction.atomic
+    def create(self, validated_data):
+        sync_default_permissions()
+        permission_rows = validated_data.pop("permissions", [])
+        role = Role.objects.create(
+            name=validated_data["name"],
+            description=validated_data.get("description") or "",
+            is_active=validated_data.get("is_active", True),
+            is_super_admin=validated_data.get("is_super_admin", False),
+            level=validated_data.get("level", 1),
+            permissions=_legacy_permissions_text(permission_rows),
+        )
+        self._replace_permissions(role, permission_rows)
+        return role
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        sync_default_permissions()
+        permission_rows = validated_data.pop("permissions", None)
+
+        instance.name = validated_data.get("name", instance.name)
+        instance.description = validated_data.get("description", instance.description)
+        instance.is_active = validated_data.get("is_active", instance.is_active)
+        instance.is_super_admin = validated_data.get("is_super_admin", instance.is_super_admin)
+        instance.level = validated_data.get("level", instance.level)
+
+        if permission_rows is not None:
+            instance.permissions = _legacy_permissions_text(permission_rows)
+        instance.save()
+
+        if permission_rows is not None:
+            self._replace_permissions(instance, permission_rows)
+        return instance
+
+
+class UserRoleAssignmentSerializer(serializers.Serializer):
+    user_id = serializers.IntegerField()
+    role_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        required=False,
+        allow_empty=True,
+    )
+    role_id = serializers.IntegerField(required=False, min_value=1)
+    replace_existing = serializers.BooleanField(required=False, default=True)
+
+    def validate(self, attrs):
+        UserModel = get_user_model()
+        user_id = attrs.get("user_id")
+        user = UserModel.objects.filter(pk=user_id).first()
+        if not user:
+            raise serializers.ValidationError({"user_id": "User not found."})
+
+        role_ids = attrs.get("role_ids")
+        if role_ids is None:
+            role_id = attrs.get("role_id")
+            role_ids = [role_id] if role_id else []
+
+        clean_role_ids = sorted(set([rid for rid in role_ids if rid]))
+        if clean_role_ids:
+            active_roles = list(
+                Role.objects.filter(id__in=clean_role_ids, is_active=True).values(
+                    "id",
+                    "is_super_admin",
+                )
+            )
+            found_ids = {row["id"] for row in active_roles}
+            missing_ids = [rid for rid in clean_role_ids if rid not in found_ids]
+            if missing_ids:
+                raise serializers.ValidationError(
+                    {"role_ids": f"Invalid/inactive role IDs: {missing_ids}"}
+                )
+
+            actor = self.context.get("actor")
+            if not is_super_admin(actor):
+                super_admin_ids = [row["id"] for row in active_roles if row["is_super_admin"]]
+                if super_admin_ids:
+                    raise serializers.ValidationError(
+                        {"role_ids": "Only Super Admin can assign Super Admin roles."}
+                    )
+
+        attrs["user_obj"] = user
+        attrs["clean_role_ids"] = clean_role_ids
+        return attrs
+
+    @transaction.atomic
+    def save(self, **kwargs):
+        user = self.validated_data["user_obj"]
+        role_ids = self.validated_data["clean_role_ids"]
+        replace_existing = self.validated_data.get("replace_existing", True)
+        actor = self.context.get("actor")
+
+        existing = {
+            row.role_id: row
+            for row in UserRole.objects.select_related("role").filter(user=user)
+        }
+
+        if replace_existing:
+            for role_id, row in existing.items():
+                if role_id in role_ids:
+                    continue
+                if row.is_active:
+                    row.is_active = False
+                    row.save(update_fields=["is_active", "updated_at"])
+
+        assigned = []
+        for role_id in role_ids:
+            row = existing.get(role_id)
+            if row:
+                if not row.is_active:
+                    row.is_active = True
+                    row.assigned_by = actor
+                    row.save(update_fields=["is_active", "assigned_by", "updated_at"])
+                assigned.append(row)
+                continue
+            created = UserRole.objects.create(
+                user=user,
+                role_id=role_id,
+                assigned_by=actor,
+                is_active=True,
+            )
+            assigned.append(created)
+
+        return {
+            "user": user,
+            "assigned_roles": [row.role for row in assigned],
+            "active_role_ids": list(
+                UserRole.objects.filter(user=user, is_active=True).values_list("role_id", flat=True)
+            ),
         }

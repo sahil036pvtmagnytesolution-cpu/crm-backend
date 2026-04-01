@@ -3,11 +3,15 @@ from django.contrib.auth.models import User
 from django.utils import timezone
 from django.utils.text import slugify
 from datetime import date
-from ms_crm_app.models import (
-    Staff as LegacyStaff,
-    KnowledgeBase as LegacyKnowledgeBase,
-    KnowledgeBaseGroups as LegacyKnowledgeBaseGroups,
-)
+# The following imports created circular dependencies between the core and ms_crm_app
+# apps (LegacyStaff, LegacyKnowledgeBase, LegacyKnowledgeBaseGroups). They are not
+# required for the GDPR module and caused migration failures. They have been
+# removed to break the circular reference.
+# from ms_crm_app.models import (
+#     Staff as LegacyStaff,
+#     KnowledgeBase as LegacyKnowledgeBase,
+#     KnowledgeBaseGroups as LegacyKnowledgeBaseGroups,
+# )
 
 
 class LegacyBusiness(models.Model):
@@ -111,6 +115,58 @@ class SetupCustomField(models.Model):
         return f"{self.module_slug} - {self.label}"
 
 
+class CustomField(SetupCustomField):
+    """Compatibility alias for admin-defined dynamic field definitions."""
+
+    class Meta:
+        proxy = True
+        verbose_name = "Custom Field"
+        verbose_name_plural = "Custom Fields"
+
+
+# ---------------------------------------------------------------------------
+# Custom Field Value Model
+# ---------------------------------------------------------------------------
+# This model stores the value of a custom field for any target object in the
+# system (e.g., Lead, Client, Project, etc.). It uses Django's generic
+# foreign key mechanism to link to any model instance.
+from django.contrib.contenttypes.models import ContentType
+from django.contrib.contenttypes.fields import GenericForeignKey
+
+
+class CustomFieldValue(models.Model):
+    """A value assigned to a :class:`SetupCustomField` for a specific object.
+
+    The generic relation allows this model to be attached to any other model
+    without creating a dedicated foreign key for each possible target.
+    """
+
+    custom_field = models.ForeignKey(
+        SetupCustomField,
+        on_delete=models.CASCADE,
+        related_name="values",
+    )
+    # Generic relation to the target object (e.g., Lead, Client, Project)
+    content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE)
+    object_id = models.PositiveIntegerField()
+    content_object = GenericForeignKey('content_type', 'object_id')
+
+    # Store the actual value. JSONField gives flexibility for different types.
+    value = models.JSONField(blank=True, null=True)
+
+    # Auditing fields
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_custom_field_value"
+        unique_together = ("custom_field", "content_type", "object_id")
+        ordering = ["custom_field", "content_type", "object_id"]
+
+    def __str__(self):
+        return f"{self.custom_field.field_key}={self.value} for {self.content_object}"
+
+
 class SetupGDPRRequest(models.Model):
     REQUEST_TYPE_CHOICES = [
         ("export", "Data Export"),
@@ -195,6 +251,79 @@ class SetupHelpArticle(models.Model):
         if not self.slug:
             self.slug = slugify(self.title or "")
         super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.title
+
+# ------------------------------------------------------------
+# Company Information Model
+# ------------------------------------------------------------
+class CompanyInfo(models.Model):
+    """Store basic company information used in the Setup/Setting module.
+
+    The model is deliberately simple – only the company name and an optional
+    logo image.  Additional fields (address, phone, etc.) can be added later if
+    required.
+    """
+
+    name = models.CharField(max_length=255, unique=True, db_index=True)
+    # Use FileField instead of ImageField to avoid Pillow dependency.
+    # The frontend can still treat this as an image upload; validation can be
+    # performed at the API level if needed.
+    logo = models.FileField(upload_to="company_logos/", blank=True, null=True)
+    # Timestamps for audit purposes
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_company_info"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return self.name
+
+# ------------------------------------------------------------
+# SMS Task Model – represents an outbound SMS that can be
+# scheduled, sent, and tracked.  Simple fields are provided; the
+# implementation can be expanded later (e.g., integration with an
+# external SMS gateway).
+# ------------------------------------------------------------
+class SMSTask(models.Model):
+    recipient = models.CharField(max_length=20, help_text="Phone number in international format")
+    message = models.TextField()
+    # Status tracking – pending, sent, failed
+    STATUS_CHOICES = [
+        ("pending", "Pending"),
+        ("sent", "Sent"),
+        ("failed", "Failed"),
+    ]
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default="pending")
+    scheduled_at = models.DateTimeField(blank=True, null=True)
+    sent_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "core_sms_task"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"SMS to {self.recipient} ({self.status})"
+
+# ------------------------------------------------------------
+# Generic Setup Task Model – used for tasks within the Setup/Setting
+# module (e.g., reminders for updating contacts, addresses, etc.)
+# ------------------------------------------------------------
+class SetupTask(models.Model):
+    title = models.CharField(max_length=191)
+    description = models.TextField(blank=True, null=True)
+    is_completed = models.BooleanField(default=False)
+    due_date = models.DateField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_setup_task"
+        ordering = ["-created_at"]
 
     def __str__(self):
         return self.title
@@ -488,9 +617,14 @@ class Business(models.Model):
 
 class Role(models.Model):
     name = models.CharField(max_length=100)
+    description = models.TextField(blank=True, null=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    is_super_admin = models.BooleanField(default=False, db_index=True)
+    level = models.PositiveIntegerField(default=1)
     permissions = models.TextField(default="Basic")
     is_approved = models.BooleanField(default=False)
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         db_table = "core_roles"
@@ -498,6 +632,139 @@ class Role(models.Model):
 
     def __str__(self):
         return self.name
+
+
+class Permission(models.Model):
+    ACTION_VIEW = "view"
+    ACTION_CREATE = "create"
+    ACTION_EDIT = "edit"
+    ACTION_DELETE = "delete"
+
+    ACTION_CHOICES = [
+        (ACTION_VIEW, "View"),
+        (ACTION_CREATE, "Create"),
+        (ACTION_EDIT, "Edit"),
+        (ACTION_DELETE, "Delete"),
+    ]
+
+    module = models.CharField(max_length=100, db_index=True)
+    action = models.CharField(max_length=20, choices=ACTION_CHOICES, db_index=True)
+    code = models.CharField(max_length=191, unique=True, db_index=True)
+    description = models.TextField(blank=True, null=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_permissions"
+        unique_together = ("module", "action")
+        ordering = ["module", "action", "id"]
+
+    def __str__(self):
+        return f"{self.module}:{self.action}"
+
+
+class RolePermission(models.Model):
+    role = models.ForeignKey(
+        Role,
+        on_delete=models.CASCADE,
+        related_name="role_permissions",
+    )
+    permission = models.ForeignKey(
+        Permission,
+        on_delete=models.CASCADE,
+        related_name="role_permissions",
+    )
+    is_allowed = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_role_permissions"
+        unique_together = ("role", "permission")
+        ordering = ["role_id", "permission__module", "permission__action", "id"]
+
+    def __str__(self):
+        return f"{self.role_id}:{self.permission.code}"
+
+
+class UserRole(models.Model):
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="user_roles",
+    )
+    role = models.ForeignKey(
+        Role,
+        on_delete=models.CASCADE,
+        related_name="user_roles",
+    )
+    assigned_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="assigned_user_roles",
+    )
+    is_active = models.BooleanField(default=True, db_index=True)
+    assigned_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_user_roles"
+        unique_together = ("user", "role")
+        ordering = ["-assigned_at", "-id"]
+
+    def __str__(self):
+        return f"{self.user_id}:{self.role_id}"
+
+
+class RoleAuditLog(models.Model):
+    EVENT_CREATE = "create"
+    EVENT_UPDATE = "update"
+    EVENT_DELETE = "delete"
+    EVENT_ASSIGN = "assign"
+    EVENT_UNASSIGN = "unassign"
+
+    EVENT_CHOICES = [
+        (EVENT_CREATE, "Create"),
+        (EVENT_UPDATE, "Update"),
+        (EVENT_DELETE, "Delete"),
+        (EVENT_ASSIGN, "Assign"),
+        (EVENT_UNASSIGN, "Unassign"),
+    ]
+
+    role = models.ForeignKey(
+        Role,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="audit_logs",
+    )
+    actor = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="role_audit_actor_logs",
+    )
+    target_user = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="role_audit_target_logs",
+    )
+    event_type = models.CharField(max_length=20, choices=EVENT_CHOICES, db_index=True)
+    changes = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = "core_role_audit_logs"
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return f"{self.event_type}:{self.role_id or '-'}"
 
 
 class StaffProfile(models.Model):
@@ -1154,6 +1421,17 @@ class Contact(models.Model):
     last_login = models.DateTimeField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # ------------------------------------------------------------
+    # Additional address fields – allow storing a full address for a
+    # contact record. These are optional and align with the UI request
+    # to manage contact addresses.
+    # ------------------------------------------------------------
+    street = models.CharField(max_length=255, blank=True, null=True)
+    city = models.CharField(max_length=100, blank=True, null=True)
+    state = models.CharField(max_length=100, blank=True, null=True)
+    zip_code = models.CharField(max_length=20, blank=True, null=True)
+    country = models.CharField(max_length=100, blank=True, null=True)
+
     class Meta:
         db_table = "core_contact"
         ordering = ["-created_at", "-id"]
@@ -1266,25 +1544,4 @@ class Project(models.Model):
         return self.name
 
 
-class StaffProxy(LegacyStaff):
-    class Meta:
-        proxy = True
-        app_label = "core"
-        verbose_name = "Staff"
-        verbose_name_plural = "Staff"
-
-
-class KnowledgeBaseProxy(LegacyKnowledgeBase):
-    class Meta:
-        proxy = True
-        app_label = "core"
-        verbose_name = "Knowledge Base Article"
-        verbose_name_plural = "Knowledge Base Articles"
-
-
-class KnowledgeBaseGroupProxy(LegacyKnowledgeBaseGroups):
-    class Meta:
-        proxy = True
-        app_label = "core"
-        verbose_name = "Knowledge Base Group"
-        verbose_name_plural = "Knowledge Base Groups"
+# Proxy models for legacy tables have been removed to avoid circular dependencies.
