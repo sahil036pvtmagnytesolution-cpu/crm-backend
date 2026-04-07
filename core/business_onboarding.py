@@ -4,10 +4,10 @@ from typing import Optional
 import MySQLdb
 from django.conf import settings
 from django.contrib.auth.models import User
-from django.utils.html import escape
 from django.utils.text import slugify
+from django.utils import timezone
 
-from .email_branding import send_branded_email
+from .email_branding import build_module_email_html, send_branded_email
 from .models import Business
 
 
@@ -341,16 +341,8 @@ def _copy_legacy_data_from_default_to_tenant(db_name: str) -> bool:
     return copied_any
 
 
-def _login_button_html():
-    login_url = getattr(settings, "FRONTEND_LOGIN_URL", "http://localhost:3000/login")
-    safe_url = escape(login_url)
-    return (
-        f'<a href="{safe_url}" '
-        'style="display:inline-block;padding:10px 20px;background:#0a3459;'
-        'color:#ffffff;text-decoration:none;border-radius:6px;font-weight:600;">'
-        "Login"
-        "</a>"
-    )
+def _frontend_login_url() -> str:
+    return getattr(settings, "FRONTEND_LOGIN_URL", "http://localhost:3000/login")
 
 
 def _send_email(subject: str, message: str, to_email: str, html_message: Optional[str] = None):
@@ -378,54 +370,78 @@ def send_signup_received_email(business: Business):
         "Regards,\n"
         "CRM Team"
     )
-    html_message = (
-        f"<p>Hello {escape(business.owner_name)},</p>"
-        f"<p>We received your business signup request for <b>{escape(business.name)}</b>.</p>"
-        "<p>Your account is currently pending super admin approval.</p>"
-        "<p>You will receive another email once your business is approved.</p>"
-        "<p>Regards,<br/>CRM Team</p>"
+    html_message = build_module_email_html(
+        title="Business Signup Request Received",
+        greeting=business.owner_name,
+        intro=(
+            f"We received your business signup request for '{business.name}'. "
+            "Your account is currently pending super admin approval."
+        ),
+        details=[
+            ("Business Name", business.name),
+            ("Owner Name", business.owner_name),
+            ("Email", business.email),
+            ("Approval Status", "Pending"),
+        ],
+        body_html="<p>You will receive another email once your business is approved.</p>",
+        closing="Regards,<br/><strong>CRM Team</strong>",
     )
     return _send_email(subject, message, business.email, html_message=html_message)
 
 
 def send_business_approved_email(business: Business):
     subject = f"Business Approved - {business.name}"
+    login_url = _frontend_login_url()
     message = (
         f"Hello {business.owner_name},\n\n"
         f"Your business '{business.name}' is now approved.\n"
         "You can login to CRM now.\n\n"
         f"Business DB Name: {business.db_name}\n"
-        "Use the Login button in this email.\n\n"
+        f"Login URL: {login_url}\n\n"
         "Regards,\n"
         "CRM Team"
     )
-    html_message = (
-        f"<p>Hello {escape(business.owner_name)},</p>"
-        f"<p>Your business <b>{escape(business.name)}</b> is now approved.</p>"
-        "<p>You can login to CRM now.</p>"
-        f"<p><b>Business DB Name:</b> {escape(business.db_name or '-')}</p>"
-        f"<p>{_login_button_html()}</p>"
-        "<p>Regards,<br/>CRM Team</p>"
+    html_message = build_module_email_html(
+        title="Business Approved",
+        greeting=business.owner_name,
+        intro=f"Your business '{business.name}' is now approved. You can login to CRM now.",
+        details=[
+            ("Business Name", business.name),
+            ("Business DB Name", business.db_name or "-"),
+            ("Approval Status", "Approved"),
+        ],
+        cta_label="Login to CRM",
+        cta_url=login_url,
+        closing="Regards,<br/><strong>CRM Team</strong>",
     )
     return _send_email(subject, message, business.email, html_message=html_message)
 
 
 def send_login_success_email(business: Business):
     subject = f"Login Successful - {business.name}"
+    login_time = timezone.now().strftime("%Y-%m-%d %H:%M:%S %Z")
     message = (
         f"Hello {business.owner_name},\n\n"
         "Your login to CRM was successful.\n"
         f"Business: {business.name}\n\n"
+        f"Login Time: {login_time}\n\n"
         "If this wasn't you, contact support immediately.\n\n"
         "Regards,\n"
         "CRM Team"
     )
-    html_message = (
-        f"<p>Hello {escape(business.owner_name)},</p>"
-        "<p>Your login to CRM was successful.</p>"
-        f"<p><b>Business:</b> {escape(business.name)}</p>"
-        "<p>If this wasn't you, contact support immediately.</p>"
-        "<p>Regards,<br/>CRM Team</p>"
+    html_message = build_module_email_html(
+        title="Login Successful",
+        greeting=business.owner_name,
+        intro="Your login to CRM was successful.",
+        details=[
+            ("Business", business.name),
+            ("Email", business.email),
+            ("Login Time", login_time),
+        ],
+        body_html="<p>If this wasn't you, contact support immediately.</p>",
+        cta_label="Open CRM",
+        cta_url=_frontend_login_url(),
+        closing="Regards,<br/><strong>CRM Team</strong>",
     )
     return _send_email(subject, message, business.email, html_message=html_message)
 

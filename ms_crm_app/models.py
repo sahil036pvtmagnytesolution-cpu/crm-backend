@@ -1936,3 +1936,201 @@ class WebToLead(models.Model):
     class Meta:
         managed = False
         db_table = 'ms_web_to_lead'
+
+
+# Managed v2 leads module models
+class Product(models.Model):
+    name = models.CharField(max_length=255, unique=True, db_index=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "ms_lead_products"
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class ProductStatus(models.Model):
+    name = models.CharField(max_length=100, unique=True, db_index=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "ms_product_statuses"
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class CustomerStatus(models.Model):
+    name = models.CharField(max_length=100, unique=True, db_index=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "ms_customer_statuses"
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class LeadSource(models.Model):
+    name = models.CharField(max_length=100, unique=True, db_index=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "ms_lead_sources"
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class Lead(models.Model):
+    first_name = models.CharField(max_length=100, blank=True, default="")
+    last_name = models.CharField(max_length=100, blank=True, default="")
+    email = models.EmailField(unique=True, db_index=True)
+    phone = models.CharField(max_length=30, blank=True, default="")
+    company = models.CharField(max_length=191, blank=True, default="")
+    message = models.TextField(blank=True, default="")
+    priority = models.CharField(max_length=30, blank=True, default="medium")
+    assigned_to_user = models.IntegerField(null=True, blank=True)
+    assigned_to_team = models.CharField(max_length=120, blank=True, default="")
+    dynamic_data = models.JSONField(default=dict, blank=True)
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.PROTECT,
+        related_name="leads",
+        null=True,
+        blank=True,
+    )
+    product_status = models.ForeignKey(
+        ProductStatus,
+        on_delete=models.PROTECT,
+        related_name="leads",
+        null=True,
+        blank=True,
+    )
+    customer_status = models.ForeignKey(
+        CustomerStatus,
+        on_delete=models.PROTECT,
+        related_name="leads",
+    )
+    source = models.ForeignKey(
+        LeadSource,
+        on_delete=models.PROTECT,
+        related_name="leads",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "ms_crm_leads"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["customer_status"], name="ms_lead_cust_idx"),
+            models.Index(fields=["source"], name="ms_lead_source_idx"),
+            models.Index(fields=["product"], name="ms_lead_product_idx"),
+            models.Index(fields=["product_status"], name="ms_lead_prdstat_idx"),
+            models.Index(fields=["created_at"], name="ms_lead_created_idx"),
+        ]
+
+    def __str__(self):
+        full_name = f"{self.first_name} {self.last_name}".strip()
+        return full_name or self.email
+
+
+class WebFormField(models.Model):
+    FIELD_TYPE_TEXT = "text"
+    FIELD_TYPE_DROPDOWN = "dropdown"
+    FIELD_TYPE_EMAIL = "email"
+    FIELD_TYPE_PHONE = "phone"
+    FIELD_TYPE_NUMBER = "number"
+    FIELD_TYPE_TEXTAREA = "textarea"
+
+    FIELD_TYPE_CHOICES = (
+        (FIELD_TYPE_TEXT, "Text"),
+        (FIELD_TYPE_DROPDOWN, "Dropdown"),
+        (FIELD_TYPE_EMAIL, "Email"),
+        (FIELD_TYPE_PHONE, "Phone"),
+        (FIELD_TYPE_NUMBER, "Number"),
+        (FIELD_TYPE_TEXTAREA, "Textarea"),
+    )
+
+    field_name = models.CharField(max_length=120, unique=True, db_index=True)
+    label = models.CharField(max_length=120, blank=True, default="")
+    field_type = models.CharField(
+        max_length=20,
+        choices=FIELD_TYPE_CHOICES,
+        default=FIELD_TYPE_TEXT,
+    )
+    mapped_field = models.CharField(max_length=60, blank=True, default="dynamic")
+    placeholder = models.CharField(max_length=191, blank=True, default="")
+    is_required = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+    sort_order = models.PositiveIntegerField(default=0)
+    field_options = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        db_table = "ms_web_form_fields"
+        ordering = ["sort_order", "id"]
+
+    def __str__(self):
+        return self.field_name
+
+
+class EmailIntegration(models.Model):
+    email_host = models.CharField(max_length=255, blank=True, default="")
+    email_port = models.PositiveIntegerField(default=993)
+    username = models.CharField(max_length=255, blank=True, default="")
+    password = models.CharField(max_length=255, blank=True, default="")
+    smtp_host = models.CharField(max_length=255, blank=True, default="")
+    smtp_port = models.PositiveIntegerField(default=587)
+    imap_host = models.CharField(max_length=255, blank=True, default="")
+    imap_port = models.PositiveIntegerField(default=993)
+    email_address = models.CharField(max_length=255, blank=True, default="")
+    use_ssl = models.BooleanField(default=True)
+    is_connected = models.BooleanField(default=False)
+    auto_create_leads = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+    last_sync_at = models.DateTimeField(blank=True, null=True)
+
+    class Meta:
+        db_table = "ms_leads_email_integrations"
+        ordering = ["id"]
+
+    def __str__(self):
+        return self.email_address or self.username or f"integration-{self.pk}"
+
+
+class LeadCaptureConfiguration(models.Model):
+    name = models.CharField(max_length=60, unique=True, default="default")
+    is_web_to_lead_enabled = models.BooleanField(default=True)
+    require_api_key = models.BooleanField(default=False)
+    api_key_token = models.CharField(max_length=255, blank=True, default="")
+    default_source = models.CharField(max_length=120, blank=True, default="Website")
+    default_status = models.CharField(max_length=120, blank=True, default="New")
+    default_priority = models.CharField(max_length=30, blank=True, default="medium")
+    default_product = models.CharField(max_length=255, blank=True, default="")
+    default_product_status = models.CharField(max_length=120, blank=True, default="")
+    auto_assign_user = models.CharField(max_length=120, blank=True, default="")
+    auto_assign_team = models.CharField(max_length=120, blank=True, default="")
+    prevent_duplicates = models.BooleanField(default=True)
+    send_notification_email = models.BooleanField(default=False)
+    notification_email = models.CharField(max_length=255, blank=True, default="")
+    send_auto_response = models.BooleanField(default=False)
+    auto_response_subject = models.CharField(max_length=255, blank=True, default="")
+    auto_response_message = models.TextField(blank=True, default="")
+    recaptcha_enabled = models.BooleanField(default=False)
+    recaptcha_site_key = models.CharField(max_length=255, blank=True, default="")
+    recaptcha_secret_key = models.CharField(max_length=255, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "ms_lead_capture_configuration"
+        ordering = ["id"]
+
+    def __str__(self):
+        return self.name

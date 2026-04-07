@@ -53,6 +53,7 @@ from ms_crm_app.models import (
     Goals as LegacyGoals,
     Surveys as LegacySurveys,
     TicketsPipeLog as LegacyTicketsPipeLog,
+    Taskstimers as LegacyTaskTimers,
 )
 from ms_crm_app.helpers.ensure_tables import (
     ensure_project_tables,
@@ -63,6 +64,7 @@ from ms_crm_app.helpers.ensure_tables import (
     ensure_activity_log_table,
     ensure_surveys_table,
     ensure_tickets_pipe_log_table,
+    ensure_finance_created_by_columns,
 )
 from core.utils.activity_log import log_activity, serialize_activity_log
 from .serializers import (
@@ -172,7 +174,7 @@ from .serializers import ContactSerializer
 from .serializers import CreditNoteReminderSerializer, CreditNoteSerializer, CreditNoteTaskSerializer
 from .serializers import ItemGroupSerializer, ItemSerializer
 from .item_master import sync_item_to_master, sync_items_to_master
-from .email_branding import send_branded_email
+from .email_branding import build_module_email_html, send_branded_email
 from .models import Project
 from .serializers import ProjectSerializer
 from django.db.models import Count, Sum, Q
@@ -180,6 +182,7 @@ from django.db.utils import OperationalError, ProgrammingError
 from django.utils.text import slugify
 from .middleware import (
     build_user_access_payload,
+    get_current_db,
     is_super_admin,
     sync_default_permissions,
     user_has_permission,
@@ -188,13 +191,49 @@ from .middleware import (
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def timesheets_overview(request):
-    """
-    Timesheets overview API.
-    The frontend expects a list response from /core_api/timesheets/.
-    Since there is no backing model/table yet, return an empty list to
-    prevent 404/500 errors and allow the UI to show "No timesheets found".
-    """
-    return Response([])
+    from core.middleware import get_current_db
+
+    db = get_current_db()
+    try:
+        queryset = LegacyTaskTimers.objects.using(db).all().order_by("-start_time")
+        queryset = _apply_limit(queryset, request)
+    except (ProgrammingError, OperationalError) as exc:
+        print("Timesheets query failed:", exc)
+        return Response([])
+
+    data = []
+    for index, row in enumerate(queryset, start=1):
+        start_raw = getattr(row, "start_time", None)
+        end_raw = getattr(row, "end_time", None)
+        start_label = str(start_raw or "")
+        end_label = str(end_raw or "")
+
+        worked_hours = 0.0
+        try:
+            if start_label and end_label:
+                start_dt = datetime.fromisoformat(start_label)
+                end_dt = datetime.fromisoformat(end_label)
+                delta = end_dt - start_dt
+                worked_hours = max(0.0, round(delta.total_seconds() / 3600.0, 2))
+        except Exception:
+            worked_hours = 0.0
+
+        date_value = start_label[:10] if start_label else ""
+
+        data.append(
+            {
+                "id": getattr(row, "id", None) or index,
+                "member": str(getattr(row, "staff_id", "") or ""),
+                "project": "",
+                "task": f"Task #{getattr(row, 'task_id', '')}".strip(),
+                "date": date_value,
+                "hours": worked_hours,
+                "billable": bool(getattr(row, "hourly_rate", 0)),
+                "status": "Logged",
+            }
+        )
+
+    return Response(data)
 
 class ApprovedUsersView(APIView):
 
@@ -240,30 +279,8 @@ class ProposalViewSet(ModelViewSet):
 
             print("SENDING MAIL TO:", user.email)  # 👈 Debug print
 
-            # ===== SEND EMAIL =====
-            subject = f"New Proposal Assigned - #{proposal.id}"
-
-            message = f"""
-Hello {user.first_name or user.username},
-
-You have been assigned a new proposal.
-
-Proposal ID: {proposal.id}
-Subject: {proposal.subject}
-Total: ₹{proposal.total}
-
-Please login to CRM to review it.
-
-Regards,
-CRM Team
-            """
-
-            send_branded_email(
-                subject=subject,
-                message=message,
-                to_emails=[user.email],
-                fail_silently=False,
-            )
+            if not send_proposal_assignment_email(proposal, user):
+                raise ValueError("Unable to send proposal assignment email")
 
             return Response(
                 {"message": "Assigned & Email Sent Successfully"}
@@ -563,14 +580,301 @@ class ProjectViewSet(ModelViewSet):
                 return handled
             raise
 
+def _safe_module_records(
+    model,
+    fields,
+    *,
+    order_by="-id",
+    limit=20,
+    filters=None,
+    db_alias=None,
+    include_records=True,
+):
+    queryset = model.objects
+    if db_alias:
+        queryset = queryset.using(db_alias)
+    if filters:
+        queryset = queryset.filter(**filters)
+
+    try:
+        total_count = queryset.count()
+        records = []
+        if include_records:
+            ordered = queryset.order_by(order_by) if order_by else queryset
+            records = list(ordered.values(*fields)[:limit])
+        return {
+            "available": True,
+            "count": total_count,
+            "records": records,
+        }
+    except (ProgrammingError, OperationalError) as exc:
+        print(f"Module records unavailable for {getattr(model, '__name__', model)}: {exc}")
+        return {
+            "available": False,
+            "count": 0,
+            "records": [],
+        }
+
+
+def _safe_decimal_sum(model, field_name, *, filters=None, db_alias=None):
+    queryset = model.objects
+    if db_alias:
+        queryset = queryset.using(db_alias)
+    if filters:
+        queryset = queryset.filter(**filters)
+    try:
+        total = queryset.aggregate(total=Sum(field_name)).get("total")
+    except (ProgrammingError, OperationalError) as exc:
+        print(f"Aggregate sum failed for {getattr(model, '__name__', model)}.{field_name}: {exc}")
+        return Decimal("0")
+
+    if total in (None, ""):
+        return Decimal("0")
+    try:
+        return Decimal(str(total))
+    except (InvalidOperation, ValueError, TypeError):
+        return Decimal("0")
+
+
+def _build_dashboard_modules_payload(*, limit=20, include_records=True, user=None):
+    from core.middleware import get_current_db
+
+    db_alias = get_current_db()
+    for ensure_fn in (
+        ensure_staff_table,
+        ensure_knowledge_base_tables,
+        ensure_announcements_table,
+        ensure_goals_table,
+        ensure_activity_log_table,
+        ensure_surveys_table,
+        ensure_tickets_pipe_log_table,
+    ):
+        try:
+            ensure_fn()
+        except Exception as exc:
+            print(f"Module table ensure failed for {ensure_fn.__name__}: {exc}")
+
+    activity_filters = None
+    if user is not None and getattr(user, "is_authenticated", False):
+        activity_filters = {"user": user}
+
+    modules = {
+        "customers": _safe_module_records(
+            Client,
+            ["id", "company", "phone", "is_active", "created_at"],
+            limit=limit,
+            include_records=include_records,
+        ),
+        "sales": {
+            "proposals": _safe_module_records(
+                Proposal,
+                ["id", "subject", "total", "status", "created_at"],
+                limit=limit,
+                include_records=include_records,
+            ),
+            "estimates": _safe_module_records(
+                Estimate,
+                ["id", "estimate_number", "customer_id", "amount", "status", "date", "expiry_date"],
+                limit=limit,
+                include_records=include_records,
+            ),
+            "invoices": _safe_module_records(
+                Invoice,
+                ["id", "invoice_number", "customer_id", "total_amount", "status", "invoice_date", "due_date"],
+                limit=limit,
+                include_records=include_records,
+            ),
+            "payments": _safe_module_records(
+                InvoicePayment,
+                ["id", "invoice_id", "payment_mode", "transaction_id", "amount", "payment_date"],
+                limit=limit,
+                include_records=include_records,
+            ),
+            "credit_notes": _safe_module_records(
+                CreditNote,
+                ["id", "client_id", "prefix", "number", "total", "status", "date", "datecreated"],
+                limit=limit,
+                include_records=include_records,
+            ),
+            "items": _safe_module_records(
+                Item,
+                ["id", "item_name", "item_code", "description", "rate", "status", "created_at"],
+                limit=limit,
+                include_records=include_records,
+            ),
+        },
+        "expenses": _safe_module_records(
+            Expense,
+            ["id", "name", "category", "amount", "status", "date", "created_at"],
+            limit=limit,
+            include_records=include_records,
+        ),
+        "contracts": _safe_module_records(
+            Contract,
+            ["id", "subject", "customer", "contract_type", "contract_value", "status", "created_at"],
+            limit=limit,
+            include_records=include_records,
+        ),
+        "projects": _safe_module_records(
+            Project,
+            ["id", "name", "client_id", "status", "progress", "total_rate", "start_date", "deadline", "created_at"],
+            limit=limit,
+            include_records=include_records,
+        ),
+        "staff": _safe_module_records(
+            Staff,
+            ["staffid", "firstname", "lastname", "email", "active", "datecreated"],
+            order_by="-staffid",
+            limit=limit,
+            db_alias=db_alias,
+            include_records=include_records,
+        ),
+        "leads": _safe_module_records(
+            Lead,
+            ["id", "name", "email", "phone", "source", "status", "created_at"],
+            limit=limit,
+            include_records=include_records,
+        ),
+        "knowledge_base": {
+            "groups": _safe_module_records(
+                KnowledgeBaseGroups,
+                ["groupid", "name", "description", "active", "group_order"],
+                order_by="-groupid",
+                limit=limit,
+                db_alias=db_alias,
+                include_records=include_records,
+            ),
+            "articles": _safe_module_records(
+                KnowledgeBase,
+                ["articleid", "articlegroup", "subject", "slug", "active", "datecreated"],
+                order_by="-articleid",
+                limit=limit,
+                db_alias=db_alias,
+                include_records=include_records,
+            ),
+        },
+        "support": {
+            "ticket_pipe_log": _safe_module_records(
+                LegacyTicketsPipeLog,
+                ["id", "date", "subject", "name", "email", "status", "email_to", "group_name"],
+                order_by="-date",
+                limit=limit,
+                db_alias=db_alias,
+                include_records=include_records,
+            ),
+        },
+        "utilities": {
+            "media": {
+                "available": True,
+                "count": len(MEDIA_FILES),
+                "records": MEDIA_FILES[:limit] if include_records else [],
+            },
+            "email_campaign": _safe_module_records(
+                EmailCampaign,
+                ["id", "subject", "created_at"],
+                limit=limit,
+                include_records=include_records,
+            ),
+            "calendar": _safe_module_records(
+                CalendarEvent,
+                ["id", "title", "date", "color"],
+                order_by="-date",
+                limit=limit,
+                include_records=include_records,
+            ),
+            "announcements": _safe_module_records(
+                LegacyAnnouncements,
+                ["announcementid", "name", "message", "dateadded", "userid", "showtousers", "showtostaff"],
+                order_by="-announcementid",
+                limit=limit,
+                db_alias=db_alias,
+                include_records=include_records,
+            ),
+            "goals": _safe_module_records(
+                LegacyGoals,
+                ["id", "subject", "start_date", "end_date", "achievement", "staff_id", "notified"],
+                order_by="-end_date",
+                limit=limit,
+                db_alias=db_alias,
+                include_records=include_records,
+            ),
+            "activity_log": _safe_module_records(
+                CoreActivityLog,
+                ["id", "description", "user_id", "created_at"],
+                order_by="-created_at",
+                limit=limit,
+                filters=activity_filters,
+                include_records=include_records,
+            ),
+            "surveys": _safe_module_records(
+                LegacySurveys,
+                ["surveyid", "subject", "description", "datecreated", "active", "send", "slug"],
+                order_by="-surveyid",
+                limit=limit,
+                db_alias=db_alias,
+                include_records=include_records,
+            ),
+            "ticket_pipe_log": _safe_module_records(
+                LegacyTicketsPipeLog,
+                ["id", "date", "subject", "name", "email", "status", "email_to", "group_name"],
+                order_by="-date",
+                limit=limit,
+                db_alias=db_alias,
+                include_records=include_records,
+            ),
+        },
+    }
+
+    try:
+        backups = _load_backup_history_if_needed()
+    except Exception as exc:
+        print("Database backup history load failed:", exc)
+        backups = []
+
+    modules["utilities"]["database_backup"] = {
+        "available": True,
+        "count": len(backups),
+        "records": backups[:limit] if include_records else [],
+    }
+
+    return modules
+
+
 class SmallStatsView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        modules = _build_dashboard_modules_payload(
+            limit=1,
+            include_records=False,
+            user=getattr(request, "user", None),
+        )
+        sales_block = modules.get("sales", {})
+
+        sales_total = (
+            int(sales_block.get("proposals", {}).get("count", 0))
+            + int(sales_block.get("estimates", {}).get("count", 0))
+            + int(sales_block.get("invoices", {}).get("count", 0))
+        )
+        tasks_total = (
+            _safe_module_records(ContractTask, ["id"], include_records=False).get("count", 0)
+            + _safe_module_records(InvoiceTask, ["id"], include_records=False).get("count", 0)
+            + _safe_module_records(CreditNoteTask, ["id"], include_records=False).get("count", 0)
+        )
+        revenue_total = _safe_decimal_sum(InvoicePayment, "amount")
+
+        try:
+            active_users = User.objects.filter(is_active=True).count()
+        except Exception:
+            active_users = User.objects.count()
+
         data = {
-            "users": 10,
-            "sales": 25,
-            "revenue": 50000,
+            "users": int(active_users),
+            "sales": int(sales_total),
+            "revenue": float(revenue_total),
+            "leads": int(modules.get("leads", {}).get("count", 0)),
+            "projects": int(modules.get("projects", {}).get("count", 0)),
+            "tasks": int(tasks_total),
         }
         return Response(data)
 
@@ -1186,32 +1490,19 @@ def send_proposal_assignment_email(proposal, user):
         frontend_url = f"http://localhost:3000/sales/proposals/{proposal.id}"
         subject = f"New Proposal Assigned - #{proposal.id}"
 
-        html_content = f"""
-<h3 style="margin:0 0 10px 0;color:#0f172a;">New Proposal Assigned</h3>
-<p>Hello <strong>{user.first_name or user.username}</strong>,</p>
-<p>You have been assigned a new proposal. Details are below:</p>
-<table style="width:100%; border-collapse: collapse; margin-top:15px;">
-    <tr>
-        <td style="padding:8px; border:1px solid #d1d5db;"><strong>Proposal ID</strong></td>
-        <td style="padding:8px; border:1px solid #d1d5db;">#{proposal.id}</td>
-    </tr>
-    <tr>
-        <td style="padding:8px; border:1px solid #d1d5db;"><strong>Subject</strong></td>
-        <td style="padding:8px; border:1px solid #d1d5db;">{getattr(proposal, 'subject', 'N/A')}</td>
-    </tr>
-    <tr>
-        <td style="padding:8px; border:1px solid #d1d5db;"><strong>Total</strong></td>
-        <td style="padding:8px; border:1px solid #d1d5db;">{getattr(proposal, 'total', '0')}</td>
-    </tr>
-</table>
-<div style="text-align:center; margin-top:25px;">
-    <a href="{frontend_url}" 
-       style="background:#27ae60; color:#ffffff; padding:12px 25px; text-decoration:none; border-radius:5px; display:inline-block;">
-       View Proposal
-    </a>
-</div>
-<p style="margin-top:24px;">Regards,<br/><strong>Magnyte Solution CRM Team</strong></p>
-"""
+        html_content = build_module_email_html(
+            title="New Proposal Assigned",
+            greeting=user.first_name or user.username or recipient,
+            intro="You have been assigned a new proposal. Details are below:",
+            details=[
+                ("Proposal ID", f"#{proposal.id}"),
+                ("Subject", getattr(proposal, "subject", "N/A")),
+                ("Total", f"₹{getattr(proposal, 'total', '0')}"),
+            ],
+            cta_label="View Proposal",
+            cta_url=frontend_url,
+            closing="Regards,<br/><strong>Magnyte Solution CRM Team</strong>",
+        )
 
         text_content = strip_tags(html_content)
         send_branded_email(
@@ -1345,19 +1636,36 @@ def users_list(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def dashboard_overview(request):
-
-    total_proposals = Proposal.objects.count()
-    total_users = User.objects.count()
+    modules = _build_dashboard_modules_payload(
+        limit=1,
+        include_records=False,
+        user=getattr(request, "user", None),
+    )
+    sales_block = modules.get("sales", {})
+    kb_block = modules.get("knowledge_base", {})
+    support_block = modules.get("support", {})
+    utilities_block = modules.get("utilities", {})
 
     data = [
-        {
-            "title": "Total Proposals",
-            "value": total_proposals
-        },
-        {
-            "title": "Total Users",
-            "value": total_users
-        }
+        {"title": "Customers", "slug": "customers", "value": modules.get("customers", {}).get("count", 0), "available": modules.get("customers", {}).get("available", False)},
+        {"title": "Proposals", "slug": "sales-proposals", "value": sales_block.get("proposals", {}).get("count", 0), "available": sales_block.get("proposals", {}).get("available", False)},
+        {"title": "Estimates", "slug": "sales-estimates", "value": sales_block.get("estimates", {}).get("count", 0), "available": sales_block.get("estimates", {}).get("available", False)},
+        {"title": "Invoices", "slug": "sales-invoices", "value": sales_block.get("invoices", {}).get("count", 0), "available": sales_block.get("invoices", {}).get("available", False)},
+        {"title": "Payments", "slug": "sales-payments", "value": sales_block.get("payments", {}).get("count", 0), "available": sales_block.get("payments", {}).get("available", False)},
+        {"title": "Credit Notes", "slug": "sales-credit-notes", "value": sales_block.get("credit_notes", {}).get("count", 0), "available": sales_block.get("credit_notes", {}).get("available", False)},
+        {"title": "Items", "slug": "sales-items", "value": sales_block.get("items", {}).get("count", 0), "available": sales_block.get("items", {}).get("available", False)},
+        {"title": "Expenses", "slug": "expenses", "value": modules.get("expenses", {}).get("count", 0), "available": modules.get("expenses", {}).get("available", False)},
+        {"title": "Contracts", "slug": "contracts", "value": modules.get("contracts", {}).get("count", 0), "available": modules.get("contracts", {}).get("available", False)},
+        {"title": "Projects", "slug": "projects", "value": modules.get("projects", {}).get("count", 0), "available": modules.get("projects", {}).get("available", False)},
+        {"title": "Staff", "slug": "staff", "value": modules.get("staff", {}).get("count", 0), "available": modules.get("staff", {}).get("available", False)},
+        {"title": "Leads", "slug": "leads", "value": modules.get("leads", {}).get("count", 0), "available": modules.get("leads", {}).get("available", False)},
+        {"title": "Knowledge Base Groups", "slug": "knowledge-base-groups", "value": kb_block.get("groups", {}).get("count", 0), "available": kb_block.get("groups", {}).get("available", False)},
+        {"title": "Knowledge Base Articles", "slug": "knowledge-base-articles", "value": kb_block.get("articles", {}).get("count", 0), "available": kb_block.get("articles", {}).get("available", False)},
+        {"title": "Support Tickets Pipe Log", "slug": "support-ticket-pipe-log", "value": support_block.get("ticket_pipe_log", {}).get("count", 0), "available": support_block.get("ticket_pipe_log", {}).get("available", False)},
+        {"title": "Announcements", "slug": "utilities-announcements", "value": utilities_block.get("announcements", {}).get("count", 0), "available": utilities_block.get("announcements", {}).get("available", False)},
+        {"title": "Goals", "slug": "utilities-goals", "value": utilities_block.get("goals", {}).get("count", 0), "available": utilities_block.get("goals", {}).get("available", False)},
+        {"title": "Surveys", "slug": "utilities-surveys", "value": utilities_block.get("surveys", {}).get("count", 0), "available": utilities_block.get("surveys", {}).get("available", False)},
+        {"title": "Database Backups", "slug": "utilities-database-backups", "value": utilities_block.get("database_backup", {}).get("count", 0), "available": utilities_block.get("database_backup", {}).get("available", False)},
     ]
 
     return Response(data)
@@ -1365,11 +1673,24 @@ def dashboard_overview(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def small_stats(request):
+    modules = _build_dashboard_modules_payload(
+        limit=1,
+        include_records=False,
+        user=getattr(request, "user", None),
+    )
+    sales_block = modules.get("sales", {})
+    sales_total = (
+        int(sales_block.get("proposals", {}).get("count", 0))
+        + int(sales_block.get("estimates", {}).get("count", 0))
+        + int(sales_block.get("invoices", {}).get("count", 0))
+    )
+    revenue_total = _safe_decimal_sum(InvoicePayment, "amount")
+
     data = [
-        {"title": "Total Sales", "val": "₹0", "pct": 0, "color": "#28a745"},
-        {"title": "Total Leads", "val": "0", "pct": 0, "color": "#17a2b8"},
-        {"title": "Projects", "val": "0", "pct": 0, "color": "#ffc107"},
-        {"title": "Tasks", "val": "0", "pct": 0, "color": "#dc3545"},
+        {"title": "Total Sales", "val": str(sales_total), "pct": min(100, sales_total), "color": "#28a745"},
+        {"title": "Total Leads", "val": str(modules.get("leads", {}).get("count", 0)), "pct": min(100, int(modules.get("leads", {}).get("count", 0))), "color": "#17a2b8"},
+        {"title": "Projects", "val": str(modules.get("projects", {}).get("count", 0)), "pct": min(100, int(modules.get("projects", {}).get("count", 0))), "color": "#ffc107"},
+        {"title": "Revenue", "val": f"{float(revenue_total):.2f}", "pct": 100 if revenue_total > 0 else 0, "color": "#dc3545"},
     ]
     return Response(data)
 
@@ -1377,20 +1698,58 @@ def small_stats(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def leads_overview(request):
+    try:
+        status_rows = (
+            Lead.objects.values("status")
+            .annotate(total=Count("id"))
+            .order_by("status")
+        )
+    except (ProgrammingError, OperationalError) as exc:
+        print("Leads overview query failed:", exc)
+        status_rows = []
+
+    palette = ["#007bff", "#28a745", "#ffc107", "#dc3545", "#17a2b8", "#6f42c1"]
+    labels = []
+    data = []
+    colors = []
+    for index, row in enumerate(status_rows):
+        labels.append(str(row.get("status") or "Unknown"))
+        data.append(int(row.get("total") or 0))
+        colors.append(palette[index % len(palette)])
+
     return Response({
-        "labels": ["New", "Contacted", "Qualified"],
-        "data": [5, 3, 2],
-        "colors": ["#007bff", "#28a745", "#ffc107"]
+        "labels": labels,
+        "data": data,
+        "colors": colors
     })
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def project_status(request):
+    try:
+        status_rows = (
+            Project.objects.values("status")
+            .annotate(total=Count("id"))
+            .order_by("status")
+        )
+    except (ProgrammingError, OperationalError) as exc:
+        print("Project status query failed:", exc)
+        status_rows = []
+
+    palette = ["#dc3545", "#28a745", "#ffc107", "#17a2b8", "#6f42c1", "#0d6efd"]
+    labels = []
+    data = []
+    colors = []
+    for index, row in enumerate(status_rows):
+        labels.append(str(row.get("status") or "Unknown"))
+        data.append(int(row.get("total") or 0))
+        colors.append(palette[index % len(palette)])
+
     return Response({
-        "labels": ["Pending", "Completed"],
-        "data": [4, 6],
-        "colors": ["#dc3545", "#28a745"]
+        "labels": labels,
+        "data": data,
+        "colors": colors
     })
 
 
@@ -1402,17 +1761,20 @@ def weekly_payments(request):
     days = [start_date + timedelta(days=offset) for offset in range(7)]
     totals = {day: 0.0 for day in days}
 
-    payments = InvoicePayment.objects.filter(payment_date__range=(start_date, today))
-    for payment in payments:
-        pay_date = payment.payment_date
-        if isinstance(pay_date, datetime):
-            pay_date = pay_date.date()
-        if pay_date in totals:
-            try:
-                amount = float(payment.amount or 0)
-            except (TypeError, ValueError):
-                amount = 0.0
-            totals[pay_date] += amount
+    try:
+        payments = InvoicePayment.objects.filter(payment_date__range=(start_date, today))
+        for payment in payments:
+            pay_date = payment.payment_date
+            if isinstance(pay_date, datetime):
+                pay_date = pay_date.date()
+            if pay_date in totals:
+                try:
+                    amount = float(payment.amount or 0)
+                except (TypeError, ValueError):
+                    amount = 0.0
+                totals[pay_date] += amount
+    except (ProgrammingError, OperationalError) as exc:
+        print("Weekly payments query failed:", exc)
 
     labels = [day.strftime("%a") for day in days]
     data = [round(totals[day], 2) for day in days]
@@ -1427,23 +1789,132 @@ def weekly_payments(request):
         ]
     })
 
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def dashboard_activity(request):
-    return Response([
+    def infer_status(text_value):
+        lowered = str(text_value or "").lower()
+        if "delete" in lowered or "removed" in lowered:
+            return "Deleted"
+        if "update" in lowered or "changed" in lowered:
+            return "Updated"
+        if "create" in lowered or "added" in lowered:
+            return "Created"
+        if "paid" in lowered or "payment" in lowered:
+            return "Paid"
+        return "Activity"
+
+    data = []
+    user = getattr(request, "user", None)
+
+    try:
+        core_logs = CoreActivityLog.objects.all()
+        if user is not None and getattr(user, "is_authenticated", False):
+            core_logs = core_logs.filter(Q(user=user) | Q(user__isnull=True))
+        core_logs = core_logs.order_by("-created_at")[:10]
+        for row in core_logs:
+            created_at = getattr(row, "created_at", None)
+            if created_at is not None:
+                try:
+                    created_at = timezone.localtime(created_at)
+                    time_label = created_at.strftime("%I:%M %p")
+                except Exception:
+                    time_label = str(created_at)
+            else:
+                time_label = "-"
+            text_value = getattr(row, "description", "") or ""
+            data.append(
+                {
+                    "time": time_label,
+                    "text": text_value,
+                    "project": "CRM",
+                    "status": infer_status(text_value),
+                }
+            )
+    except (ProgrammingError, OperationalError) as exc:
+        print("Dashboard core activity query failed:", exc)
+
+    if data:
+        return Response(data)
+
+    from core.middleware import get_current_db
+
+    db_alias = get_current_db()
+    candidate_staff_ids = []
+    if user is not None:
+        candidate_staff_ids.extend(
+            [
+                str(getattr(user, "id", "")).strip(),
+                str(getattr(user, "username", "")).strip(),
+                str(getattr(user, "email", "")).strip(),
+                str(getattr(user, "get_full_name", lambda: "")()).strip(),
+            ]
+        )
+    candidate_staff_ids = [value for value in candidate_staff_ids if value]
+
+    try:
+        legacy_logs = LegacyActivityLog.objects.using(db_alias).all()
+        if candidate_staff_ids:
+            legacy_filter = Q()
+            for value in candidate_staff_ids:
+                legacy_filter |= Q(staff_name__iexact=value)
+            legacy_logs = legacy_logs.filter(legacy_filter)
+        else:
+            legacy_logs = legacy_logs.none()
+
+        legacy_logs = legacy_logs.order_by("-date")[:10]
+        for row in legacy_logs:
+            date_value = getattr(row, "date", None)
+            if date_value is not None:
+                try:
+                    date_value = timezone.localtime(date_value)
+                    time_label = date_value.strftime("%I:%M %p")
+                except Exception:
+                    time_label = str(date_value)
+            else:
+                time_label = "-"
+            text_value = getattr(row, "description", "") or ""
+            data.append(
+                {
+                    "time": time_label,
+                    "text": text_value,
+                    "project": "CRM",
+                    "status": infer_status(text_value),
+                }
+            )
+    except (ProgrammingError, OperationalError) as exc:
+        print("Dashboard legacy activity query failed:", exc)
+
+    return Response(data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def dashboard_module_records(request):
+    limit_param = request.query_params.get("limit", 20)
+    include_records_raw = str(request.query_params.get("include_records", "1")).strip().lower()
+    include_records = include_records_raw in {"1", "true", "yes", "y"}
+
+    try:
+        limit = int(limit_param)
+    except (TypeError, ValueError):
+        limit = 20
+    limit = max(1, min(limit, 200))
+
+    modules = _build_dashboard_modules_payload(
+        limit=limit,
+        include_records=include_records,
+        user=getattr(request, "user", None),
+    )
+    return Response(
         {
-            "time": "10:30 AM",
-            "text": "New proposal created",
-            "project": "Website Development",
-            "status": "New",
-        },
-        {
-            "time": "12:15 PM",
-            "text": "Lead converted",
-            "project": "CRM System",
-            "status": "Completed",
-        },
-    ])
+            "generated_at": timezone.now(),
+            "limit": limit,
+            "include_records": include_records,
+            "modules": modules,
+        }
+    )
 
 # =========================Customer API=========================
 class ClientViewSet(viewsets.ModelViewSet):
@@ -1718,10 +2189,15 @@ def invoice_detail(request, pk):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def invoice_reminders(request, pk):
+    invoice = Invoice.objects.filter(pk=pk).first()
+    if not invoice:
+        return Response({"error": "Invoice not found"}, status=404)
+
+    ensure_finance_created_by_columns()
 
     if request.method == "GET":
 
-        reminders = InvoiceReminder.objects.filter(invoice_id=pk)
+        reminders = InvoiceReminder.objects.filter(invoice_id=pk).order_by("-created_at", "-id")
 
         serializer = InvoiceReminderSerializer(reminders, many=True)
 
@@ -1737,8 +2213,12 @@ def invoice_reminders(request, pk):
         serializer = InvoiceReminderSerializer(data=data)
 
         if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data, status=201)
+            reminder = serializer.save(created_by=_user_display(getattr(request, "user", None)))
+            log_activity(
+                f"Invoice Reminder Created [Invoice No: {invoice.invoice_number}]",
+                user=getattr(request, "user", None),
+            )
+            return Response(InvoiceReminderSerializer(reminder).data, status=201)
 
         return Response(serializer.errors, status=400)
 
@@ -1748,10 +2228,15 @@ def invoice_reminders(request, pk):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def invoice_tasks(request, pk):
+    invoice = Invoice.objects.filter(pk=pk).first()
+    if not invoice:
+        return Response({"error": "Invoice not found"}, status=404)
+
+    ensure_finance_created_by_columns()
 
     if request.method == "GET":
 
-        tasks = InvoiceTask.objects.filter(invoice_id=pk)
+        tasks = InvoiceTask.objects.filter(invoice_id=pk).order_by("-created_at", "-id")
 
         serializer = InvoiceTaskSerializer(tasks, many=True)
 
@@ -1767,10 +2252,36 @@ def invoice_tasks(request, pk):
         serializer = InvoiceTaskSerializer(data=data)
 
         if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data, status=201)
+            task = serializer.save(created_by=_user_display(getattr(request, "user", None)))
+            log_activity(
+                f"Invoice Task Created [Invoice No: {invoice.invoice_number}]",
+                user=getattr(request, "user", None),
+            )
+            return Response(InvoiceTaskSerializer(task).data, status=201)
 
         return Response(serializer.errors, status=400)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def invoice_activity(request, pk):
+    invoice = Invoice.objects.filter(pk=pk).first()
+    if not invoice:
+        return Response({"error": "Invoice not found"}, status=404)
+
+    invoice_number = str(getattr(invoice, "invoice_number", "") or "").strip()
+    if not invoice_number:
+        return Response([])
+
+    try:
+        queryset = CoreActivityLog.objects.filter(
+            description__icontains=f"Invoice No: {invoice_number}"
+        ).order_by("-created_at", "-id")
+        queryset = _apply_limit(queryset, request)
+        return Response([serialize_activity_log(log) for log in queryset])
+    except (ProgrammingError, OperationalError) as exc:
+        print("Invoice activity query failed:", exc)
+        return Response([])
 
 # ====================== send invoice email ====================================
 @api_view(["POST"])
@@ -1806,6 +2317,10 @@ def send_invoice_email(request):
             invoice=invoice,
             email=email,
             message=message
+        )
+        log_activity(
+            f"Invoice Email Sent [Invoice No: {invoice.invoice_number} | To: {email}]",
+            user=getattr(request, "user", None),
         )
 
         print("EMAIL LOG SAVED:", log.id)
@@ -2122,11 +2637,109 @@ def toggle_client_active(request, pk):
 
 
 def get_contacts_db_alias():
-    return "default"
+    try:
+        return get_current_db()
+    except Exception:
+        return "default"
 
 
-def _serialize_contact(contact):
-    return {
+CONTACT_BASE_FIELDS = (
+    "id",
+    "is_primary",
+    "firstname",
+    "lastname",
+    "email",
+    "phonenumber",
+    "title",
+    "password",
+    "last_login",
+    "active",
+    "direction",
+    "invoice_emails",
+    "estimate_emails",
+    "credit_note_emails",
+    "contract_emails",
+    "task_emails",
+    "project_emails",
+    "ticket_emails",
+    "company",
+    "created_at",
+)
+
+CONTACT_ADDRESS_FIELDS = (
+    "street",
+    "city",
+    "state",
+    "zip_code",
+    "country",
+)
+
+
+def _safe_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(int(value))
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off", ""}:
+            return False
+    return bool(value)
+
+
+def _existing_contact_columns(db_alias):
+    connection = connections[db_alias]
+    table_name = Contact._meta.db_table
+    with connection.cursor() as cursor:
+        description = connection.introspection.get_table_description(cursor, table_name)
+    return {getattr(column, "name", column[0]) for column in description}
+
+
+def _available_contact_address_fields(db_alias):
+    try:
+        existing_columns = _existing_contact_columns(db_alias)
+    except Exception:
+        return tuple()
+
+    available = []
+    for field_name in CONTACT_ADDRESS_FIELDS:
+        field = Contact._meta.get_field(field_name)
+        if field.column in existing_columns:
+            available.append(field_name)
+    return tuple(available)
+
+
+def _ensure_contact_address_columns(db_alias):
+    connection = connections[db_alias]
+    table_name = Contact._meta.db_table
+    if table_name not in set(connection.introspection.table_names()):
+        return
+
+    existing_columns = _existing_contact_columns(db_alias)
+    missing_fields = []
+    for field_name in CONTACT_ADDRESS_FIELDS:
+        field = Contact._meta.get_field(field_name)
+        if field.column not in existing_columns:
+            missing_fields.append(field_name)
+
+    if not missing_fields:
+        return
+
+    with connection.schema_editor() as schema_editor:
+        for field_name in missing_fields:
+            schema_editor.add_field(Contact, Contact._meta.get_field(field_name))
+
+
+def _contact_select_fields(address_fields):
+    return (*CONTACT_BASE_FIELDS, *tuple(address_fields))
+
+
+def _serialize_contact(contact, address_fields=()):
+    payload = {
         "id": contact.id,
         "userid": None,
         "is_primary": int(contact.is_primary),
@@ -2149,17 +2762,25 @@ def _serialize_contact(contact):
         "ticket_emails": int(contact.ticket_emails),
         "company": contact.company or "-",
     }
+    available_address = set(address_fields)
+    payload["street"] = getattr(contact, "street", "") if "street" in available_address else ""
+    payload["city"] = getattr(contact, "city", "") if "city" in available_address else ""
+    payload["state"] = getattr(contact, "state", "") if "state" in available_address else ""
+    payload["zip_code"] = getattr(contact, "zip_code", "") if "zip_code" in available_address else ""
+    payload["country"] = getattr(contact, "country", "") if "country" in available_address else ""
+    return payload
 
 
-def _get_or_create_client(company_name, phonenumber=""):
+def _get_or_create_client(company_name, phonenumber="", db_alias=None):
     if not company_name:
         return None
 
-    client = Client.objects.filter(company__iexact=company_name).first()
+    alias = db_alias or get_contacts_db_alias()
+    client = Client.objects.using(alias).filter(company__iexact=company_name).first()
     if client:
         return client
 
-    return Client.objects.create(
+    return Client.objects.using(alias).create(
         company=company_name,
         phone=phonenumber or "",
         country="",
@@ -2187,45 +2808,33 @@ def contacts_list_create(request):
     include the missing columns in the SELECT statement, preventing the error
     while keeping the existing behaviour intact.
     """
+    db_alias = get_contacts_db_alias()
+    try:
+        _ensure_contact_address_columns(db_alias)
+    except Exception:
+        # Keep legacy environments operational even when schema auto-repair fails.
+        pass
+    address_fields = _available_contact_address_fields(db_alias)
+    select_fields = _contact_select_fields(address_fields)
+
     if request.method == "GET":
-        # Explicitly fetch only the fields that ``_serialize_contact`` needs.
-        # This guards against missing address columns in the database.
         contacts = (
-            Contact.objects.only(
-                "id",
-                "is_primary",
-                "firstname",
-                "lastname",
-                "email",
-                "phonenumber",
-                "title",
-                "password",
-                "last_login",
-                "active",
-                "direction",
-                "invoice_emails",
-                "estimate_emails",
-                "credit_note_emails",
-                "contract_emails",
-                "task_emails",
-                "project_emails",
-                "ticket_emails",
-                "company",
-                "created_at",
-            )
+            Contact.objects.using(db_alias)
+            .only(*select_fields)
             .order_by("-created_at", "-id")
         )
-        return Response([_serialize_contact(contact) for contact in contacts])
+        return Response([_serialize_contact(contact, address_fields) for contact in contacts])
 
     data = request.data
     company_name = (data.get("company") or "").strip()
     client = _get_or_create_client(
         company_name,
         data.get("phonenumber") or "",
+        db_alias=db_alias,
     )
 
-    contact = Contact.objects.create(
-        is_primary=bool(int(data.get("is_primary", 0) or 0)),
+    create_payload = dict(
+        is_primary=_safe_bool(data.get("is_primary", 0)),
         firstname=data.get("firstname", "").strip(),
         lastname=data.get("lastname", "").strip(),
         email=data.get("email", "").strip(),
@@ -2234,44 +2843,63 @@ def contacts_list_create(request):
         title=data.get("title") or "",
         password=data.get("password") or "",
         last_login=timezone.now(),
-        active=bool(int(data.get("active", 1) or 1)),
+        active=_safe_bool(data.get("active", 1), default=True),
         direction=data.get("direction") or None,
-        invoice_emails=bool(int(data.get("invoice_emails", 0) or 0)),
-        estimate_emails=bool(int(data.get("estimate_emails", 0) or 0)),
-        credit_note_emails=bool(int(data.get("credit_note_emails", 0) or 0)),
-        contract_emails=bool(int(data.get("contract_emails", 0) or 0)),
-        task_emails=bool(int(data.get("task_emails", 0) or 0)),
-        project_emails=bool(int(data.get("project_emails", 0) or 0)),
-        ticket_emails=bool(int(data.get("ticket_emails", 0) or 0)),
+        invoice_emails=_safe_bool(data.get("invoice_emails", 0)),
+        estimate_emails=_safe_bool(data.get("estimate_emails", 0)),
+        credit_note_emails=_safe_bool(data.get("credit_note_emails", 0)),
+        contract_emails=_safe_bool(data.get("contract_emails", 0)),
+        task_emails=_safe_bool(data.get("task_emails", 0)),
+        project_emails=_safe_bool(data.get("project_emails", 0)),
+        ticket_emails=_safe_bool(data.get("ticket_emails", 0)),
     )
+    for field_name in address_fields:
+        create_payload[field_name] = (data.get(field_name) or "").strip()
 
-    return Response(_serialize_contact(contact), status=status.HTTP_201_CREATED)
+    contact = Contact.objects.using(db_alias).create(**create_payload)
+    contact = Contact.objects.using(db_alias).only(*select_fields).get(pk=contact.pk)
+
+    return Response(_serialize_contact(contact, address_fields), status=status.HTTP_201_CREATED)
 
 
 @api_view(["GET", "PATCH", "PUT", "DELETE"])
 @permission_classes([IsAuthenticated])
 def contacts_detail(request, pk):
+    db_alias = get_contacts_db_alias()
     try:
-        contact = Contact.objects.get(pk=pk)
-    except Contact.DoesNotExist:
+        _ensure_contact_address_columns(db_alias)
+    except Exception:
+        pass
+    address_fields = _available_contact_address_fields(db_alias)
+    select_fields = _contact_select_fields(address_fields)
+
+    contact = (
+        Contact.objects.using(db_alias)
+        .only(*select_fields)
+        .filter(pk=pk)
+        .first()
+    )
+    if not contact:
         return Response({"error": "Contact not found"}, status=404)
 
     if request.method == "GET":
-        return Response(_serialize_contact(contact))
+        return Response(_serialize_contact(contact, address_fields))
 
     if request.method == "DELETE":
-        contact.delete()
+        Contact.objects.using(db_alias).filter(pk=pk).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     data = request.data
+    updates = {}
 
     if "company" in data:
         company_name = (data.get("company") or "").strip()
         client = _get_or_create_client(
             company_name,
             data.get("phonenumber") or contact.phonenumber,
+            db_alias=db_alias,
         )
-        contact.company = company_name or (client.company if client else contact.company)
+        updates["company"] = company_name or (client.company if client else contact.company)
 
     updatable_fields = {
         "is_primary": bool,
@@ -2292,22 +2920,34 @@ def contacts_detail(request, pk):
         "project_emails": bool,
         "ticket_emails": bool,
     }
+    for field_name in address_fields:
+        updatable_fields[field_name] = str
 
     for field, caster in updatable_fields.items():
         if field in data:
             raw_value = data.get(field)
             if raw_value is None:
-                setattr(contact, field, None)
+                updates[field] = None
             elif caster is bool:
-                setattr(contact, field, bool(int(raw_value)))
+                updates[field] = _safe_bool(raw_value)
             else:
-                setattr(contact, field, raw_value)
+                updates[field] = str(raw_value).strip()
 
     if "last_login" in data and data.get("last_login"):
-        contact.last_login = data.get("last_login")
+        updates["last_login"] = data.get("last_login")
 
-    contact.save()
-    return Response(_serialize_contact(contact))
+    if updates:
+        Contact.objects.using(db_alias).filter(pk=pk).update(**updates)
+
+    refreshed_contact = (
+        Contact.objects.using(db_alias)
+        .only(*select_fields)
+        .filter(pk=pk)
+        .first()
+    )
+    if not refreshed_contact:
+        return Response({"error": "Contact not found"}, status=404)
+    return Response(_serialize_contact(refreshed_contact, address_fields))
 
 
 # ================= STAFF API =================
@@ -2702,16 +3342,24 @@ def creditnote_detail(request, pk):
 @permission_classes([IsAuthenticated])
 def creditnote_reminders(request, pk):
     if request.method == "GET":
-        reminders = CreditNoteReminder.objects.using("default").filter(credit_note_id=pk)
+        reminders = CreditNoteReminder.objects.using("default").filter(credit_note_id=pk).order_by("-created_at", "-id")
         serializer = CreditNoteReminderSerializer(reminders, many=True)
         return Response(serializer.data)
+
+    credit_note = CreditNote.objects.using("default").filter(pk=pk).first()
+    if not credit_note:
+        return Response({"error": "Credit note not found"}, status=404)
 
     serializer = CreditNoteReminderSerializer(
         data={**request.data, "credit_note": pk}
     )
     if serializer.is_valid():
-        serializer.save()
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        reminder = serializer.save(created_by=_user_display(getattr(request, "user", None)))
+        log_activity(
+            f"Credit Note Reminder Created [Credit Note: {credit_note.prefix}{credit_note.number}]",
+            user=getattr(request, "user", None),
+        )
+        return Response(CreditNoteReminderSerializer(reminder).data, status=status.HTTP_201_CREATED)
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
@@ -2719,17 +3367,45 @@ def creditnote_reminders(request, pk):
 @permission_classes([IsAuthenticated])
 def creditnote_tasks(request, pk):
     if request.method == "GET":
-        tasks = CreditNoteTask.objects.using("default").filter(credit_note_id=pk)
+        tasks = CreditNoteTask.objects.using("default").filter(credit_note_id=pk).order_by("-created_at", "-id")
         serializer = CreditNoteTaskSerializer(tasks, many=True)
         return Response(serializer.data)
+
+    credit_note = CreditNote.objects.using("default").filter(pk=pk).first()
+    if not credit_note:
+        return Response({"error": "Credit note not found"}, status=404)
 
     serializer = CreditNoteTaskSerializer(
         data={**request.data, "credit_note": pk}
     )
     if serializer.is_valid():
-        serializer.save()
-    return Response(serializer.data, status=status.HTTP_201_CREATED)
+        task = serializer.save(created_by=_user_display(getattr(request, "user", None)))
+        log_activity(
+            f"Credit Note Task Created [Credit Note: {credit_note.prefix}{credit_note.number}]",
+            user=getattr(request, "user", None),
+        )
+        return Response(CreditNoteTaskSerializer(task).data, status=status.HTTP_201_CREATED)
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def creditnote_activity(request, pk):
+    credit_note = CreditNote.objects.using("default").filter(pk=pk).first()
+    if not credit_note:
+        return Response({"error": "Credit note not found"}, status=404)
+
+    credit_number = f"{credit_note.prefix}{credit_note.number}"
+
+    try:
+        queryset = CoreActivityLog.objects.filter(
+            description__icontains=f"Credit Note: {credit_number}"
+        ).order_by("-created_at", "-id")
+        queryset = _apply_limit(queryset, request)
+        return Response([serialize_activity_log(log) for log in queryset])
+    except (ProgrammingError, OperationalError) as exc:
+        print("Credit note activity query failed:", exc)
+        return Response([])
 
 
 # ========================= MEDIA FILE API =========================
@@ -3947,11 +4623,11 @@ def _backup_storage_dir():
 
 def _load_backup_history_if_needed():
     if BACKUP_HISTORY:
-        return
+        return BACKUP_HISTORY
 
     backup_dir = _backup_storage_dir()
     if not os.path.isdir(backup_dir):
-        return
+        return BACKUP_HISTORY
 
     groups = {}
     for entry in os.listdir(backup_dir):
@@ -3969,7 +4645,7 @@ def _load_backup_history_if_needed():
             group["pdf"] = path
 
     if not groups:
-        return
+        return BACKUP_HISTORY
 
     def group_mtime(group):
         times = [os.path.getmtime(p) for p in group.values() if p]
@@ -4003,6 +4679,7 @@ def _load_backup_history_if_needed():
 
     BACKUP_HISTORY.extend(records)
     BACKUP_ID_COUNTER[0] = max(BACKUP_ID_COUNTER[0], len(BACKUP_HISTORY))
+    return BACKUP_HISTORY
 
 
 def _safe_backup_filename(raw_name, fallback):
@@ -4308,12 +4985,20 @@ from .serializers import (
 
 DEFAULT_SETUP_MODULES = [
     {
+        "name": "Dashboard",
+        "slug": "dashboard",
+        "description": "Main dashboard overview with quick stats and activity widgets.",
+        "route": "/dashboard",
+        "icon": "gauge",
+        "sort_order": 1,
+    },
+    {
         "name": "Staff",
         "slug": "staff",
         "description": "Manage staff members, roles, active status and assignments.",
         "route": "/staff",
         "icon": "users",
-        "sort_order": 1,
+        "sort_order": 2,
     },
     {
         "name": "Customer",
@@ -4321,7 +5006,23 @@ DEFAULT_SETUP_MODULES = [
         "description": "Manage customers, contacts and account status.",
         "route": "/customer",
         "icon": "building",
-        "sort_order": 2,
+        "sort_order": 3,
+    },
+    {
+        "name": "Sales",
+        "slug": "sales",
+        "description": "Sales workspace with proposals, estimates, invoices and payments.",
+        "route": "/sales/proposals",
+        "icon": "scale-balanced",
+        "sort_order": 4,
+    },
+    {
+        "name": "Expenses",
+        "slug": "expenses",
+        "description": "Expense and income tracking with reporting visibility.",
+        "route": "/reports/expenses",
+        "icon": "coins",
+        "sort_order": 5,
     },
     {
         "name": "Support",
@@ -4329,7 +5030,7 @@ DEFAULT_SETUP_MODULES = [
         "description": "Support ticket pipe, routing and service mailbox operations.",
         "route": "/support",
         "icon": "headset",
-        "sort_order": 3,
+        "sort_order": 6,
     },
     {
         "name": "Leads",
@@ -4337,7 +5038,7 @@ DEFAULT_SETUP_MODULES = [
         "description": "Lead capture, lifecycle and status tracking.",
         "route": "/leads",
         "icon": "bullseye",
-        "sort_order": 4,
+        "sort_order": 7,
     },
     {
         "name": "Finance",
@@ -4345,7 +5046,7 @@ DEFAULT_SETUP_MODULES = [
         "description": "Expense and payment related controls and reporting links.",
         "route": "/reports/expenses",
         "icon": "coins",
-        "sort_order": 5,
+        "sort_order": 8,
     },
     {
         "name": "Contracts",
@@ -4353,39 +5054,63 @@ DEFAULT_SETUP_MODULES = [
         "description": "Contract master data, terms and renewal tracking.",
         "route": "/Sale/ContractsDashboard/",
         "icon": "file-contract",
-        "sort_order": 6,
+        "sort_order": 9,
+    },
+    {
+        "name": "Projects",
+        "slug": "projects",
+        "description": "Project delivery board, milestones, and collaboration tracking.",
+        "route": "/projects",
+        "icon": "diagram-project",
+        "sort_order": 10,
+    },
+    {
+        "name": "Knowledge Base",
+        "slug": "knowledge-base",
+        "description": "Knowledge articles and grouped documentation for teams.",
+        "route": "/knowledgebase",
+        "icon": "folder-open",
+        "sort_order": 11,
+    },
+    {
+        "name": "Utilities",
+        "slug": "utilities",
+        "description": "Utility tools like media, announcements, goals and backups.",
+        "route": "/utilities/media",
+        "icon": "gears",
+        "sort_order": 12,
+    },
+    {
+        "name": "Reports",
+        "slug": "reports",
+        "description": "Reporting dashboards for sales, expenses and operational trends.",
+        "route": "/reports/expenses-vs-income",
+        "icon": "chart-area",
+        "sort_order": 13,
     },
     {
         "name": "Modules",
         "slug": "modules",
         "description": "Enable or disable modules visible in setup and app navigation.",
-        "route": "/setup?tab=modules",
+        "route": "/setup/modules",
         "icon": "layer-group",
-        "sort_order": 7,
+        "sort_order": 14,
     },
     {
         "name": "Email Template",
         "slug": "email-template",
         "description": "Centralized email templates for notifications and transactional emails.",
-        "route": "/setup?tab=email-template",
+        "route": "/setup/email-template",
         "icon": "envelope",
-        "sort_order": 8,
+        "sort_order": 15,
     },
     {
         "name": "Custom Fields",
         "slug": "custom-fields",
         "description": "Create module-wise custom fields without code changes.",
-        "route": "/setup?tab=custom-fields",
+        "route": "/setup/custom-fields",
         "icon": "table-columns",
-        "sort_order": 9,
-    },
-    {
-        "name": "GDPR",
-        "slug": "gdpr",
-        "description": "Track GDPR requests, processing and completion timeline.",
-        "route": "/setup?tab=gdpr",
-        "icon": "shield-check",
-        "sort_order": 10,
+        "sort_order": 16,
     },
     {
         "name": "Roles",
@@ -4393,31 +5118,79 @@ DEFAULT_SETUP_MODULES = [
         "description": "Role and permission definition.",
         "route": "/role/save",
         "icon": "user-shield",
-        "sort_order": 11,
+        "sort_order": 17,
     },
     {
         "name": "Theme Style",
         "slug": "theme-style",
         "description": "Customize brand colors and shared UI style options.",
-        "route": "/setup?tab=theme-style",
+        "route": "/setup/theme-style",
         "icon": "palette",
-        "sort_order": 12,
+        "sort_order": 18,
     },
     {
         "name": "Settings",
         "slug": "settings",
         "description": "System preferences and default operational values.",
-        "route": "/setup?tab=settings",
+        "route": "/setup/settings",
         "icon": "gear",
-        "sort_order": 13,
+        "sort_order": 19,
     },
     {
         "name": "Help",
         "slug": "help",
         "description": "Setup module documentation and team self-help knowledge.",
-        "route": "/setup?tab=help",
+        "route": "/setup/help",
         "icon": "circle-info",
-        "sort_order": 14,
+        "sort_order": 20,
+    },
+    {
+        "name": "Sales Proposals",
+        "slug": "sales-proposals",
+        "description": "Proposal listing and creation under the Sales module.",
+        "route": "/sales/proposals",
+        "icon": "file-signature",
+        "sort_order": 21,
+    },
+    {
+        "name": "Sales Estimates",
+        "slug": "sales-estimates",
+        "description": "Estimate listing and conversion flow in Sales.",
+        "route": "/sales/estimates",
+        "icon": "calculator",
+        "sort_order": 22,
+    },
+    {
+        "name": "Sales Invoices",
+        "slug": "sales-invoices",
+        "description": "Invoice management and payment status tracking.",
+        "route": "/sales/invoices",
+        "icon": "file-invoice",
+        "sort_order": 23,
+    },
+    {
+        "name": "Sales Payments",
+        "slug": "sales-payments",
+        "description": "Payment capture and reconciliation against invoices.",
+        "route": "/sales/payments",
+        "icon": "money-check-dollar",
+        "sort_order": 24,
+    },
+    {
+        "name": "Sales Credit Notes",
+        "slug": "sales-creditnotes",
+        "description": "Credit note creation and adjustment tracking.",
+        "route": "/sales/creditnotes",
+        "icon": "note-sticky",
+        "sort_order": 25,
+    },
+    {
+        "name": "Sales Items",
+        "slug": "sales-items",
+        "description": "Item catalog and import workflow for sales documents.",
+        "route": "/sales/items",
+        "icon": "boxes-stacked",
+        "sort_order": 26,
     },
 ]
 
@@ -4463,16 +5236,6 @@ DEFAULT_SETUP_SETTINGS = [
         "is_public": True,
         "is_editable": True,
     },
-    {
-        "category": "compliance",
-        "key": "gdpr_auto_acknowledge",
-        "display_name": "GDPR Auto Acknowledge",
-        "value": "true",
-        "input_type": "boolean",
-        "description": "Send automated acknowledgement for GDPR requests.",
-        "is_public": False,
-        "is_editable": True,
-    },
 ]
 
 
@@ -4501,18 +5264,6 @@ DEFAULT_HELP_ARTICLES = [
         "sort_order": 2,
         "is_published": True,
     },
-    {
-        "title": "GDPR Request Handling",
-        "slug": "setup-gdpr-handling",
-        "module_slug": "gdpr",
-        "summary": "Track data export and delete requests safely.",
-        "content": (
-            "Create a GDPR request for each customer demand, move status as work "
-            "progresses, and capture resolution notes before completion."
-        ),
-        "sort_order": 3,
-        "is_published": True,
-    },
 ]
 
 
@@ -4523,12 +5274,21 @@ def _seed_setup_modules():
         slug = item["slug"]
         module = existing.get(slug)
         if module:
+            # Keep existing records editable from UI:
+            # do not force-reset user-updated fields on every list call.
             changed = False
-            for field in ("name", "description", "route", "icon", "sort_order"):
+            for field in ("name", "description", "route", "icon"):
+                current_value = getattr(module, field)
+                if current_value not in (None, ""):
+                    continue
                 next_value = item.get(field)
-                if getattr(module, field) != next_value:
-                    setattr(module, field, next_value)
-                    changed = True
+                if next_value in (None, ""):
+                    continue
+                setattr(module, field, next_value)
+                changed = True
+            if not getattr(module, "sort_order", 0):
+                module.sort_order = int(item.get("sort_order") or 0)
+                changed = True
             if changed:
                 module.save(
                     update_fields=[
@@ -4617,7 +5377,7 @@ class SetupModuleViewSet(SetupBaseViewSet):
 
     def get_queryset(self):
         _seed_setup_modules()
-        queryset = SetupModule.objects.all()
+        queryset = SetupModule.objects.exclude(slug__iexact="gdpr").exclude(name__iexact="GDPR")
 
         include_deleted = str(self.request.query_params.get("include_deleted", "")).strip().lower() in {
             "1",
@@ -4650,8 +5410,32 @@ class SetupModuleViewSet(SetupBaseViewSet):
 
         return queryset.order_by("sort_order", "name", "id")
 
+    def create(self, request, *args, **kwargs):
+        raw_slug = str(request.data.get("slug") or "").strip()
+        raw_name = str(request.data.get("name") or "").strip()
+        normalized_slug = slugify(raw_slug or raw_name)
+
+        try:
+            if normalized_slug:
+                deleted_match = SetupModule.objects.filter(slug=normalized_slug, is_deleted=True).first()
+                if deleted_match:
+                    payload = request.data.copy() if hasattr(request.data, "copy") else dict(request.data)
+                    if not payload.get("slug"):
+                        payload["slug"] = normalized_slug
+
+                    serializer = self.get_serializer(deleted_match, data=payload, partial=True)
+                    serializer.is_valid(raise_exception=True)
+                    serializer.save(is_deleted=False, deleted_at=None)
+                    return Response(serializer.data, status=status.HTTP_200_OK)
+        except (ProgrammingError, OperationalError):
+            return super().create(request, *args, **kwargs)
+
+        return super().create(request, *args, **kwargs)
+
     def destroy(self, request, *args, **kwargs):
-        module = self.get_object()
+        module = SetupModule.objects.filter(pk=kwargs.get("pk")).first()
+        if not module:
+            return Response({"detail": "Module not found."}, status=status.HTTP_404_NOT_FOUND)
         if not module.is_deleted:
             module.is_deleted = True
             module.deleted_at = timezone.now()
@@ -4862,7 +5646,7 @@ class SetupCustomFieldViewSet(SetupBaseViewSet):
     serializer_class = SetupCustomFieldSerializer
 
     def get_queryset(self):
-        queryset = SetupCustomField.objects.all()
+        queryset = SetupCustomField.objects.exclude(module_slug__iexact="gdpr")
         module_slug = _normalize_custom_field_module_slug(self.request.query_params.get("module", ""))
         active = str(self.request.query_params.get("active", "")).strip().lower()
 
@@ -5125,7 +5909,7 @@ class SetupSettingViewSet(SetupBaseViewSet):
 
     def get_queryset(self):
         _seed_setup_settings()
-        queryset = SetupSetting.objects.all()
+        queryset = SetupSetting.objects.exclude(key__istartswith="gdpr_").exclude(category__iexact="compliance")
         category = str(self.request.query_params.get("category", "")).strip()
         if category:
             queryset = queryset.filter(category__iexact=category)
@@ -5172,7 +5956,7 @@ class SetupHelpArticleViewSet(SetupBaseViewSet):
 
     def get_queryset(self):
         _seed_help_articles()
-        queryset = SetupHelpArticle.objects.all()
+        queryset = SetupHelpArticle.objects.exclude(module_slug__iexact="gdpr")
 
         module_slug = str(self.request.query_params.get("module", "")).strip()
         published = str(self.request.query_params.get("published", "")).strip().lower()
@@ -5196,7 +5980,24 @@ class SetupHelpArticleViewSet(SetupBaseViewSet):
     # ------------------------------------------------------------
     # Email notification on create / update
     # ------------------------------------------------------------
-    def _resolve_review_recipients(self):
+    @staticmethod
+    def _emails_from_csv(value):
+        parts = [item.strip() for item in re.split(r"[,\n;]+", str(value or "")) if item.strip()]
+        out = []
+        seen = set()
+        for raw in parts:
+            try:
+                validate_email(raw)
+            except DjangoValidationError:
+                continue
+            key = raw.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(raw)
+        return out
+
+    def _resolve_review_recipients(self, article=None):
         """Resolve company review recipient emails for Help article submissions."""
         recipients = []
         seen = set()
@@ -5210,6 +6011,13 @@ class SetupHelpArticleViewSet(SetupBaseViewSet):
                 return
             seen.add(key)
             recipients.append(email_value)
+
+        # 0) Help article inquiry recipients (highest priority if provided).
+        if article is not None:
+            for email_value in self._emails_from_csv(getattr(article, "inquiry_email_to", None)):
+                add_email(email_value)
+            if recipients:
+                return recipients
 
         # 1) Primary source: setup setting (company/company_email).
         try:
@@ -5258,14 +6066,18 @@ class SetupHelpArticleViewSet(SetupBaseViewSet):
 
     def _send_review_email(self, article, *, action="created"):
         """Send a review email for a created/updated help article."""
-        recipients = self._resolve_review_recipients()
+        recipients = self._resolve_review_recipients(article=article)
+        cc_recipients = self._emails_from_csv(getattr(article, "inquiry_email_cc", None))
         verb = "created" if action == "created" else "updated"
-        subject = f"Help Article {verb.title()} for Review: {article.title}"
+        custom_subject = str(getattr(article, "inquiry_email_subject", "") or "").strip()
+        subject = custom_subject or f"Help Article {verb.title()} for Review: {article.title}"
         message = (
             f"A help article has been {verb} in the system.\n\n"
             f"Title: {article.title}\n"
             f"Module: {article.module_slug or '-'}\n"
             f"Published: {'Yes' if article.is_published else 'No'}\n"
+            f"Inquiry To: {getattr(article, 'inquiry_email_to', '') or '-'}\n"
+            f"Inquiry CC: {getattr(article, 'inquiry_email_cc', '') or '-'}\n"
             f"\nSummary:\n{article.summary or ''}\n\n"
             f"Content preview (first 200 chars):\n{(article.content or '')[:200]}"
         )
@@ -5274,11 +6086,13 @@ class SetupHelpArticleViewSet(SetupBaseViewSet):
                 subject=subject,
                 message=message,
                 to_emails=recipients,
+                cc=cc_recipients,
                 fail_silently=False,
             )
             return {
                 "sent": True,
                 "to": recipients,
+                "cc": cc_recipients,
             }
         except Exception as exc:
             # Logging failure should not break the API response.
@@ -5286,6 +6100,7 @@ class SetupHelpArticleViewSet(SetupBaseViewSet):
             return {
                 "sent": False,
                 "to": recipients,
+                "cc": cc_recipients,
                 "error": str(exc),
             }
 
@@ -5590,6 +6405,9 @@ class SetupRolePermissionViewSet(SetupBaseViewSet):
         if module_slug:
             queryset = queryset.filter(module_slug__iexact=module_slug)
         return queryset.order_by("role_id", "module_slug", "id")
+
+
+
 
 
 

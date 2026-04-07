@@ -1,5 +1,4 @@
 from django.shortcuts import get_object_or_404
-from django.core.mail import EmailMessage, send_mail
 from django.conf import settings
 from django.utils import timezone
 from django.db import ProgrammingError, OperationalError, connections
@@ -8,23 +7,48 @@ from django.apps import apps
 import csv
 import io
 import json
+import logging
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
+from urllib.error import URLError
 
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework import filters, mixins, status, viewsets
+from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
-from rest_framework import status
 
 from django.contrib.auth import authenticate
 from django.contrib.auth.hashers import make_password
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth.models import User
 
-from .models import UserToken, Roles
+from .models import (
+    CustomerStatus,
+    EmailIntegration,
+    Lead,
+    LeadCaptureConfiguration,
+    LeadSource,
+    Product,
+    ProductStatus,
+    Roles,
+    UserToken,
+    WebFormField,
+)
 from .serializers import UserProfileSerializers
 from .serializers import (
+    CustomerStatusSerializer,
     CompanyInfoSerializer,
+    EmailIntegrationSerializer,
+    LeadSerializer,
+    LeadCaptureConfigurationSerializer,
+    LeadSourceSerializer,
+    ProductSerializer,
+    ProductStatusSerializer,
     SMSTaskSerializer,
     SetupTaskSerializer,
+    WebFormFieldSerializer,
+    WebToLeadSerializer,
 )
 from .helpers.utility import (
     app_name,
@@ -35,9 +59,11 @@ from .helpers.utility import (
 from .constants import UserType
 from core.models import Business
 from core.middleware import get_current_db
+from core.email_branding import build_module_email_html, send_branded_email
 
 # ✅ SAFE TABLE ENSURE
 from ms_crm_app.helpers.ensure_tables import (
+    ensure_leads_setup_tables,
     ensure_roles_table,
     ensure_gdpr_requests_table,
     ensure_setup_management_tables,
@@ -323,18 +349,31 @@ def _send_gdpr_submission_email(gdpr_request):
     if attachment_note:
         body_lines.append(attachment_note)
 
-    email_message = EmailMessage(
-        subject=f"GDPR Request Submitted - {gdpr_request.request_id}",
-        body="\n".join(body_lines),
-        from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
-        to=[gdpr_request.email],
+    html_message = build_module_email_html(
+        title="GDPR Request Submitted",
+        greeting=gdpr_request.customer_name or gdpr_request.email,
+        intro="Your GDPR request has been received and logged by the CRM system.",
+        details=[
+            ("Request ID", gdpr_request.request_id),
+            ("Request Type", request_type_label),
+            ("Requested Export Format", str(gdpr_request.data_format).upper()),
+            ("Current Status", gdpr_request.status),
+            ("Requested By", f"{gdpr_request.customer_name} ({gdpr_request.email})"),
+            ("Details", gdpr_request.details or "N/A"),
+            ("Exported Records Found", len(export_rows)),
+        ],
+        closing="Regards,<br/><strong>CRM Team</strong>",
     )
 
-    if attachment:
-        filename, content, content_type = attachment
-        email_message.attach(filename, content, content_type)
-
-    email_message.send(fail_silently=True)
+    send_branded_email(
+        subject=f"GDPR Request Submitted - {gdpr_request.request_id}",
+        message="\n".join(body_lines),
+        to_emails=[gdpr_request.email],
+        html_message=html_message,
+        attachments=[attachment] if attachment else None,
+        from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
+        fail_silently=True,
+    )
 
 
 # ======================================================
@@ -374,7 +413,14 @@ def manage_data(request, model_name, item_id=None, field=None, value=None):
             )
             if not field and not value and not request.query_params:
                 queryset = model.objects.all()
-            queryset = queryset.order_by('id')
+            # Order by the model's primary key field instead of assuming 'id'
+            pk_name = getattr(model._meta, 'pk', None)
+            if pk_name is not None:
+                pk_field = pk_name.name
+                queryset = queryset.order_by(pk_field)
+            else:
+                # Fallback: no explicit PK, use default ordering if any
+                queryset = queryset
 
             paginator = CustomPageNumberPagination()
             page = paginator.paginate_queryset(queryset, request)
@@ -526,11 +572,23 @@ def gdpr_request_detail(request, pk):
             # Notify on completion
             if updated.status == 'completed':
                 try:
-                    send_mail(
+                    completion_message = f"Your GDPR request (ID: {updated.request_id}) has been completed."
+                    completion_html = build_module_email_html(
+                        title="GDPR Request Completed",
+                        greeting=updated.customer_name or updated.email,
+                        intro=completion_message,
+                        details=[
+                            ("Request ID", updated.request_id),
+                            ("Status", updated.status),
+                            ("Requested Email", updated.email),
+                        ],
+                        closing="Regards,<br/><strong>CRM Team</strong>",
+                    )
+                    send_branded_email(
                         subject='GDPR Request Completed',
-                        message=f"Your GDPR request (ID: {updated.request_id}) has been completed.",
-                        from_email=None,
-                        recipient_list=[updated.email],
+                        message=completion_message,
+                        to_emails=[updated.email],
+                        html_message=completion_html,
                         fail_silently=True,
                     )
                 except Exception:
@@ -683,3 +741,549 @@ def roles_list_create(request):
             "permissions": role.permissions
         }, status=status.HTTP_201_CREATED)
 
+
+logger = logging.getLogger(__name__)
+
+
+def _to_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _token_from_request(request):
+    return (
+        request.headers.get("X-Lead-Token")
+        or request.headers.get("X-API-Key")
+        or request.data.get("api_key")
+        or request.query_params.get("api_key")
+        or ""
+    )
+
+
+def _get_lead_capture_config():
+    config, _ = LeadCaptureConfiguration.objects.get_or_create(name="default")
+    return config
+
+
+def _verify_recaptcha_token(config, request):
+    if not getattr(config, "recaptcha_enabled", False):
+        return True, ""
+
+    recaptcha_token = (
+        request.data.get("recaptcha_token")
+        or request.headers.get("X-Recaptcha-Token")
+        or ""
+    )
+    if not recaptcha_token:
+        return False, "reCAPTCHA token is required."
+    if not config.recaptcha_secret_key:
+        return False, "reCAPTCHA secret key is not configured."
+
+    payload = urllib_parse.urlencode(
+        {"secret": config.recaptcha_secret_key, "response": recaptcha_token}
+    ).encode("utf-8")
+
+    try:
+        req = urllib_request.Request(
+            "https://www.google.com/recaptcha/api/siteverify",
+            data=payload,
+            method="POST",
+        )
+        with urllib_request.urlopen(req, timeout=8) as response:
+            parsed = json.loads(response.read().decode("utf-8"))
+        if parsed.get("success"):
+            return True, ""
+        return False, "reCAPTCHA validation failed."
+    except (URLError, ValueError):
+        return False, "Unable to verify reCAPTCHA token."
+
+
+def _send_web_to_lead_emails(config, lead):
+    if not config:
+        return
+
+    try:
+        if config.send_notification_email and config.notification_email:
+            summary = f"Lead received from website: {lead.email}"
+            html = build_module_email_html(
+                title="New Web Lead",
+                greeting="Team",
+                intro="A new lead was captured from the web form.",
+                details=[
+                    ("Name", f"{lead.first_name} {lead.last_name}".strip() or "-"),
+                    ("Email", lead.email),
+                    ("Phone", lead.phone or "-"),
+                    ("Company", lead.company or "-"),
+                    ("Priority", lead.priority or "-"),
+                    ("Source", getattr(lead.source, "name", "-")),
+                ],
+                closing="Regards,<br/><strong>CRM Lead Automation</strong>",
+            )
+            send_branded_email(
+                subject="New Web To Lead Submission",
+                message=summary,
+                to_emails=[config.notification_email],
+                html_message=html,
+                fail_silently=True,
+            )
+    except Exception:
+        logger.exception("Web lead notification email failed.")
+
+    try:
+        if config.send_auto_response and lead.email:
+            subject = config.auto_response_subject or "We received your request"
+            body = config.auto_response_message or (
+                "Thank you for contacting us. Our team will reach out shortly."
+            )
+            html = build_module_email_html(
+                title=subject,
+                greeting=lead.first_name or lead.email,
+                intro=body,
+                details=[("Reference", f"Lead #{lead.id}")],
+                closing="Regards,<br/><strong>CRM Team</strong>",
+            )
+            send_branded_email(
+                subject=subject,
+                message=body,
+                to_emails=[lead.email],
+                html_message=html,
+                fail_silently=True,
+            )
+    except Exception:
+        logger.exception("Web lead auto-response email failed.")
+
+
+class LeadSetupEnsureMixin:
+    """
+    Shared safety layer for Leads setup APIs.
+    - Bootstraps required tables/columns.
+    - Avoids crashing endpoints on schema drift.
+    """
+
+    @staticmethod
+    def _is_missing_table_error(exc):
+        msg = str(exc or "").lower()
+        return "doesn't exist" in msg or "1146" in msg or "no such table" in msg
+
+    def _handle_db_error(self, exc, *, empty_ok):
+        if self._is_missing_table_error(exc):
+            if empty_ok:
+                return Response([])
+            return Response(
+                {
+                    "detail": "Leads setup table not found. Run setup table bootstrap/migrations.",
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        return None
+
+    def initial(self, request, *args, **kwargs):
+        try:
+            ensure_leads_setup_tables()
+        except Exception as exc:
+            # Keep auth/permission flow intact; action handlers below guard DB errors.
+            logger.exception("Leads setup table ensure failed: %s", exc)
+        return super().initial(request, *args, **kwargs)
+
+    def list(self, request, *args, **kwargs):
+        try:
+            return super().list(request, *args, **kwargs)
+        except (ProgrammingError, OperationalError) as exc:
+            handled = self._handle_db_error(exc, empty_ok=True)
+            if handled is not None:
+                return handled
+            raise
+
+    def retrieve(self, request, *args, **kwargs):
+        try:
+            return super().retrieve(request, *args, **kwargs)
+        except (ProgrammingError, OperationalError) as exc:
+            handled = self._handle_db_error(exc, empty_ok=False)
+            if handled is not None:
+                return handled
+            raise
+
+    def create(self, request, *args, **kwargs):
+        try:
+            return super().create(request, *args, **kwargs)
+        except (ProgrammingError, OperationalError) as exc:
+            handled = self._handle_db_error(exc, empty_ok=False)
+            if handled is not None:
+                return handled
+            raise
+
+    def update(self, request, *args, **kwargs):
+        try:
+            return super().update(request, *args, **kwargs)
+        except (ProgrammingError, OperationalError) as exc:
+            handled = self._handle_db_error(exc, empty_ok=False)
+            if handled is not None:
+                return handled
+            raise
+
+    def partial_update(self, request, *args, **kwargs):
+        try:
+            return super().partial_update(request, *args, **kwargs)
+        except (ProgrammingError, OperationalError) as exc:
+            handled = self._handle_db_error(exc, empty_ok=False)
+            if handled is not None:
+                return handled
+            raise
+
+    def destroy(self, request, *args, **kwargs):
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except (ProgrammingError, OperationalError) as exc:
+            handled = self._handle_db_error(exc, empty_ok=False)
+            if handled is not None:
+                return handled
+            raise
+
+
+class LeadEmailIntakeService:
+    """
+    Placeholder email intake service.
+    The current implementation intentionally simulates IMAP polling and
+    converts email payloads into Lead records.
+    """
+
+    def __init__(self, integration):
+        self.integration = integration
+
+    def fetch_emails(self):
+        if not self.integration.is_connected:
+            return []
+
+        return [
+            {
+                "from_name": "Website Contact",
+                "from_email": "sample.prospect@example.com",
+                "phone": "",
+                "subject": "Interested in your CRM offering",
+                "body": "Please contact me for a demo.",
+            }
+        ]
+
+    def convert_email_to_lead(self, email_payload):
+        email = str(email_payload.get("from_email", "")).strip().lower()
+        if not email:
+            raise ValueError("from_email is required to create a lead.")
+
+        config = _get_lead_capture_config()
+        existing = Lead.objects.filter(email__iexact=email).first()
+        if existing:
+            if config.prevent_duplicates:
+                return existing, False
+
+            existing.message = str(email_payload.get("body", "")).strip()
+            existing.priority = config.default_priority or existing.priority or "medium"
+            if not existing.phone:
+                existing.phone = str(email_payload.get("phone", "")).strip()
+            if not existing.assigned_to_user:
+                existing.assigned_to_user = self._parse_int(config.auto_assign_user)
+            if not existing.assigned_to_team:
+                existing.assigned_to_team = config.auto_assign_team or ""
+            existing.save()
+            return existing, False
+
+        source = LeadSource.objects.filter(name__iexact="Email").first()
+        if source is None:
+            source, _ = LeadSource.objects.get_or_create(name="Email", defaults={"is_active": True})
+
+        customer_status = CustomerStatus.objects.filter(name__iexact=config.default_status).first()
+        if customer_status is None:
+            customer_status, _ = CustomerStatus.objects.get_or_create(
+                name="New",
+                defaults={"is_active": True},
+            )
+
+        first_name, last_name = self._split_name(email_payload.get("from_name", ""))
+
+        lead = Lead.objects.create(
+            first_name=first_name,
+            last_name=last_name,
+            email=email,
+            phone=str(email_payload.get("phone", "")).strip(),
+            product=self._get_default_product(),
+            product_status=self._get_default_product_status(),
+            customer_status=customer_status,
+            source=source,
+            message=str(email_payload.get("body", "")).strip(),
+            priority=config.default_priority or "medium",
+            assigned_to_user=self._parse_int(config.auto_assign_user),
+            assigned_to_team=config.auto_assign_team or "",
+        )
+        return lead, True
+
+    @staticmethod
+    def _split_name(full_name):
+        raw_name = str(full_name or "").strip()
+        if not raw_name:
+            return "", ""
+        parts = raw_name.split()
+        if len(parts) == 1:
+            return parts[0], ""
+        return parts[0], " ".join(parts[1:])
+
+    @staticmethod
+    def _get_default_product():
+        config = _get_lead_capture_config()
+        if config.default_product:
+            mapped = Product.objects.filter(name__iexact=config.default_product).first()
+            if mapped is not None:
+                return mapped
+        return Product.objects.filter(is_active=True).order_by("id").first()
+
+    @staticmethod
+    def _get_default_product_status():
+        config = _get_lead_capture_config()
+        if config.default_product_status:
+            mapped = ProductStatus.objects.filter(name__iexact=config.default_product_status).first()
+            if mapped is not None:
+                return mapped
+        return ProductStatus.objects.filter(is_active=True).order_by("id").first()
+
+    @staticmethod
+    def _parse_int(value):
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
+
+class LeadsPagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+
+class LeadViewSet(LeadSetupEnsureMixin, viewsets.ModelViewSet):
+    queryset = Lead.objects.select_related(
+        "product",
+        "product_status",
+        "customer_status",
+        "source",
+    )
+    serializer_class = LeadSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = LeadsPagination
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ["first_name", "last_name", "email"]
+    ordering_fields = ["created_at", "updated_at"]
+    ordering = ["-created_at"]
+
+    def get_permissions(self):
+        if self.action in {"web_to_lead", "validate_token"}:
+            return [AllowAny()]
+        return super().get_permissions()
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        params = self.request.query_params
+
+        product = params.get("product")
+        product_status = params.get("product_status")
+        customer_status = params.get("customer_status")
+        source = params.get("source")
+
+        if product:
+            queryset = queryset.filter(product_id=product)
+        if product_status:
+            queryset = queryset.filter(product_status_id=product_status)
+        if customer_status:
+            queryset = queryset.filter(customer_status_id=customer_status)
+        if source:
+            queryset = queryset.filter(source_id=source)
+
+        return queryset
+
+    @action(detail=False, methods=["post"], url_path="web-to-lead")
+    def web_to_lead(self, request):
+        config = _get_lead_capture_config()
+
+        if not config.is_web_to_lead_enabled:
+            return Response(
+                {"detail": "Web To Lead capture is disabled."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if config.require_api_key:
+            request_token = str(_token_from_request(request) or "").strip()
+            expected_token = str(config.api_key_token or "").strip()
+            if not expected_token or request_token != expected_token:
+                return Response(
+                    {"detail": "Invalid API key/token."},
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
+
+        recaptcha_ok, recaptcha_message = _verify_recaptcha_token(config, request)
+        if not recaptcha_ok:
+            return Response(
+                {"detail": recaptcha_message},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = WebToLeadSerializer(
+            data=request.data,
+            context={"lead_capture_config": config},
+        )
+        serializer.is_valid(raise_exception=True)
+        lead = serializer.save()
+        _send_web_to_lead_emails(config, lead)
+        return Response(LeadSerializer(lead).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["get", "patch", "put"], url_path="configuration")
+    def configuration(self, request):
+        config = _get_lead_capture_config()
+        if request.method == "GET":
+            return Response(LeadCaptureConfigurationSerializer(config).data, status=status.HTTP_200_OK)
+
+        partial = request.method == "PATCH"
+        serializer = LeadCaptureConfigurationSerializer(config, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["post"], url_path="validate-token")
+    def validate_token(self, request):
+        config = _get_lead_capture_config()
+        if not config.require_api_key:
+            return Response({"valid": True, "required": False}, status=status.HTTP_200_OK)
+
+        provided = str(_token_from_request(request) or "").strip()
+        expected = str(config.api_key_token or "").strip()
+        is_valid = bool(expected) and provided == expected
+        return Response(
+            {"valid": is_valid, "required": True},
+            status=status.HTTP_200_OK if is_valid else status.HTTP_401_UNAUTHORIZED,
+        )
+
+
+class ProductViewSet(LeadSetupEnsureMixin, viewsets.ModelViewSet):
+    queryset = Product.objects.all().order_by("name")
+    serializer_class = ProductSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        # Detail actions must be able to target inactive records as well.
+        if getattr(self, "action", "") in {"retrieve", "update", "partial_update", "destroy"}:
+            return queryset
+        include_inactive = _to_bool(self.request.query_params.get("include_inactive"), default=False)
+        if include_inactive:
+            return queryset
+        return queryset.filter(is_active=True)
+
+
+class ProductStatusViewSet(LeadSetupEnsureMixin, viewsets.ModelViewSet):
+    queryset = ProductStatus.objects.all().order_by("name")
+    serializer_class = ProductStatusSerializer
+    permission_classes = [IsAuthenticated]
+
+
+class CustomerStatusViewSet(LeadSetupEnsureMixin, viewsets.ModelViewSet):
+    queryset = CustomerStatus.objects.all().order_by("name")
+    serializer_class = CustomerStatusSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        # Keep detail actions consistent with Products (inactive rows are manageable).
+        if getattr(self, "action", "") in {"retrieve", "update", "partial_update", "destroy"}:
+            return queryset
+        include_inactive = _to_bool(self.request.query_params.get("include_inactive"), default=False)
+        if include_inactive:
+            return queryset
+        return queryset.filter(is_active=True)
+
+
+class LeadSourceViewSet(LeadSetupEnsureMixin, viewsets.ModelViewSet):
+    queryset = LeadSource.objects.all().order_by("name")
+    serializer_class = LeadSourceSerializer
+    permission_classes = [IsAuthenticated]
+
+
+class WebFormFieldViewSet(LeadSetupEnsureMixin, viewsets.ModelViewSet):
+    queryset = WebFormField.objects.all().order_by("sort_order", "id")
+    serializer_class = WebFormFieldSerializer
+    permission_classes = [IsAuthenticated]
+
+
+class EmailIntegrationViewSet(LeadSetupEnsureMixin, viewsets.ModelViewSet):
+    queryset = EmailIntegration.objects.all().order_by("id")
+    serializer_class = EmailIntegrationSerializer
+    permission_classes = [IsAuthenticated]
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        if not instance.email_address and instance.username:
+            instance.email_address = instance.username
+        if not instance.imap_host and instance.email_host:
+            instance.imap_host = instance.email_host
+        if not instance.smtp_host and instance.email_host:
+            instance.smtp_host = instance.email_host
+        if not instance.imap_port and instance.email_port:
+            instance.imap_port = instance.email_port
+        if not instance.smtp_port and instance.email_port:
+            instance.smtp_port = instance.email_port
+        instance.save()
+
+    def _sync_integration(self, integration):
+        service = LeadEmailIntakeService(integration)
+        created_count = 0
+        skipped_count = 0
+        errors = []
+
+        for payload in service.fetch_emails():
+            try:
+                _, created = service.convert_email_to_lead(payload)
+                if created:
+                    created_count += 1
+                else:
+                    skipped_count += 1
+            except Exception as exc:
+                logger.exception("Email-to-lead conversion failed: %s", exc)
+                errors.append(str(exc))
+
+        integration.last_sync_at = timezone.now()
+        integration.save(update_fields=["last_sync_at"])
+
+        return {
+            "status": "completed",
+            "created": created_count,
+            "skipped": skipped_count,
+            "errors": errors,
+        }
+
+    @action(detail=True, methods=["post"], url_path="connect")
+    def connect(self, request, pk=None):
+        integration = self.get_object()
+        integration.is_connected = True
+        integration.save(update_fields=["is_connected"])
+        return Response({"status": "connected"}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="disconnect")
+    def disconnect(self, request, pk=None):
+        integration = self.get_object()
+        integration.is_connected = False
+        integration.save(update_fields=["is_connected"])
+        return Response({"status": "disconnected"}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="sync")
+    def sync(self, request, pk=None):
+        integration = self.get_object()
+        if not integration.is_connected:
+            return Response(
+                {"detail": "Integration is not connected."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        result = self._sync_integration(integration)
+        return Response(result, status=status.HTTP_200_OK)

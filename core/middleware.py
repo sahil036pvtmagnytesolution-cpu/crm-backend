@@ -39,7 +39,6 @@ MODULE_CANONICAL_MAP = {
     "email-template": "EmailTemplate",
     "customfields": "CustomFields",
     "custom-fields": "CustomFields",
-    "gdpr": "GDPR",
     "settings": "Settings",
 }
 
@@ -146,10 +145,7 @@ def _to_pascal_case(raw: str) -> str:
 
     canonical_parts = []
     for part in parts:
-        if part.lower() == "gdpr":
-            canonical_parts.append("GDPR")
-        else:
-            canonical_parts.append(part[:1].upper() + part[1:].lower())
+        canonical_parts.append(part[:1].upper() + part[1:].lower())
     return "".join(canonical_parts)
 
 

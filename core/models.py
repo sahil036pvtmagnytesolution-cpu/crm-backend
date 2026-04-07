@@ -240,6 +240,9 @@ class SetupHelpArticle(models.Model):
     module_slug = models.SlugField(max_length=120, blank=True, null=True, db_index=True)
     summary = models.CharField(max_length=255, blank=True, null=True)
     content = models.TextField()
+    inquiry_email_to = models.TextField(blank=True, null=True)
+    inquiry_email_cc = models.TextField(blank=True, null=True)
+    inquiry_email_subject = models.CharField(max_length=255, blank=True, null=True)
     is_published = models.BooleanField(default=True, db_index=True)
     sort_order = models.PositiveIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
@@ -1036,6 +1039,7 @@ class InvoiceReminder(models.Model):
     invoice = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name="reminders")
     description = models.TextField()
     date = models.DateTimeField()
+    created_by = models.CharField(max_length=191, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
@@ -1044,6 +1048,7 @@ class InvoiceReminder(models.Model):
 class InvoiceTask(models.Model):
     invoice = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name="tasks")
     description = models.TextField()
+    created_by = models.CharField(max_length=191, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
@@ -1139,6 +1144,7 @@ class CreditNoteReminder(models.Model):
     description = models.TextField(blank=True, null=True)
     date = models.DateTimeField(blank=True, null=True)
     status = models.CharField(max_length=50, blank=True, null=True, default="Pending")
+    created_by = models.CharField(max_length=191, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -1155,6 +1161,7 @@ class CreditNoteTask(models.Model):
     description = models.TextField(blank=True, null=True)
     date = models.DateTimeField(blank=True, null=True)
     status = models.CharField(max_length=50, blank=True, null=True, default="Open")
+    created_by = models.CharField(max_length=191, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

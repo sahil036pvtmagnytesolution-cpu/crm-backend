@@ -1,4 +1,5 @@
 import json
+import re
 from decimal import Decimal, InvalidOperation
 
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -904,9 +905,83 @@ class SetupCustomFieldSerializer(serializers.ModelSerializer):
 
 
 class SetupGDPRRequestSerializer(serializers.ModelSerializer):
+    REQUEST_TYPE_ALIASES = {
+        "access": "export",
+        "update": "rectify",
+    }
+    ALLOWED_REQUEST_TYPES = {"export", "delete", "rectify", "consent"}
+    ACTIVE_STATUSES = {"pending", "in_progress"}
+
     class Meta:
         model = SetupGDPRRequest
         fields = "__all__"
+
+    def _normalize_request_type(self, value):
+        raw_value = str(value or "").strip().lower()
+        if not raw_value:
+            raise serializers.ValidationError({"request_type": "Request type is required."})
+
+        normalized = self.REQUEST_TYPE_ALIASES.get(raw_value, raw_value)
+        if normalized not in self.ALLOWED_REQUEST_TYPES:
+            raise serializers.ValidationError(
+                {"request_type": "Invalid request type. Allowed values: access, delete, update."}
+            )
+        return normalized
+
+    def validate(self, attrs):
+        attrs = dict(attrs)
+
+        if "request_type" in attrs:
+            attrs["request_type"] = self._normalize_request_type(attrs.get("request_type"))
+
+        if self.instance is None:
+            request = self.context.get("request")
+            current_user = getattr(request, "user", None)
+
+            email = str(attrs.get("email", "")).strip().lower()
+            customer_name = str(attrs.get("customer_name", "")).strip()
+            request_type = attrs.get("request_type")
+            module_slug = str(attrs.get("module_slug", "")).strip().lower()
+
+            if getattr(current_user, "is_authenticated", False):
+                auth_email = str(getattr(current_user, "email", "") or "").strip().lower()
+                if auth_email and not email:
+                    attrs["email"] = auth_email
+                    email = auth_email
+
+                if not customer_name:
+                    full_name = ""
+                    get_full_name = getattr(current_user, "get_full_name", None)
+                    if callable(get_full_name):
+                        full_name = str(get_full_name() or "").strip()
+                    username = str(getattr(current_user, "username", "") or "").strip()
+                    attrs["customer_name"] = full_name or username or customer_name
+
+            queryset = SetupGDPRRequest.objects.filter(
+                email__iexact=email,
+                request_type=request_type,
+                status__in=self.ACTIVE_STATUSES,
+            )
+            if module_slug:
+                queryset = queryset.filter(module_slug__iexact=module_slug)
+
+            if email and request_type and queryset.exists():
+                raise serializers.ValidationError(
+                    {
+                        "non_field_errors": [
+                            "A similar active GDPR request already exists for this user and request type."
+                        ]
+                    }
+                )
+
+            attrs["status"] = "pending"
+
+        return attrs
+
+    def create(self, validated_data):
+        validated_data = dict(validated_data)
+        validated_data["status"] = "pending"
+        return super().create(validated_data)
 
     def update(self, instance, validated_data):
         next_status = validated_data.get("status")
@@ -928,6 +1003,41 @@ class SetupHelpArticleSerializer(serializers.ModelSerializer):
         extra_kwargs = {
             "slug": {"required": False, "allow_blank": True},
         }
+
+    @staticmethod
+    def _normalize_email_list(value):
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+
+        parts = [item.strip() for item in re.split(r"[,\n;]+", raw) if item.strip()]
+        cleaned = []
+        seen = set()
+
+        for email in parts:
+            normalized = email.lower()
+            if normalized in seen:
+                continue
+            validate_email(email)
+            seen.add(normalized)
+            cleaned.append(email)
+
+        return ", ".join(cleaned)
+
+    def validate(self, attrs):
+        for field_name in ("inquiry_email_to", "inquiry_email_cc"):
+            if field_name in attrs:
+                try:
+                    attrs[field_name] = self._normalize_email_list(attrs.get(field_name))
+                except DjangoValidationError:
+                    raise serializers.ValidationError(
+                        {field_name: "Enter valid comma-separated email addresses."}
+                    )
+
+        if "inquiry_email_subject" in attrs:
+            attrs["inquiry_email_subject"] = str(attrs.get("inquiry_email_subject") or "").strip()
+
+        return attrs
 
 
 class SetupCustomerGroupSerializer(serializers.ModelSerializer):

@@ -3,6 +3,7 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     CalendarEventViewSet,
     dashboard_overview,
+    dashboard_module_records,
     proposal_detail,
     register_business,
     login,
@@ -72,7 +73,6 @@ from .views import (
     SetupCustomFieldViewSet,
     SetupCurrencyViewSet,
     SetupContractTemplateViewSet,
-    SetupGDPRRequestViewSet,
     SetupExpenseCategoryViewSet,
     SetupSettingViewSet,
     SetupHelpArticleViewSet,
@@ -119,7 +119,6 @@ router.register(r'projects', ProjectViewSet, basename="projects")
 router.register(r'setup/modules', SetupModuleViewSet, basename="setup-modules")
 router.register(r'setup/email-templates', EmailTemplateViewSet, basename="setup-email-templates")
 router.register(r'setup/custom-fields', SetupCustomFieldViewSet, basename="setup-custom-fields")
-router.register(r'setup/gdpr-requests', SetupGDPRRequestViewSet, basename="setup-gdpr-requests")
 router.register(r'setup/settings', SetupSettingViewSet, basename="setup-settings")
 router.register(r'setup/help-articles', SetupHelpArticleViewSet, basename="setup-help-articles")
 router.register(r'setup/customer-groups', SetupCustomerGroupViewSet, basename="setup-customer-groups")
@@ -198,6 +197,7 @@ urlpatterns = [
     path("Creditnotesave/<int:pk>/", creditnote_detail),
     path("Creditnote/<int:pk>/reminders/", creditnote_reminders),
     path("Creditnotes/<int:pk>/tasks/", creditnote_tasks),
+    path("Creditnotes/<int:pk>/activity/", views.creditnote_activity),
 
     # Projects (back-compat with older frontend paths)
     path(
@@ -231,6 +231,7 @@ urlpatterns = [
     # Dashboard
     path("dashboard/small-stats/", SmallStatsView.as_view()),
     path("dashboard/overview/", dashboard_overview),
+    path("dashboard/modules-records/", dashboard_module_records),
     path("dashboard/leads-overview/", leads_overview),
     path("dashboard/project-status/", project_status),
     path("dashboard/weekly-payments/", weekly_payments),
@@ -252,6 +253,7 @@ urlpatterns = [
     # Invoice reminders/tasks
     path("invoices/<int:pk>/reminders/", views.invoice_reminders),
     path("invoices/<int:pk>/tasks/", views.invoice_tasks),
+    path("invoices/<int:pk>/activity/", views.invoice_activity),
 
     # Invoice email
     path("send-invoice-email/", views.send_invoice_email),

@@ -436,6 +436,25 @@ def ensure_setup_tables():
                 schema_editor.add_field(setup_module_model, field)
             existing_columns.add(field_name)
 
+    # Backward-compatible schema patch:
+    # If help article table already exists, ensure inquiry email columns are present.
+    help_article_model = apps.get_model("core", "SetupHelpArticle")
+    help_article_table = help_article_model._meta.db_table
+    if help_article_table in existing_tables:
+        with connection.cursor() as cursor:
+            help_columns = {
+                column.name
+                for column in connection.introspection.get_table_description(cursor, help_article_table)
+            }
+
+        for field_name in ("inquiry_email_to", "inquiry_email_cc", "inquiry_email_subject"):
+            if field_name in help_columns:
+                continue
+            field = help_article_model._meta.get_field(field_name)
+            with connection.schema_editor() as schema_editor:
+                schema_editor.add_field(help_article_model, field)
+            help_columns.add(field_name)
+
     # Email templates are global (default DB in router), ensure table there as well.
     default_connection = connections["default"]
     default_existing = set(default_connection.introspection.table_names())
@@ -473,3 +492,207 @@ def ensure_setup_management_tables():
         with db_connection.schema_editor() as schema_editor:
             schema_editor.create_model(model)
         existing_tables.add(table_name)
+
+
+def ensure_finance_created_by_columns():
+    """
+    Ensure tenant DBs contain created_by columns used by invoice/credit-note
+    reminder and task models.
+    """
+    from django.apps import apps
+    from django.db import connections
+    from core.middleware import get_current_db
+
+    db_alias = get_current_db()
+    db_connection = connections[db_alias]
+    existing_tables = set(db_connection.introspection.table_names())
+
+    model_names = [
+        "InvoiceReminder",
+        "InvoiceTask",
+        "CreditNoteReminder",
+        "CreditNoteTask",
+    ]
+
+    for model_name in model_names:
+        model = apps.get_model("core", model_name)
+        table_name = model._meta.db_table
+        if table_name not in existing_tables:
+            continue
+
+        with db_connection.cursor() as cursor:
+            existing_columns = {
+                column.name
+                for column in db_connection.introspection.get_table_description(cursor, table_name)
+            }
+
+        if "created_by" in existing_columns:
+            continue
+
+        field = model._meta.get_field("created_by")
+        with db_connection.schema_editor() as schema_editor:
+            schema_editor.add_field(model, field)
+
+
+def ensure_leads_setup_tables():
+    """
+    Ensure managed leads setup tables and newly introduced columns exist for
+    tenant databases without relying on migration files.
+    """
+    from django.apps import apps
+    from django.db import connections
+
+    db_alias = get_current_db()
+    db_connection = connections[db_alias]
+    existing_tables = set(db_connection.introspection.table_names())
+
+    model_names = [
+        "Product",
+        "ProductStatus",
+        "CustomerStatus",
+        "LeadSource",
+        "Lead",
+        "WebFormField",
+        "EmailIntegration",
+        "LeadCaptureConfiguration",
+    ]
+
+    for model_name in model_names:
+        model = apps.get_model("ms_crm_app", model_name)
+        table_name = model._meta.db_table
+        if table_name in existing_tables:
+            continue
+
+        with db_connection.schema_editor() as schema_editor:
+            schema_editor.create_model(model)
+        existing_tables.add(table_name)
+
+    field_patch_map = {
+        "ProductStatus": ["is_active"],
+        "LeadSource": ["is_active"],
+        "Lead": [
+            "company",
+            "message",
+            "priority",
+            "assigned_to_user",
+            "assigned_to_team",
+            "dynamic_data",
+        ],
+        "WebFormField": [
+            "label",
+            "mapped_field",
+            "placeholder",
+            "is_active",
+            "sort_order",
+            "field_options",
+        ],
+        "EmailIntegration": [
+            "smtp_host",
+            "smtp_port",
+            "imap_host",
+            "imap_port",
+            "email_address",
+            "use_ssl",
+            "auto_create_leads",
+            "is_active",
+            "last_sync_at",
+        ],
+    }
+
+    for model_name, field_names in field_patch_map.items():
+        model = apps.get_model("ms_crm_app", model_name)
+        table_name = model._meta.db_table
+        if table_name not in existing_tables:
+            continue
+
+        with db_connection.cursor() as cursor:
+            existing_columns = {
+                column.name
+                for column in db_connection.introspection.get_table_description(cursor, table_name)
+            }
+
+        for field_name in field_names:
+            if field_name in existing_columns:
+                continue
+            field = model._meta.get_field(field_name)
+            with db_connection.schema_editor() as schema_editor:
+                schema_editor.add_field(model, field)
+            existing_columns.add(field_name)
+
+    web_form_field_model = apps.get_model("ms_crm_app", "WebFormField")
+    default_fields = [
+        {
+            "field_name": "name",
+            "label": "Name",
+            "field_type": "text",
+            "mapped_field": "first_name",
+            "placeholder": "Enter name",
+            "is_required": True,
+            "is_active": True,
+            "sort_order": 1,
+        },
+        {
+            "field_name": "email",
+            "label": "Email",
+            "field_type": "email",
+            "mapped_field": "email",
+            "placeholder": "Enter email",
+            "is_required": True,
+            "is_active": True,
+            "sort_order": 2,
+        },
+        {
+            "field_name": "phone",
+            "label": "Phone",
+            "field_type": "phone",
+            "mapped_field": "phone",
+            "placeholder": "Enter phone",
+            "is_required": False,
+            "is_active": True,
+            "sort_order": 3,
+        },
+        {
+            "field_name": "company",
+            "label": "Company",
+            "field_type": "text",
+            "mapped_field": "company",
+            "placeholder": "Enter company",
+            "is_required": False,
+            "is_active": True,
+            "sort_order": 4,
+        },
+        {
+            "field_name": "message",
+            "label": "Message",
+            "field_type": "textarea",
+            "mapped_field": "message",
+            "placeholder": "Enter message",
+            "is_required": False,
+            "is_active": True,
+            "sort_order": 5,
+        },
+    ]
+
+    for item in default_fields:
+        obj, created = web_form_field_model.objects.get_or_create(
+            field_name=item["field_name"],
+            defaults=item,
+        )
+        if created:
+            continue
+        updated_fields = []
+        for key, value in item.items():
+            if key == "field_name":
+                continue
+            current_value = getattr(obj, key, None)
+            if current_value == value:
+                continue
+            if key in {"is_required", "sort_order"}:
+                continue
+            setattr(obj, key, value)
+            updated_fields.append(key)
+        if updated_fields:
+            obj.save(update_fields=updated_fields)
+
+    config_model = apps.get_model("ms_crm_app", "LeadCaptureConfiguration")
+    config_model.objects.get_or_create(name="default")

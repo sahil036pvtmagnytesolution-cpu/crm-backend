@@ -23,6 +23,7 @@ from rest_framework_simplejwt.views import (
     TokenRefreshView,
 )
 from core.views import public_items_list, activity_logs_api
+from ms_crm_app.urls import lead_urlpatterns
 from core.views import (
     assign_role_to_user_api,
     my_permissions_api,
@@ -58,6 +59,7 @@ urlpatterns = [
     path("core_api/", include("core.urls")),
     # Include the ms_crm_app URLs which contain the newly added setup endpoints
     path("api/app/", include("ms_crm_app.urls")),
+    path("api/", include((lead_urlpatterns, "ms_crm_app"))),
 ]
 
 if settings.DEBUG:
