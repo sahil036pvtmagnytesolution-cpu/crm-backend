@@ -404,6 +404,7 @@ def ensure_setup_tables():
         "SetupLeadStatus",
         "SetupContractTemplate",
         "SetupRolePermission",
+        "Ticket",
     ]
 
     for model_name in model_names:
@@ -455,6 +456,67 @@ def ensure_setup_tables():
                 schema_editor.add_field(help_article_model, field)
             help_columns.add(field_name)
 
+    # Backward-compatible schema patch:
+    # If theme style table already exists, ensure all expected theming columns are present.
+    theme_style_model = apps.get_model("core", "SetupThemeStyle")
+    theme_style_table = theme_style_model._meta.db_table
+    if theme_style_table in existing_tables:
+        with connection.cursor() as cursor:
+            theme_columns = {
+                column.name
+                for column in connection.introspection.get_table_description(cursor, theme_style_table)
+            }
+
+        theme_fields = (
+            "primary_color",
+            "secondary_color",
+            "accent_color",
+            "theme_mode",
+            "sidebar_bg",
+            "sidebar_text",
+            "navbar_bg",
+            "navbar_text",
+            "status_success",
+            "status_warning",
+            "status_error",
+            "status_info",
+            "status_colors",
+            "ui_settings",
+        )
+        for field_name in theme_fields:
+            if field_name in theme_columns:
+                continue
+            field = theme_style_model._meta.get_field(field_name)
+            with connection.schema_editor() as schema_editor:
+                schema_editor.add_field(theme_style_model, field)
+            theme_columns.add(field_name)
+
+    # Backward-compatible schema patch:
+    # Ensure support department and ticket priority enhancement columns exist.
+    setup_field_patch_map = {
+        "SetupSupportDepartment": ("imap_host",),
+        "SetupTicketPriority": ("description",),
+    }
+    for model_name, field_names in setup_field_patch_map.items():
+        model = apps.get_model("core", model_name)
+        table_name = model._meta.db_table
+        if table_name not in existing_tables:
+            continue
+
+        with connection.cursor() as cursor:
+            existing_columns = {
+                column.name
+                for column in connection.introspection.get_table_description(cursor, table_name)
+            }
+
+        for field_name in field_names:
+            if field_name in existing_columns:
+                continue
+            field = model._meta.get_field(field_name)
+            with connection.schema_editor() as schema_editor:
+                schema_editor.add_field(model, field)
+            existing_columns.add(field_name)
+
     # Email templates are global (default DB in router), ensure table there as well.
     default_connection = connections["default"]
     default_existing = set(default_connection.introspection.table_names())
@@ -463,6 +525,22 @@ def ensure_setup_tables():
     if email_table not in default_existing:
         with default_connection.schema_editor() as schema_editor:
             schema_editor.create_model(email_template_model)
+        default_existing.add(email_table)
+
+    if email_table in default_existing:
+        with default_connection.cursor() as cursor:
+            email_columns = {
+                column.name
+                for column in default_connection.introspection.get_table_description(cursor, email_table)
+            }
+
+        for field_name in ("name", "variables"):
+            if field_name in email_columns:
+                continue
+            field = email_template_model._meta.get_field(field_name)
+            with default_connection.schema_editor() as schema_editor:
+                schema_editor.add_field(email_template_model, field)
+            email_columns.add(field_name)
 
 
 def ensure_setup_management_tables():

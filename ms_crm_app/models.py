@@ -403,12 +403,20 @@ class Departments(models.Model):
     imap_username = models.CharField(max_length=50, blank=True, null=True)
     email = models.CharField(max_length=100, blank=True, null=True)
     email_from_header = models.IntegerField()
-    host = models.CharField(max_length=150, blank=True, null=True)
+    imap_host = models.CharField(max_length=150, blank=True, null=True, db_column="host")
     password = models.TextField(blank=True, null=True)
     encryption = models.CharField(max_length=3, blank=True, null=True)
     delete_after_import = models.IntegerField()
     calendar_id = models.TextField(blank=True, null=True)
     hidefromclient = models.IntegerField()
+
+    @property
+    def host(self):
+        return self.imap_host
+
+    @host.setter
+    def host(self, value):
+        self.imap_host = value
 
     class Meta:
         managed = False

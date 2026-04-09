@@ -11,7 +11,7 @@ from django.contrib.auth.models import User
 from django.contrib.auth.hashers import check_password, make_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import validate_email
-from django.db import transaction
+from django.db import transaction, DatabaseError
 import threading
 
 from django.http import FileResponse
@@ -193,16 +193,20 @@ from .middleware import (
 def timesheets_overview(request):
     from core.middleware import get_current_db
 
-    db = get_current_db()
     try:
+        db = get_current_db()
         queryset = LegacyTaskTimers.objects.using(db).all().order_by("-start_time")
         queryset = _apply_limit(queryset, request)
-    except (ProgrammingError, OperationalError) as exc:
+        rows = list(queryset)
+    except DatabaseError as exc:
         print("Timesheets query failed:", exc)
+        return Response([])
+    except Exception as exc:
+        print("Timesheets overview failed:", exc)
         return Response([])
 
     data = []
-    for index, row in enumerate(queryset, start=1):
+    for index, row in enumerate(rows, start=1):
         start_raw = getattr(row, "start_time", None)
         end_raw = getattr(row, "end_time", None)
         start_label = str(start_raw or "")
@@ -4937,6 +4941,7 @@ def database_backup_download(request, pk):
 from ms_crm_app.helpers.ensure_tables import ensure_setup_tables
 from .models import (
     EmailTemplate,
+    Ticket,
     SetupCustomField,
     SetupContractTemplate,
     SetupCurrency,
@@ -4960,6 +4965,7 @@ from .models import (
 )
 from .serializers import (
     EmailTemplateSerializer,
+    TicketSerializer,
     SetupContractTemplateSerializer,
     SetupCurrencySerializer,
     SetupCustomFieldSerializer,
@@ -5137,12 +5143,20 @@ DEFAULT_SETUP_MODULES = [
         "sort_order": 19,
     },
     {
+        "name": "GDPR",
+        "slug": "gdpr",
+        "description": "Track GDPR access, deletion and data correction requests.",
+        "route": "/setup/gdpr",
+        "icon": "shield-halved",
+        "sort_order": 20,
+    },
+    {
         "name": "Help",
         "slug": "help",
         "description": "Setup module documentation and team self-help knowledge.",
         "route": "/setup/help",
         "icon": "circle-info",
-        "sort_order": 20,
+        "sort_order": 21,
     },
     {
         "name": "Sales Proposals",
@@ -5335,41 +5349,137 @@ class SetupBaseViewSet(viewsets.ModelViewSet):
 
     def _handle_missing_table(self, exc, *, empty_ok):
         msg = str(exc).lower()
-        if "doesn't exist" in msg or "1146" in msg:
+        missing_table_markers = (
+            "doesn't exist",
+            "no such table",
+            "undefined table",
+            "relation does not exist",
+            "1146",
+        )
+        missing_column_markers = (
+            "unknown column",
+            "no such column",
+            "undefined column",
+            "1054",
+        )
+
+        is_missing_table = any(marker in msg for marker in missing_table_markers)
+        is_missing_column = any(marker in msg for marker in missing_column_markers) or (
+            "column" in msg and "does not exist" in msg
+        )
+
+        if is_missing_table or is_missing_column:
             if empty_ok:
                 return Response([])
             return Response(
-                {"detail": "Setup table not found. Run migrations or setup table bootstrap."},
+                {
+                    "detail": (
+                        "Setup schema is out of date. "
+                        "Run migrations or setup table bootstrap."
+                    )
+                },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
         return None
 
+    def _service_unavailable(self, detail, exc=None):
+        payload = {"detail": detail}
+        if exc is not None:
+            payload["error"] = str(exc)
+        return Response(payload, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    def _ensure_database_connection(self):
+        try:
+            db_alias = get_current_db()
+            connections[db_alias].ensure_connection()
+            return None
+        except Exception as exc:
+            return self._service_unavailable(
+                "Service unavailable. Database connection could not be established.",
+                exc=exc,
+            )
+
+    def _handle_db_exception(self, exc, *, empty_ok):
+        handled = self._handle_missing_table(exc, empty_ok=empty_ok)
+        if handled is not None:
+            return handled
+        return self._service_unavailable(
+            "Service unavailable. A database error occurred while processing the request.",
+            exc=exc,
+        )
+
     def list(self, request, *args, **kwargs):
+        connection_error = self._ensure_database_connection()
+        if connection_error is not None:
+            return connection_error
         try:
             return super().list(request, *args, **kwargs)
         except (ProgrammingError, OperationalError) as exc:
-            handled = self._handle_missing_table(exc, empty_ok=True)
-            if handled is not None:
-                return handled
-            raise
+            try:
+                ensure_setup_tables()
+                return super().list(request, *args, **kwargs)
+            except (ProgrammingError, OperationalError) as retry_exc:
+                exc = retry_exc
+            return self._handle_db_exception(exc, empty_ok=True)
+        except DatabaseError as exc:
+            return self._handle_db_exception(exc, empty_ok=True)
 
     def create(self, request, *args, **kwargs):
+        connection_error = self._ensure_database_connection()
+        if connection_error is not None:
+            return connection_error
         try:
             return super().create(request, *args, **kwargs)
         except (ProgrammingError, OperationalError) as exc:
-            handled = self._handle_missing_table(exc, empty_ok=False)
-            if handled is not None:
-                return handled
-            raise
+            try:
+                ensure_setup_tables()
+            except Exception:
+                pass
+            return self._handle_db_exception(exc, empty_ok=False)
+        except DatabaseError as exc:
+            return self._handle_db_exception(exc, empty_ok=False)
+
+    def retrieve(self, request, *args, **kwargs):
+        connection_error = self._ensure_database_connection()
+        if connection_error is not None:
+            return connection_error
+        try:
+            return super().retrieve(request, *args, **kwargs)
+        except (ProgrammingError, OperationalError, DatabaseError) as exc:
+            return self._handle_db_exception(exc, empty_ok=False)
 
     def update(self, request, *args, **kwargs):
+        connection_error = self._ensure_database_connection()
+        if connection_error is not None:
+            return connection_error
         try:
             return super().update(request, *args, **kwargs)
         except (ProgrammingError, OperationalError) as exc:
-            handled = self._handle_missing_table(exc, empty_ok=False)
-            if handled is not None:
-                return handled
-            raise
+            try:
+                ensure_setup_tables()
+            except Exception:
+                pass
+            return self._handle_db_exception(exc, empty_ok=False)
+        except DatabaseError as exc:
+            return self._handle_db_exception(exc, empty_ok=False)
+
+    def partial_update(self, request, *args, **kwargs):
+        connection_error = self._ensure_database_connection()
+        if connection_error is not None:
+            return connection_error
+        try:
+            return super().partial_update(request, *args, **kwargs)
+        except (ProgrammingError, OperationalError, DatabaseError) as exc:
+            return self._handle_db_exception(exc, empty_ok=False)
+
+    def destroy(self, request, *args, **kwargs):
+        connection_error = self._ensure_database_connection()
+        if connection_error is not None:
+            return connection_error
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except (ProgrammingError, OperationalError, DatabaseError) as exc:
+            return self._handle_db_exception(exc, empty_ok=False)
 
 
 class SetupModuleViewSet(SetupBaseViewSet):
@@ -5377,7 +5487,7 @@ class SetupModuleViewSet(SetupBaseViewSet):
 
     def get_queryset(self):
         _seed_setup_modules()
-        queryset = SetupModule.objects.exclude(slug__iexact="gdpr").exclude(name__iexact="GDPR")
+        queryset = SetupModule.objects.all()
 
         include_deleted = str(self.request.query_params.get("include_deleted", "")).strip().lower() in {
             "1",
@@ -5515,18 +5625,354 @@ class EmailTemplateViewSet(SetupBaseViewSet):
     def perform_create(self, serializer):
         subject = serializer.validated_data.get("subject")
         slug_value = serializer.validated_data.get("slug")
+        module_value = str(serializer.validated_data.get("module") or "").strip().lower()
+        variables_value = _normalize_template_variables(serializer.validated_data.get("variables"))
+        if module_value == "ticket" and not variables_value:
+            variables_value = TICKET_TEMPLATE_VARIABLES
+
+        save_kwargs = {"variables": variables_value}
         if not slug_value and subject:
-            serializer.save(slug=slugify(subject))
+            serializer.save(slug=slugify(subject), **save_kwargs)
             return
-        serializer.save()
+        serializer.save(**save_kwargs)
 
     def perform_update(self, serializer):
         subject = serializer.validated_data.get("subject")
         slug_value = serializer.validated_data.get("slug")
+        module_value = str(serializer.validated_data.get("module") or getattr(serializer.instance, "module", "")).strip().lower()
+        raw_variables = serializer.validated_data.get("variables", getattr(serializer.instance, "variables", []))
+        variables_value = _normalize_template_variables(raw_variables)
+        if module_value == "ticket" and not variables_value:
+            variables_value = TICKET_TEMPLATE_VARIABLES
+
+        save_kwargs = {"variables": variables_value}
         if (slug_value is None or slug_value == "") and subject:
-            serializer.save(slug=slugify(subject))
+            serializer.save(slug=slugify(subject), **save_kwargs)
             return
-        serializer.save()
+        serializer.save(**save_kwargs)
+
+
+TICKET_TEMPLATE_VARIABLE_KEYS = [
+    "ticket_id",
+    "customer_name",
+    "email",
+    "subject",
+    "description",
+    "status",
+    "priority",
+    "assigned_to",
+    "created_at",
+]
+TICKET_TEMPLATE_VARIABLES = [f"{{{{{key}}}}}" for key in TICKET_TEMPLATE_VARIABLE_KEYS]
+TICKET_TEMPLATE_PATTERN = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
+TICKET_ACTIONS = {"create", "open", "assign", "update", "close", "reopen"}
+TICKET_ACTION_TEMPLATE_MAP = {
+    "create": "ticket_created",
+    "open": "ticket_updated",
+    "assign": "ticket_assigned",
+    "update": "ticket_updated",
+    "close": "ticket_closed",
+    "reopen": "ticket_reopened",
+}
+TICKET_EMAIL_FALLBACKS = {
+    "ticket_created": {
+        "subject": "Ticket #{{ticket_id}} created",
+        "body": "Hello {{customer_name}}, ticket #{{ticket_id}} has been created.",
+    },
+    "ticket_assigned": {
+        "subject": "Ticket #{{ticket_id}} assigned",
+        "body": "Ticket #{{ticket_id}} is now assigned to {{assigned_to}}.",
+    },
+    "ticket_updated": {
+        "subject": "Ticket #{{ticket_id}} updated",
+        "body": "Ticket #{{ticket_id}} has been updated. Current status: {{status}}.",
+    },
+    "ticket_closed": {
+        "subject": "Ticket #{{ticket_id}} closed",
+        "body": "Ticket #{{ticket_id}} has been closed.",
+    },
+    "ticket_reopened": {
+        "subject": "Ticket #{{ticket_id}} reopened",
+        "body": "Ticket #{{ticket_id}} has been reopened.",
+    },
+    "thank_you": {
+        "subject": "Thank you for contacting support",
+        "body": "Thank you {{customer_name}}. Ticket #{{ticket_id}} is now {{status}}.",
+    },
+}
+
+
+def _normalize_template_variables(raw_variables):
+    if raw_variables in (None, ""):
+        return []
+
+    if isinstance(raw_variables, str):
+        text = raw_variables.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+            raw_variables = parsed
+        except Exception:
+            raw_variables = [item.strip() for item in text.split(",") if item.strip()]
+
+    if isinstance(raw_variables, list):
+        normalized = []
+        for item in raw_variables:
+            token = str(item or "").strip()
+            if token:
+                normalized.append(token)
+        return normalized
+
+    return []
+
+
+def _ticket_template_context(ticket):
+    created_label = ""
+    created_at = getattr(ticket, "created_at", None)
+    if created_at:
+        try:
+            created_label = timezone.localtime(created_at).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            created_label = str(created_at)
+
+    return {
+        "ticket_id": getattr(ticket, "ticket_id", ""),
+        "customer_name": str(getattr(ticket, "customer_name", "") or ""),
+        "email": str(getattr(ticket, "email", "") or ""),
+        "subject": str(getattr(ticket, "subject", "") or ""),
+        "description": str(getattr(ticket, "description", "") or ""),
+        "status": str(getattr(ticket, "status", "") or ""),
+        "priority": str(getattr(ticket, "priority", "") or ""),
+        "assigned_to": str(getattr(ticket, "assigned_to", "") or ""),
+        "created_at": created_label,
+    }
+
+
+def _render_ticket_template(raw_text, context):
+    text = str(raw_text or "")
+    if not text:
+        return ""
+
+    def _replace(match):
+        key = str(match.group(1) or "").strip()
+        if key in context:
+            return str(context.get(key) or "")
+        return match.group(0)
+
+    return TICKET_TEMPLATE_PATTERN.sub(_replace, text)
+
+
+def _send_ticket_template_email(ticket, template_slug):
+    recipient = str(getattr(ticket, "email", "") or "").strip()
+    if not recipient:
+        return {
+            "template_slug": template_slug,
+            "sent": False,
+            "reason": "missing_recipient",
+        }
+
+    try:
+        template = (
+            EmailTemplate.objects.filter(module__iexact="ticket", slug__iexact=template_slug)
+            .order_by("id")
+            .first()
+        )
+    except Exception:
+        template = None
+
+    fallback = TICKET_EMAIL_FALLBACKS.get(template_slug, {})
+    subject_template = (getattr(template, "subject", "") or fallback.get("subject") or "").strip()
+    body_template = getattr(template, "body", "") or fallback.get("body") or ""
+
+    context = _ticket_template_context(ticket)
+    subject = _render_ticket_template(subject_template, context) or f"Ticket #{ticket.ticket_id} update"
+    body = _render_ticket_template(body_template, context)
+
+    from_email = (
+        getattr(settings, "DEFAULT_FROM_EMAIL", None)
+        or getattr(settings, "EMAIL_HOST_USER", None)
+        or None
+    )
+
+    try:
+        message = EmailMessage(
+            subject=subject,
+            body=body,
+            from_email=from_email,
+            to=[recipient],
+        )
+        if "<" in body and ">" in body:
+            message.content_subtype = "html"
+        message.send(fail_silently=False)
+        return {
+            "template_slug": template_slug,
+            "template_id": getattr(template, "id", None),
+            "variables": _normalize_template_variables(getattr(template, "variables", None)) or TICKET_TEMPLATE_VARIABLES,
+            "sent": True,
+        }
+    except Exception as exc:
+        return {
+            "template_slug": template_slug,
+            "template_id": getattr(template, "id", None),
+            "variables": _normalize_template_variables(getattr(template, "variables", None)) or TICKET_TEMPLATE_VARIABLES,
+            "sent": False,
+            "error": str(exc),
+        }
+
+
+class TicketViewSet(SetupBaseViewSet):
+    serializer_class = TicketSerializer
+
+    def get_queryset(self):
+        try:
+            seed_email_templates_optimized()
+        except Exception as exc:
+            print("Ticket template seed failed:", exc)
+
+        queryset = Ticket.objects.all()
+
+        status_filter = str(self.request.query_params.get("status", "")).strip().lower()
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+
+        priority_filter = str(self.request.query_params.get("priority", "")).strip().lower()
+        if priority_filter:
+            queryset = queryset.filter(priority=priority_filter)
+
+        assigned_to = str(self.request.query_params.get("assigned_to", "")).strip()
+        if assigned_to:
+            queryset = queryset.filter(assigned_to__icontains=assigned_to)
+
+        search = str(self.request.query_params.get("search", "")).strip()
+        if search:
+            numeric_ticket_id = None
+            try:
+                numeric_ticket_id = int(search)
+            except Exception:
+                numeric_ticket_id = None
+
+            query = (
+                Q(customer_name__icontains=search)
+                | Q(email__icontains=search)
+                | Q(subject__icontains=search)
+                | Q(description__icontains=search)
+                | Q(assigned_to__icontains=search)
+            )
+            if numeric_ticket_id is not None:
+                query = query | Q(ticket_id=numeric_ticket_id)
+            queryset = queryset.filter(query)
+
+        return queryset.order_by("-created_at", "-ticket_id")
+
+    @action(detail=False, methods=["post"], url_path="lifecycle")
+    def lifecycle(self, request):
+        payload = request.data if isinstance(request.data, dict) else {}
+        action_name = str(payload.get("action") or "create").strip().lower()
+
+        if action_name not in TICKET_ACTIONS:
+            return Response(
+                {"detail": "Invalid action. Use create, open, assign, update, close, or reopen."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        all_mutable_fields = {
+            key: payload.get(key)
+            for key in (
+                "customer_name",
+                "email",
+                "subject",
+                "description",
+                "status",
+                "priority",
+                "assigned_to",
+            )
+            if key in payload and payload.get(key) not in (None, "")
+        }
+
+        if action_name == "create":
+            serializer = self.get_serializer(data=all_mutable_fields)
+            serializer.is_valid(raise_exception=True)
+            ticket = serializer.save()
+
+            email_events = [
+                _send_ticket_template_email(ticket, TICKET_ACTION_TEMPLATE_MAP["create"]),
+            ]
+
+            return Response(
+                {
+                    "detail": "Ticket created successfully.",
+                    "action": action_name,
+                    "ticket": self.get_serializer(ticket).data,
+                    "emails": email_events,
+                },
+                status=status.HTTP_201_CREATED,
+            )
+
+        ticket_id = payload.get("ticket_id") or payload.get("id")
+        if ticket_id in (None, ""):
+            return Response(
+                {"detail": "ticket_id is required for this action."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        ticket = Ticket.objects.filter(ticket_id=ticket_id).first()
+        if not ticket:
+            return Response({"detail": "Ticket not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        response_message = "Ticket updated successfully."
+        email_template_slug = TICKET_ACTION_TEMPLATE_MAP.get(action_name, "ticket_updated")
+        mutable_fields = dict(all_mutable_fields)
+
+        if action_name == "assign":
+            assigned_to = str(payload.get("assigned_to") or "").strip()
+            if not assigned_to:
+                return Response(
+                    {"detail": "assigned_to is required for assign action."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            mutable_fields["assigned_to"] = assigned_to
+            if "status" not in mutable_fields:
+                mutable_fields["status"] = Ticket.STATUS_IN_PROGRESS
+            response_message = "Ticket assigned successfully."
+        elif action_name == "close":
+            mutable_fields = {}
+            mutable_fields["status"] = Ticket.STATUS_CLOSED
+            response_message = "Ticket closed successfully."
+        elif action_name == "reopen":
+            mutable_fields = {}
+            mutable_fields["status"] = Ticket.STATUS_OPEN
+            response_message = "Ticket reopened successfully."
+        elif action_name == "open":
+            mutable_fields = {}
+            mutable_fields["status"] = Ticket.STATUS_OPEN
+            response_message = "Ticket opened successfully."
+        elif action_name == "update":
+            response_message = "Ticket updated successfully."
+
+        if action_name == "update" and not mutable_fields:
+            return Response(
+                {"detail": "Provide at least one ticket field to update."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = self.get_serializer(ticket, data=mutable_fields, partial=True)
+        serializer.is_valid(raise_exception=True)
+        ticket = serializer.save()
+
+        email_events = [_send_ticket_template_email(ticket, email_template_slug)]
+        if action_name == "close":
+            email_events.append(_send_ticket_template_email(ticket, "thank_you"))
+
+        return Response(
+            {
+                "detail": response_message,
+                "action": action_name,
+                "ticket": self.get_serializer(ticket).data,
+                "emails": email_events,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 CUSTOM_FIELD_MODULE_ALIASES = {
@@ -6215,6 +6661,7 @@ class SetupCustomerGroupAssignmentViewSet(SetupBaseViewSet):
 class SetupThemeStyleViewSet(SetupBaseViewSet):
     serializer_class = SetupThemeStyleSerializer
 
+
     def get_queryset(self):
         queryset = SetupThemeStyle.objects.all()
         active = str(self.request.query_params.get("active", "")).strip().lower()
@@ -6405,6 +6852,8 @@ class SetupRolePermissionViewSet(SetupBaseViewSet):
         if module_slug:
             queryset = queryset.filter(module_slug__iexact=module_slug)
         return queryset.order_by("role_id", "module_slug", "id")
+
+
 
 
 

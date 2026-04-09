@@ -1,3 +1,6 @@
+import re
+
+from django.core.validators import validate_email
 from rest_framework import serializers;
 # Import the app-specific models.
 from .models import *;
@@ -89,21 +92,106 @@ class SetupTaskSerializers(SetupTaskSerializer):
 
 # Serializer for Ticket Status model
 class TicketsStatusSerializer(serializers.ModelSerializer):
+    color = serializers.CharField(source="statuscolor", required=False, allow_blank=True)
+
     class Meta:
         model = TicketsStatus
         fields = "__all__"
 
+    def validate_name(self, value):
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            raise serializers.ValidationError("name is required.")
+        return cleaned
+
+    def validate(self, attrs):
+        # Keep legacy table required ints backward-compatible for sparse payloads.
+        if attrs.get("isdefault") is None:
+            attrs["isdefault"] = getattr(self.instance, "isdefault", 0) if self.instance else 0
+        if attrs.get("statusorder") is None:
+            attrs["statusorder"] = getattr(self.instance, "statusorder", 0) if self.instance else 0
+        return attrs
+
 # Serializer for Departments model
 class DepartmentsSerializer(serializers.ModelSerializer):
+    imap_host = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    host = serializers.CharField(source="imap_host", required=False, allow_blank=True, allow_null=True, write_only=True)
+
     class Meta:
         model = Departments
         fields = "__all__"
+        extra_kwargs = {
+            "email_from_header": {"required": False},
+            "delete_after_import": {"required": False},
+            "hidefromclient": {"required": False},
+            "imap_username": {"required": False, "allow_blank": True, "allow_null": True},
+            "password": {"required": False, "allow_blank": True, "allow_null": True},
+            "encryption": {"required": False, "allow_blank": True, "allow_null": True},
+            "calendar_id": {"required": False, "allow_blank": True, "allow_null": True},
+        }
+
+    def validate_name(self, value):
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            raise serializers.ValidationError("name is required.")
+        return cleaned
+
+    def validate_email(self, value):
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            return cleaned
+        try:
+            validate_email(cleaned)
+        except Exception:
+            raise serializers.ValidationError("Enter a valid email address.")
+        return cleaned
+
+    def validate_imap_host(self, value):
+        host = str(value or "").strip()
+        if not host:
+            return host
+        # Basic hostname format, e.g. imap.gmail.com
+        if not re.fullmatch(r"^(?=.{1,255}$)(?!-)(?:[a-zA-Z0-9-]{1,63}\.)+[A-Za-z]{2,63}$", host):
+            raise serializers.ValidationError("Enter a valid IMAP host, e.g. imap.gmail.com.")
+        return host
+
+    def validate(self, attrs):
+        # Support sparse legacy payloads by supplying defaults for required int columns.
+        if self.instance is not None:
+            attrs.setdefault("email_from_header", getattr(self.instance, "email_from_header", 1))
+            attrs.setdefault("delete_after_import", getattr(self.instance, "delete_after_import", 0))
+            attrs.setdefault("hidefromclient", getattr(self.instance, "hidefromclient", 0))
+        else:
+            attrs.setdefault("email_from_header", 1)
+            attrs.setdefault("delete_after_import", 0)
+            attrs.setdefault("hidefromclient", 0)
+        return attrs
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["host"] = data.get("imap_host", "")
+        return data
 
 # Serializer for TicketsPredefinedReplies model
 class TicketsPredefinedRepliesSerializer(serializers.ModelSerializer):
+    response = serializers.CharField(source="message", required=False, allow_blank=True)
+    department = serializers.CharField(required=False, allow_blank=True, write_only=True)
+
     class Meta:
         model = TicketsPredefinedReplies
         fields = "__all__"
+
+    def validate_name(self, value):
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            raise serializers.ValidationError("name is required.")
+        return cleaned
+
+    def validate(self, attrs):
+        if not str(attrs.get("message", "") or "").strip():
+            raise serializers.ValidationError({"response": "response is required."})
+        attrs.pop("department", None)
+        return attrs
 
 # Serializer for TicketsPriorities model
 class TicketsPrioritiesSerializer(serializers.ModelSerializer):
@@ -113,15 +201,45 @@ class TicketsPrioritiesSerializer(serializers.ModelSerializer):
 
 # Serializer for Services model
 class ServicesSerializer(serializers.ModelSerializer):
+    category = serializers.CharField(required=False, allow_blank=True, write_only=True)
+    status = serializers.CharField(required=False, allow_blank=True, write_only=True)
+
     class Meta:
         model = Services
         fields = "__all__"
 
+    def validate_name(self, value):
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            raise serializers.ValidationError("name is required.")
+        return cleaned
+
+    def validate(self, attrs):
+        attrs.pop("category", None)
+        attrs.pop("status", None)
+        return attrs
+
 # Serializer for SpamFilters model
 class SpamFiltersSerializer(serializers.ModelSerializer):
+    rule = serializers.CharField(source="value", required=False, allow_blank=True)
+    action = serializers.CharField(source="rel_type", required=False, allow_blank=True)
+
     class Meta:
         model = SpamFilters
         fields = "__all__"
+
+    def validate_type(self, value):
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            raise serializers.ValidationError("type is required.")
+        return cleaned
+
+    def validate(self, attrs):
+        if not str(attrs.get("value", "") or "").strip():
+            raise serializers.ValidationError({"rule": "rule is required."})
+        if not str(attrs.get("rel_type", "") or "").strip():
+            attrs["rel_type"] = "ticket"
+        return attrs
 
 
 class ProductSerializer(serializers.ModelSerializer):

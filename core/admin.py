@@ -8,6 +8,7 @@ from django.shortcuts import redirect
 # longer imported.
 from .models import (
     Business,
+    EmailTemplate,
     Project,
     # StaffProxy,
     # KnowledgeBaseProxy,
@@ -19,6 +20,7 @@ from .models import Proposal
 from django.contrib import admin
 from .models import Expense
 from .models import Contract
+from .models import Ticket
 
 from django.contrib import admin
 from .models import Lead
@@ -271,6 +273,31 @@ class ExpenseAdmin(admin.ModelAdmin):
     list_filter = ("category", "status", "payment_mode")
 
     ordering = ("-id",)
+
+
+@admin.register(EmailTemplate)
+class EmailTemplateAdmin(admin.ModelAdmin):
+    list_display = ("id", "name", "module", "slug", "language", "subject")
+    search_fields = ("name", "module", "slug", "subject", "body")
+    list_filter = ("module", "language")
+    ordering = ("module", "slug", "language", "id")
+
+
+@admin.register(Ticket)
+class TicketAdmin(admin.ModelAdmin):
+    list_display = (
+        "ticket_id",
+        "customer_name",
+        "email",
+        "subject",
+        "status",
+        "priority",
+        "assigned_to",
+        "created_at",
+    )
+    search_fields = ("ticket_id", "customer_name", "email", "subject", "assigned_to")
+    list_filter = ("status", "priority", "created_at")
+    ordering = ("-created_at", "-ticket_id")
 
 # ==============================
 # LEAD ADMIN

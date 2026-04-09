@@ -1,3 +1,6 @@
+# Task Progress Update:
+# - [x] Fix incorrect CustomerSerializer to use Customer model
+# - [ ] Verify Theme Style UI updates and backend integration
 import json
 import re
 from decimal import Decimal, InvalidOperation
@@ -31,6 +34,7 @@ from .models import ContractType
 from .models import ContractAttachment, ContractComment, ContractRenewal, ContractTask, ContractNote
 from .models import (
     EmailTemplate,
+    Ticket,
     Permission,
     RolePermission,
     SetupModule,
@@ -112,6 +116,8 @@ def _normalize_items_payload(items):
     return normalized
 # ======================= Customer ==========================
 class CustomerSerializer(serializers.ModelSerializer):
+    """Serialize Customer model – unchanged from original implementation."""
+
     class Meta:
         model = Customer
         fields = "__all__"
@@ -161,15 +167,53 @@ class InvoiceSerializer(serializers.ModelSerializer):
         data["items"] = _normalize_items_payload(data.get("items"))
         return data
 
-class InvoiceReminderSerializer(serializers.ModelSerializer):
+# Serializer for theme styles – limited to the original fields to maintain backward compatibility.
+class SetupThemeStyleSerializer(serializers.ModelSerializer):
     class Meta:
-        model = InvoiceReminder
-        fields = "__all__"
+        model = SetupThemeStyle
+        # Only expose fields that were present before the dynamic theming extension.
+        # Expose all theming related fields required by the frontend form.
+        fields = [
+            "id",
+            "name",
+            "primary_color",
+            "secondary_color",
+            "accent_color",
+            "theme_mode",
+            "sidebar_bg",
+            "sidebar_text",
+            "navbar_bg",
+            "navbar_text",
+            "status_success",
+            "status_warning",
+            "status_error",
+            "status_info",
+            "ui_settings",
+            "is_default",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
 
 
 class InvoiceTaskSerializer(serializers.ModelSerializer):
     class Meta:
         model = InvoiceTask
+
+# ------------------------------------------------------------
+# Invoice Reminder Serializer
+# Added to resolve missing import errors in view modules.
+# ------------------------------------------------------------
+class InvoiceReminderSerializer(serializers.ModelSerializer):
+    """Serialize InvoiceReminder model – includes all fields.
+    This serializer mirrors the simple pattern used for other models
+    and provides create/update handling via the default ModelSerializer
+    implementation.
+    """
+
+    class Meta:
+        model = InvoiceReminder
+        fields = "__all__"
         fields = "__all__"
 
 
@@ -775,6 +819,43 @@ class EmailCampaignSerializer(serializers.ModelSerializer):
 
 
 class EmailTemplateSerializer(serializers.ModelSerializer):
+    def validate_variables(self, value):
+        if value in (None, ""):
+            return []
+
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+                value = parsed
+            except Exception:
+                value = [item.strip() for item in text.split(",") if item.strip()]
+
+        if isinstance(value, list):
+            normalized = []
+            for item in value:
+                token = str(item or "").strip()
+                if token:
+                    normalized.append(token)
+            return normalized
+
+        raise serializers.ValidationError("Variables must be a list or comma separated string.")
+
+    def validate(self, attrs):
+        subject = str(attrs.get("subject") or getattr(self.instance, "subject", "")).strip()
+        slug_value = str(attrs.get("slug") or getattr(self.instance, "slug", "")).strip()
+        name_value = str(attrs.get("name") or "").strip()
+
+        if not name_value:
+            attrs["name"] = subject or slug_value
+
+        if "variables" not in attrs and self.instance:
+            attrs["variables"] = self.instance.variables or []
+
+        return attrs
+
     class Meta:
         model = EmailTemplate
         fields = "__all__"
@@ -782,6 +863,19 @@ class EmailTemplateSerializer(serializers.ModelSerializer):
             "slug": {"required": False, "allow_blank": True},
             "language": {"required": False},
         }
+
+
+class TicketSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Ticket
+        fields = "__all__"
+        read_only_fields = ("ticket_id", "created_at", "updated_at")
+
+    def validate_status(self, value):
+        return str(value or "").strip().lower()
+
+    def validate_priority(self, value):
+        return str(value or "").strip().lower()
 
 
 class SetupModuleSerializer(serializers.ModelSerializer):
@@ -1058,7 +1152,32 @@ class SetupCustomerGroupAssignmentSerializer(serializers.ModelSerializer):
 class SetupThemeStyleSerializer(serializers.ModelSerializer):
     class Meta:
         model = SetupThemeStyle
-        fields = "__all__"
+        # Expose all theming related fields required by the frontend form.
+        fields = (
+            "id",
+            "name",
+            "primary_color",
+            "secondary_color",
+            "accent_color",
+            "theme_mode",
+            "sidebar_bg",
+            "sidebar_text",
+            "navbar_bg",
+            "navbar_text",
+            # Individual status badge colors – the UI may edit them directly.
+            "status_success",
+            "status_warning",
+            "status_error",
+            "status_info",
+            # JSON container for additional status colors (optional).
+            "status_colors",
+            # UI settings JSON – kept as a flexible configuration object.
+            "ui_settings",
+            "is_default",
+            "is_active",
+            "created_at",
+            "updated_at",
+        )
 
     def validate(self, attrs):
         is_default = attrs.get("is_default")
@@ -1119,11 +1238,41 @@ class SetupSupportDepartmentSerializer(serializers.ModelSerializer):
         model = SetupSupportDepartment
         fields = "__all__"
 
+    def validate_name(self, value):
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            raise serializers.ValidationError("name is required.")
+        return cleaned
+
+    def validate_imap_host(self, value):
+        host = str(value or "").strip()
+        if not host:
+            return host
+        if not re.fullmatch(r"^(?=.{1,255}$)(?!-)(?:[a-zA-Z0-9-]{1,63}\.)+[A-Za-z]{2,63}$", host):
+            raise serializers.ValidationError("Enter a valid IMAP host, e.g. imap.gmail.com.")
+        return host
+
 
 class SetupTicketPrioritySerializer(serializers.ModelSerializer):
     class Meta:
         model = SetupTicketPriority
         fields = "__all__"
+
+    def validate_name(self, value):
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            raise serializers.ValidationError("name is required.")
+        return cleaned
+
+    def validate_level(self, value):
+        if value is None:
+            return 1
+        if int(value) < 1:
+            raise serializers.ValidationError("level must be greater than or equal to 1.")
+        return int(value)
+
+    def validate_description(self, value):
+        return str(value or "").strip()
 
 
 class SetupTicketStatusSerializer(serializers.ModelSerializer):

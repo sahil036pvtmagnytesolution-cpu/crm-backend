@@ -86,8 +86,10 @@ from .views import (
     SetupThemeStyleViewSet,
     SetupTicketPriorityViewSet,
     SetupTicketStatusViewSet,
+    SetupGDPRRequestViewSet,
     SetupCustomerGroupViewSet,
     SetupCustomerGroupAssignmentViewSet,
+    TicketViewSet,
 )
 from ms_crm_app.views import manage_data as legacy_manage_data
 from .views import (
@@ -118,6 +120,7 @@ router.register(r'proposals', ProposalViewSet)
 router.register(r'projects', ProjectViewSet, basename="projects")
 router.register(r'setup/modules', SetupModuleViewSet, basename="setup-modules")
 router.register(r'setup/email-templates', EmailTemplateViewSet, basename="setup-email-templates")
+router.register(r'setup/tickets', TicketViewSet, basename="setup-tickets")
 router.register(r'setup/custom-fields', SetupCustomFieldViewSet, basename="setup-custom-fields")
 router.register(r'setup/settings', SetupSettingViewSet, basename="setup-settings")
 router.register(r'setup/help-articles', SetupHelpArticleViewSet, basename="setup-help-articles")
@@ -131,6 +134,7 @@ router.register(r'setup/expense-categories', SetupExpenseCategoryViewSet, basena
 router.register(r'setup/support-departments', SetupSupportDepartmentViewSet, basename="setup-support-departments")
 router.register(r'setup/ticket-priorities', SetupTicketPriorityViewSet, basename="setup-ticket-priorities")
 router.register(r'setup/ticket-statuses', SetupTicketStatusViewSet, basename="setup-ticket-statuses")
+router.register(r'setup/gdpr-requests', SetupGDPRRequestViewSet, basename="setup-gdpr-requests")
 router.register(r'setup/predefined-replies', SetupPredefinedReplyViewSet, basename="setup-predefined-replies")
 router.register(r'setup/lead-sources', SetupLeadSourceViewSet, basename="setup-lead-sources")
 router.register(r'setup/lead-statuses', SetupLeadStatusViewSet, basename="setup-lead-statuses")

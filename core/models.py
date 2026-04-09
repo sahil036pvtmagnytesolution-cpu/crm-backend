@@ -36,11 +36,13 @@ class LegacyBusiness(models.Model):
 
 
 class EmailTemplate(models.Model):
+    name = models.CharField(max_length=191, blank=True, default="")
     module = models.CharField(max_length=50)
     slug = models.CharField(max_length=100)
     language = models.CharField(max_length=20, default="english")
     subject = models.CharField(max_length=255)
     body = models.TextField()
+    variables = models.JSONField(default=list, blank=True)
 
     class Meta:
         unique_together = ("module", "slug", "language")
@@ -49,7 +51,47 @@ class EmailTemplate(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.module} - {self.slug}"
+        return self.name or f"{self.module} - {self.slug}"
+
+
+class Ticket(models.Model):
+    STATUS_OPEN = "open"
+    STATUS_IN_PROGRESS = "in_progress"
+    STATUS_CLOSED = "closed"
+    STATUS_CHOICES = [
+        (STATUS_OPEN, "Open"),
+        (STATUS_IN_PROGRESS, "In Progress"),
+        (STATUS_CLOSED, "Closed"),
+    ]
+
+    PRIORITY_LOW = "low"
+    PRIORITY_MEDIUM = "medium"
+    PRIORITY_HIGH = "high"
+    PRIORITY_URGENT = "urgent"
+    PRIORITY_CHOICES = [
+        (PRIORITY_LOW, "Low"),
+        (PRIORITY_MEDIUM, "Medium"),
+        (PRIORITY_HIGH, "High"),
+        (PRIORITY_URGENT, "Urgent"),
+    ]
+
+    ticket_id = models.AutoField(primary_key=True)
+    customer_name = models.CharField(max_length=191)
+    email = models.EmailField()
+    subject = models.CharField(max_length=255)
+    description = models.TextField()
+    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default=STATUS_OPEN, db_index=True)
+    priority = models.CharField(max_length=30, choices=PRIORITY_CHOICES, default=PRIORITY_MEDIUM, db_index=True)
+    assigned_to = models.CharField(max_length=191, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "core_ticket"
+        ordering = ["-created_at", "-ticket_id"]
+
+    def __str__(self):
+        return f"#{self.ticket_id} {self.subject}"
 
 
 class SetupModule(models.Model):
@@ -375,9 +417,25 @@ class SetupCustomerGroupAssignment(models.Model):
 # ⚠️ renamed (duplicate model avoid)
 class SetupThemeStyle(models.Model):
     name = models.CharField(max_length=120, unique=True, db_index=True)
+    # Original theming fields retained for backward compatibility.
+    # Base palette colors
     primary_color = models.CharField(max_length=7, default="#0d6efd")
     secondary_color = models.CharField(max_length=7, default="#6c757d")
     accent_color = models.CharField(max_length=7, default="#198754")
+    # Dynamic theming extensions
+    theme_mode = models.CharField(max_length=5, choices=[("light", "Light"), ("dark", "Dark")], default="light")
+    sidebar_bg = models.CharField(max_length=7, default="#011e34")
+    sidebar_text = models.CharField(max_length=7, default="#ffffff")
+    navbar_bg = models.CharField(max_length=7, default="#011e34")
+    navbar_text = models.CharField(max_length=7, default="#ffffff")
+    # Status badge colors
+    status_success = models.CharField(max_length=7, default="#28a745")
+    status_warning = models.CharField(max_length=7, default="#ffc107")
+    status_error = models.CharField(max_length=7, default="#dc3545")
+    status_info = models.CharField(max_length=7, default="#17a2b8")
+    # JSON container for additional status colors (optional)
+    status_colors = models.JSONField(default=dict, blank=True)
+    # UI settings JSON – kept as a flexible configuration object.
     ui_settings = models.JSONField(default=dict, blank=True)
     is_default = models.BooleanField(default=False, db_index=True)
     is_active = models.BooleanField(default=True, db_index=True)
@@ -462,6 +520,7 @@ class SetupExpenseCategory(models.Model):
 class SetupSupportDepartment(models.Model):
     name = models.CharField(max_length=120, unique=True, db_index=True)
     email = models.EmailField(blank=True, null=True)
+    imap_host = models.CharField(max_length=255, blank=True, default="")
     is_active = models.BooleanField(default=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -477,6 +536,7 @@ class SetupSupportDepartment(models.Model):
 class SetupTicketPriority(models.Model):
     name = models.CharField(max_length=80, unique=True, db_index=True)
     level = models.PositiveSmallIntegerField(default=1)
+    description = models.TextField(blank=True, default="")
     is_active = models.BooleanField(default=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)

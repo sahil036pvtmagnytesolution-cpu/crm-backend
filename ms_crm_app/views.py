@@ -1,7 +1,8 @@
 from django.shortcuts import get_object_or_404
 from django.conf import settings
+from django.http import Http404
 from django.utils import timezone
-from django.db import ProgrammingError, OperationalError, connections
+from django.db import DatabaseError, ProgrammingError, OperationalError, connections
 from .models import ActivityLog
 from django.apps import apps
 import csv
@@ -404,6 +405,19 @@ def manage_data(request, model_name, item_id=None, field=None, value=None):
             print("Setup management table ensure failed:", exc)
 
     try:
+        db_alias = get_current_db()
+        connections[db_alias].ensure_connection()
+    except Exception as exc:
+        logger.exception("Database connection unavailable for manage_data(%s): %s", model_name, exc)
+        return Response(
+            {
+                "detail": "Service unavailable. Database connection could not be established.",
+                "error": str(exc),
+            },
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    try:
         if request.method == 'GET':
             queryset = get_filtered_queryset(
                 model,
@@ -436,7 +450,10 @@ def manage_data(request, model_name, item_id=None, field=None, value=None):
             if serializer.is_valid():
                 serializer.save()
                 return Response(serializer.data, status=status.HTTP_201_CREATED)
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": "Validation failed.", "errors": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if request.method == 'PUT':
             if not item_id:
                 return Response(
@@ -451,7 +468,10 @@ def manage_data(request, model_name, item_id=None, field=None, value=None):
                 serializer.save()
                 return Response(serializer.data, status=status.HTTP_200_OK)
 
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": "Validation failed.", "errors": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         if request.method == 'DELETE':
             if not item_id:
@@ -475,7 +495,31 @@ def manage_data(request, model_name, item_id=None, field=None, value=None):
                 {"detail": "Table not found for this tenant. Bootstrap setup tables or run migrations."},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
-        raise
+        logger.exception("Database operation error in manage_data(%s): %s", model_name, exc)
+        return Response(
+            {
+                "detail": "Service unavailable. A database error occurred while processing the request.",
+                "error": str(exc),
+            },
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    except DatabaseError as exc:
+        logger.exception("Unhandled database error in manage_data(%s): %s", model_name, exc)
+        return Response(
+            {
+                "detail": "Service unavailable. A database error occurred while processing the request.",
+                "error": str(exc),
+            },
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    except Http404:
+        return Response({"detail": "Record not found."}, status=status.HTTP_404_NOT_FOUND)
+    except Exception as exc:
+        logger.exception("Unexpected manage_data failure for %s: %s", model_name, exc)
+        return Response(
+            {"detail": "Service unavailable. Unexpected server error.", "error": str(exc)},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
 
 # ======================================================
 # GDPR Specific API
