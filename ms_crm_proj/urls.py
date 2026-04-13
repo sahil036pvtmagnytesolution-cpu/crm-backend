@@ -31,6 +31,7 @@ from core.views import (
     role_detail_api,
     roles_create_api,
     roles_list_api,
+    SetupModuleViewSet,
 )
 
 urlpatterns = [
@@ -54,6 +55,33 @@ urlpatterns = [
     path("api/roles/permissions", permissions_catalog_api),
     path("api/roles/my-permissions/", my_permissions_api),
     path("api/roles/my-permissions", my_permissions_api),
+    path(
+        "api/modules/",
+        SetupModuleViewSet.as_view({"get": "list", "post": "create"}),
+        name="api-modules-list",
+    ),
+    path(
+        "api/modules/<int:pk>/",
+        SetupModuleViewSet.as_view(
+            {
+                "get": "retrieve",
+                "put": "update",
+                "patch": "partial_update",
+                "delete": "destroy",
+            }
+        ),
+        name="api-modules-detail",
+    ),
+    path(
+        "api/modules/<int:pk>/restore/",
+        SetupModuleViewSet.as_view({"post": "restore"}),
+        name="api-modules-restore",
+    ),
+    path(
+        "api/modules/bulk-toggle/",
+        SetupModuleViewSet.as_view({"post": "bulk_toggle"}),
+        name="api-modules-bulk-toggle",
+    ),
     path("api/items/", public_items_list),
     path("api/activity-logs/", activity_logs_api),
     path("core_api/", include("core.urls")),

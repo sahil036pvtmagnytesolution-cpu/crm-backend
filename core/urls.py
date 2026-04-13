@@ -118,6 +118,7 @@ router.register(r'calendar-events', CalendarEventViewSet, basename="calendar-eve
 router.register(r'estimates', EstimateViewSet, basename='estimates')
 router.register(r'proposals', ProposalViewSet)
 router.register(r'projects', ProjectViewSet, basename="projects")
+router.register(r'modules', SetupModuleViewSet, basename="modules")
 router.register(r'setup/modules', SetupModuleViewSet, basename="setup-modules")
 router.register(r'setup/email-templates', EmailTemplateViewSet, basename="setup-email-templates")
 router.register(r'setup/tickets', TicketViewSet, basename="setup-tickets")

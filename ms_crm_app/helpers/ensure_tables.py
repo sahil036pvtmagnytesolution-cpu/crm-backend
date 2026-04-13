@@ -71,6 +71,20 @@ def ensure_staff_table():
                 VALUES ('admin@example.com', 'Admin', 'User', '', NOW(), 1, 1, 0)
             """)
 
+        cursor.execute("SHOW TABLES LIKE 'ms_staff_permissions'")
+        permissions_exists = cursor.fetchone()
+        if not permissions_exists:
+            cursor.execute("""
+                CREATE TABLE ms_staff_permissions (
+                    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    staff_id INT NOT NULL,
+                    feature VARCHAR(40) NOT NULL,
+                    capability VARCHAR(100) NOT NULL,
+                    KEY idx_ms_staff_permissions_staff (staff_id),
+                    UNIQUE KEY uq_ms_staff_permissions_staff_feature_capability (staff_id, feature, capability)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3
+            """)
+
 
 def ensure_project_tables():
     """Ensure core_project (and its M2M table) exist for the current DB."""

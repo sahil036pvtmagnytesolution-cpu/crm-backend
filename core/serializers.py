@@ -11,6 +11,7 @@ from django.utils import timezone
 from django.utils.dateparse import parse_date
 from django.utils.text import slugify
 from django.db import transaction
+from django.db.utils import OperationalError, ProgrammingError
 from rest_framework import serializers
 from .models import Business, Contact, CreditNote, CreditNoteReminder, CreditNoteTask, Customer, Item, ItemGroup, Role, Proposal, CustomFieldValue
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
@@ -61,7 +62,7 @@ from .models import (
 )
 from .item_master import sync_items_to_master
 from .models import Project
-from ms_crm_app.models import Staff
+from ms_crm_app.models import Staff, StaffPermissions
 from .middleware import (
     RBAC_ACTIONS,
     canonicalize_module,
@@ -883,12 +884,109 @@ class SetupModuleSerializer(serializers.ModelSerializer):
     # This aligns the backend representation with the frontend expectations,
     # which checks for `is_active`, `active`, or `enabled` to determine module status.
     is_active = serializers.BooleanField(source="is_enabled", required=False)
+    order = serializers.IntegerField(source="sort_order", required=False, min_value=0)
 
     class Meta:
         model = SetupModule
-        # Include all model fields plus the alias. Using "__all__" already brings
-        # `is_enabled`; adding `is_active` provides a convenient duplicate name.
-        fields = "__all__"
+        fields = [
+            "id",
+            "name",
+            "slug",
+            "description",
+            "route",
+            "icon",
+            "is_enabled",
+            "is_active",
+            "sort_order",
+            "order",
+            "is_deleted",
+            "deleted_at",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ("id", "created_at", "updated_at", "deleted_at")
+        extra_kwargs = {
+            "slug": {"required": False, "allow_blank": True},
+            "name": {"required": False, "allow_blank": True},
+            "route": {"required": False, "allow_blank": True, "allow_null": True},
+            "icon": {"required": False, "allow_blank": True, "allow_null": True},
+            "description": {"required": False, "allow_blank": True, "allow_null": True},
+        }
+
+    def validate_slug(self, value):
+        return slugify(str(value or "").strip())
+
+    @staticmethod
+    def _normalize_route_key(value):
+        route_value = str(value or "").strip()
+        if not route_value:
+            return ""
+        normalized_route = "/" + route_value.lstrip("/")
+        if normalized_route != "/":
+            normalized_route = normalized_route.rstrip("/")
+        return normalized_route.lower()
+
+    def validate_route(self, value):
+        route_value = str(value or "").strip()
+        if not route_value:
+            return ""
+
+        if not route_value.startswith("/"):
+            raise serializers.ValidationError("Route must start with '/'.")
+
+        normalized_route = "/" + route_value.lstrip("/")
+        if normalized_route != "/":
+            normalized_route = normalized_route.rstrip("/")
+        return normalized_route
+
+    def validate(self, attrs):
+        name_value = str(
+            attrs.get("name", getattr(self.instance, "name", ""))
+        ).strip()
+        slug_value = str(
+            attrs.get("slug", getattr(self.instance, "slug", ""))
+        ).strip()
+
+        if not slug_value:
+            slug_value = slugify(name_value)
+        if not slug_value:
+            raise serializers.ValidationError({"slug": "Slug is required."})
+
+        if not name_value:
+            name_value = slug_value.replace("-", " ").title()
+
+        attrs["slug"] = slug_value
+        attrs["name"] = name_value
+
+        queryset = SetupModule.objects.all()
+        if self.instance:
+            queryset = queryset.exclude(pk=self.instance.pk)
+
+        if queryset.filter(slug__iexact=slug_value).exists():
+            raise serializers.ValidationError({"slug": "Slug must be unique."})
+
+        route_in_payload = "route" in attrs
+        route_value = attrs.get("route", getattr(self.instance, "route", ""))
+        route_value = str(route_value or "").strip()
+        current_route = str(getattr(self.instance, "route", "") or "").strip()
+        route_key = self._normalize_route_key(route_value)
+        current_route_key = self._normalize_route_key(current_route)
+
+        should_validate_route_uniqueness = (
+            (not self.instance and bool(route_value))
+            or (
+                self.instance
+                and route_in_payload
+                and route_key != current_route_key
+                and bool(route_value)
+            )
+        )
+        if should_validate_route_uniqueness:
+            for existing_route in queryset.values_list("route", flat=True):
+                if self._normalize_route_key(existing_route) == route_key:
+                    raise serializers.ValidationError({"route": "Route must be unique."})
+
+        return attrs
 
 
 class SetupCustomFieldSerializer(serializers.ModelSerializer):
@@ -1327,6 +1425,8 @@ class SetupRolePermissionSerializer(serializers.ModelSerializer):
 
 # ================= STAFF =================
 class StaffSerializer(serializers.ModelSerializer):
+    permissions = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
         model = Staff
         fields = [
@@ -1355,6 +1455,7 @@ class StaffSerializer(serializers.ModelSerializer):
             "hourly_rate",
             "two_factor_auth_enabled",
             "email_signature",
+            "permissions",
         ]
         extra_kwargs = {
             "password": {"write_only": True},
@@ -1368,6 +1469,29 @@ class StaffSerializer(serializers.ModelSerializer):
             "two_factor_auth_code": {"write_only": True},
             "two_factor_auth_code_requested": {"read_only": True},
         }
+
+    def get_permissions(self, obj):
+        try:
+            permission_rows = (
+                StaffPermissions.objects.filter(staff_id=obj.staffid)
+                .order_by("feature", "capability")
+                .values("feature", "capability")
+            )
+        except (ProgrammingError, OperationalError):
+            # Some legacy tenant DBs may not have ms_staff_permissions yet.
+            return {}
+
+        matrix = {}
+        for row in permission_rows:
+            feature_name = str(row["feature"] or "").strip()
+            capability_name = str(row["capability"] or "").strip()
+            if not feature_name or not capability_name:
+                continue
+            if feature_name not in matrix:
+                matrix[feature_name] = {}
+            matrix[feature_name][capability_name] = True
+
+        return matrix
 
 # ---------------------------------------------------------------------------
 # Custom Field Value Serializer

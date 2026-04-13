@@ -116,6 +116,14 @@ class SetupModule(models.Model):
             self.slug = slugify(self.name or "")
         if not self.name:
             self.name = (self.slug or "").replace("-", " ").title()
+        route_value = str(self.route or "").strip()
+        if route_value:
+            route_value = f"/{route_value.lstrip('/')}"
+            if route_value != "/":
+                route_value = route_value.rstrip("/")
+            self.route = route_value
+        else:
+            self.route = ""
         super().save(*args, **kwargs)
 
     def __str__(self):

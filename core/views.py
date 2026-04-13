@@ -44,6 +44,7 @@ from .models import (
 from django.contrib.contenttypes.models import ContentType
 from ms_crm_app.models import (
     Staff,
+    StaffPermissions,
     Contacts,
     Notifications,
     KnowledgeBase,
@@ -2955,6 +2956,121 @@ def contacts_detail(request, pk):
 
 
 # ================= STAFF API =================
+def _normalize_staff_permissions_payload(payload):
+    if payload in (None, ""):
+        return []
+
+    candidate = payload
+    if isinstance(candidate, str):
+        text = candidate.strip()
+        if not text:
+            return []
+        try:
+            candidate = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError("permissions must be valid JSON when sent as text.") from exc
+
+    normalized = []
+
+    def add_permission(feature_value, capability_value):
+        feature_name = str(feature_value or "").strip()
+        capability_name = str(capability_value or "").strip()
+        if not feature_name or not capability_name:
+            return
+        normalized.append(
+            {
+                "feature": feature_name[:40],
+                "capability": capability_name[:100],
+            }
+        )
+
+    def consume_feature_permissions(feature_name, value):
+        if not feature_name:
+            return
+
+        if isinstance(value, dict):
+            for capability_name, enabled in value.items():
+                if enabled:
+                    add_permission(feature_name, capability_name)
+            return
+
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    capability_name = (
+                        item.get("capability")
+                        or item.get("permission")
+                        or item.get("name")
+                    )
+                    enabled = item.get("enabled", item.get("allowed", True))
+                    if enabled:
+                        add_permission(feature_name, capability_name)
+                else:
+                    add_permission(feature_name, item)
+            return
+
+        if isinstance(value, str):
+            for part in [entry.strip() for entry in value.split(",") if entry.strip()]:
+                add_permission(feature_name, part)
+            return
+
+        if value:
+            add_permission(feature_name, value)
+
+    if isinstance(candidate, dict):
+        for feature_name, value in candidate.items():
+            consume_feature_permissions(feature_name, value)
+    elif isinstance(candidate, list):
+        for row in candidate:
+            if not isinstance(row, dict):
+                continue
+            feature_name = (
+                row.get("feature")
+                or row.get("group")
+                or row.get("module")
+                or row.get("name")
+            )
+            permissions_value = (
+                row.get("permissions")
+                if row.get("permissions") is not None
+                else row.get("actions")
+            )
+            if permissions_value is None:
+                permissions_value = row.get("capability")
+            consume_feature_permissions(feature_name, permissions_value)
+    else:
+        raise ValueError("permissions must be an object or list.")
+
+    seen = set()
+    deduped = []
+    for row in normalized:
+        key = (row["feature"].lower(), row["capability"].lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+
+    return deduped
+
+
+def _sync_staff_permissions(staff_id, permissions_payload):
+    rows = _normalize_staff_permissions_payload(permissions_payload)
+    StaffPermissions.objects.filter(staff_id=staff_id).delete()
+    if not rows:
+        return
+
+    StaffPermissions.objects.bulk_create(
+        [
+            StaffPermissions(
+                staff_id=staff_id,
+                feature=row["feature"],
+                capability=row["capability"],
+            )
+            for row in rows
+        ]
+    )
+
+
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def staff_list_create(request):
@@ -2967,6 +3083,10 @@ def staff_list_create(request):
         return Response(serializer.data)
 
     data = request.data.copy()
+    has_permissions = "permissions" in data
+    permissions_payload = data.pop("permissions", None) if has_permissions else None
+    if isinstance(permissions_payload, list) and len(permissions_payload) == 1:
+        permissions_payload = permissions_payload[0]
 
     raw_password = (data.get("password") or "").strip()
     if not raw_password:
@@ -2990,7 +3110,16 @@ def staff_list_create(request):
 
     serializer = StaffSerializer(data=data)
     serializer.is_valid(raise_exception=True)
-    staff = serializer.save(datecreated=timezone.now())
+    try:
+        with transaction.atomic():
+            staff = serializer.save(datecreated=timezone.now())
+            if has_permissions:
+                _sync_staff_permissions(staff.staffid, permissions_payload)
+    except ValueError as permission_error:
+        return Response({"detail": str(permission_error)}, status=status.HTTP_400_BAD_REQUEST)
+    except DatabaseError as db_error:
+        return Response({"detail": str(db_error)}, status=status.HTTP_400_BAD_REQUEST)
+
     staff_name = f"{getattr(staff, 'firstname', '')} {getattr(staff, 'lastname', '')}".strip() or getattr(staff, "email", "") or "Staff"
     log_activity(f"Staff Created [Name: {staff_name}]", user=getattr(request, "user", None))
     return Response(StaffSerializer(staff).data, status=status.HTTP_201_CREATED)
@@ -3020,6 +3149,10 @@ def staff_detail(request, pk):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     data = request.data.copy()
+    has_permissions = "permissions" in data
+    permissions_payload = data.pop("permissions", None) if has_permissions else None
+    if isinstance(permissions_payload, list) and len(permissions_payload) == 1:
+        permissions_payload = permissions_payload[0]
 
     if "password" in data:
         raw_password = (data.get("password") or "").strip()
@@ -3031,7 +3164,16 @@ def staff_detail(request, pk):
     old_active = getattr(staff, "active", None)
     serializer = StaffSerializer(staff, data=data, partial=True)
     serializer.is_valid(raise_exception=True)
-    staff = serializer.save()
+    try:
+        with transaction.atomic():
+            staff = serializer.save()
+            if has_permissions:
+                _sync_staff_permissions(staff.staffid, permissions_payload)
+    except ValueError as permission_error:
+        return Response({"detail": str(permission_error)}, status=status.HTTP_400_BAD_REQUEST)
+    except DatabaseError as db_error:
+        return Response({"detail": str(db_error)}, status=status.HTTP_400_BAD_REQUEST)
+
     if old_active is not None and old_active != getattr(staff, "active", None):
         staff_name = f"{getattr(staff, 'firstname', '')} {getattr(staff, 'lastname', '')}".strip() or getattr(staff, "email", "") or "Staff"
         log_activity(
@@ -5504,7 +5646,11 @@ class SetupModuleViewSet(SetupBaseViewSet):
         elif not include_deleted:
             queryset = queryset.filter(is_deleted=False)
 
-        enabled = str(self.request.query_params.get("enabled", "")).strip().lower()
+        enabled = str(
+            self.request.query_params.get("is_active")
+            or self.request.query_params.get("active")
+            or self.request.query_params.get("enabled", "")
+        ).strip().lower()
         if enabled in {"1", "true", "yes"}:
             queryset = queryset.filter(is_enabled=True)
         elif enabled in {"0", "false", "no"}:
