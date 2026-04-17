@@ -1,11 +1,13 @@
-from django.db import transaction
+import json
+
+from django.db import IntegrityError, transaction
 from core.models import EmailTemplate
 from core.middleware import get_current_db
 
 
 EMAIL_TEMPLATES = [
     {
-        "name": "New Client Created",
+        # "name": "New Client Created",
         "module": "client",
         "slug": "new-client-created",
         "language": "english",
@@ -149,36 +151,15 @@ EMAIL_TEMPLATES = [
 # OLD FUNCTION (DO NOT TOUCH)
 # ============================
 def seed_email_templates():
-    objs = []
-    for t in EMAIL_TEMPLATES:
-        objs.append(EmailTemplate(**t))
+    """Legacy entry point kept for backward compatibility.
 
-    EmailTemplate.objects.bulk_create(
-        objs,
-        ignore_conflicts=True
-    )
-
-    db = get_current_db() or "default"
-
-    with transaction.atomic(using=db):
-        existing_slugs = set(
-            EmailTemplate.objects
-            .using(db)
-            .values_list("slug", flat=True)
-        )
-
-        new_templates = [
-            EmailTemplate(**data)
-            for data in EMAIL_TEMPLATES
-            if data["slug"] not in existing_slugs
-        ]
-
-        if new_templates:
-            EmailTemplate.objects.using(db).bulk_create(
-                new_templates,
-                batch_size=500,
-                ignore_conflicts=True,
-            )
+    The implementation delegates to ``seed_email_templates_optimized`` which
+    performs schema-aware raw inserts so it works across both legacy and newer
+    EmailTemplate table shapes.
+    """
+    # Call the optimized implementation which safely inserts only the known
+    # columns. This ensures both legacy callers and newer code behave correctly.
+    return seed_email_templates_optimized()
 
 
 # ======================================
@@ -195,23 +176,95 @@ def seed_email_templates_optimized():
 
     db = get_current_db() or "default"
 
+    # All operations are performed within a single atomic transaction to ensure
+    # consistency. We capture existing unique keys first, then insert only
+    # missing templates.
     with transaction.atomic(using=db):
-
         existing_keys = set(
             EmailTemplate.objects
             .using(db)
             .values_list("module", "slug", "language")
         )
 
-        new_objects = [
-            EmailTemplate(**t)
-            for t in EMAIL_TEMPLATES
-            if (t["module"], t["slug"], t["language"]) not in existing_keys
-        ]
+        # Build candidate objects once, then insert with schema-aware SQL so we
+        # can support both:
+        # 1) legacy schemas where ``name`` column does not exist
+        # 2) newer schemas where ``name`` exists (and may be required)
+        new_objects = []
+        for t in EMAIL_TEMPLATES:
+            if (t["module"], t["slug"], t["language"]) in existing_keys:
+                continue
+            new_obj = EmailTemplate(
+                name=t.get("name") or t.get("subject") or t["slug"],
+                module=t["module"],
+                slug=t["slug"],
+                language=t["language"],
+                subject=t["subject"],
+                body=t["body"],
+                variables=t.get("variables", []),
+            )
+            new_objects.append(new_obj)
 
         if new_objects:
-            EmailTemplate.objects.using(db).bulk_create(
-                new_objects,
-                batch_size=100,
-                ignore_conflicts=True
-            )
+            # Django's ``bulk_create`` includes *all* model fields, which would try to
+            # write to the ``name`` column that may be missing in older databases.
+            # To avoid this, we use a raw INSERT that explicitly lists only the known
+            # safe columns and writes JSON text for the ``variables`` column.
+            from django.db import connections
+
+            batch = []
+            connection = connections[db]
+            table_name = EmailTemplate._meta.db_table
+
+            with connection.cursor() as cursor:
+                table_columns = {
+                    col.name for col in connection.introspection.get_table_description(cursor, table_name)
+                }
+
+                insert_columns = ["module", "slug", "language", "subject", "body", "variables"]
+                if "name" in table_columns:
+                    insert_columns.insert(0, "name")
+
+                placeholders = ", ".join(["%s"] * len(insert_columns))
+                sql = (
+                    "INSERT INTO {table} ({columns}) VALUES ({placeholders})"
+                ).format(
+                    table=table_name,
+                    columns=", ".join(insert_columns),
+                    placeholders=placeholders,
+                )
+
+                def flush_batch():
+                    if not batch:
+                        return
+                    try:
+                        cursor.executemany(sql, batch)
+                    except IntegrityError:
+                        # Concurrent requests can race on the unique
+                        # (module, slug, language) constraint. Retry row-wise
+                        # and ignore duplicates so seeding stays idempotent.
+                        for row in batch:
+                            try:
+                                cursor.execute(sql, row)
+                            except IntegrityError:
+                                continue
+                    batch.clear()
+
+                for obj in new_objects:
+                    row = [
+                        obj.module,
+                        obj.slug,
+                        obj.language,
+                        obj.subject,
+                        obj.body,
+                        json.dumps(obj.variables or []),
+                    ]
+                    if "name" in table_columns:
+                        row.insert(0, obj.name or "")
+
+                    batch.append(tuple(row))
+                    # Insert in batches to avoid huge parameter lists.
+                    if len(batch) >= 100:
+                        flush_batch()
+
+                flush_batch()

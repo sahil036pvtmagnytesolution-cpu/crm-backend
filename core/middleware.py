@@ -518,6 +518,8 @@ class RBACMiddleware:
         "/api/token/",
         "/api/token/refresh/",
         "/core_api/login/",
+        "/core_api/forgot-password/",
+        "/core_api/reset-password/",
         "/core_api/register-business/",
         "/api/manage_data/login/",
         "/api/manage_data/register-business/",

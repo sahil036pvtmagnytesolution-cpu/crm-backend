@@ -7,6 +7,8 @@ from .views import (
     proposal_detail,
     register_business,
     login,
+    forgot_password,
+    reset_password,
     logout,
     approve_role,
     sales_proposals,
@@ -149,6 +151,8 @@ urlpatterns = [
     # Auth
     path("register-business/", register_business),
     path("login/", login),
+    path("forgot-password/", forgot_password),
+    path("reset-password/", reset_password),
     path("logout/", logout),
 
     # Roles

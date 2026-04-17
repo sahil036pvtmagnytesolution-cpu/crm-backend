@@ -175,11 +175,14 @@ class DepartmentsSerializer(serializers.ModelSerializer):
 # Serializer for TicketsPredefinedReplies model
 class TicketsPredefinedRepliesSerializer(serializers.ModelSerializer):
     response = serializers.CharField(source="message", required=False, allow_blank=True)
-    department = serializers.CharField(required=False, allow_blank=True, write_only=True)
+    department = serializers.CharField(required=False, allow_blank=True, allow_null=True, write_only=True)
 
     class Meta:
         model = TicketsPredefinedReplies
-        fields = "__all__"
+        fields = ("id", "name", "message", "response", "department")
+        extra_kwargs = {
+            "message": {"required": False, "allow_blank": True},
+        }
 
     def validate_name(self, value):
         cleaned = str(value or "").strip()
@@ -188,8 +191,10 @@ class TicketsPredefinedRepliesSerializer(serializers.ModelSerializer):
         return cleaned
 
     def validate(self, attrs):
-        if not str(attrs.get("message", "") or "").strip():
+        message = str(attrs.get("message", "") or "").strip()
+        if not message:
             raise serializers.ValidationError({"response": "response is required."})
+        attrs["message"] = message
         attrs.pop("department", None)
         return attrs
 
@@ -201,12 +206,13 @@ class TicketsPrioritiesSerializer(serializers.ModelSerializer):
 
 # Serializer for Services model
 class ServicesSerializer(serializers.ModelSerializer):
+    # Accept category and status on write, but don't query them from DB
     category = serializers.CharField(required=False, allow_blank=True, write_only=True)
     status = serializers.CharField(required=False, allow_blank=True, write_only=True)
-
+    
     class Meta:
         model = Services
-        fields = "__all__"
+        fields = ['serviceid', 'name', 'category', 'status']
 
     def validate_name(self, value):
         cleaned = str(value or "").strip()
@@ -214,10 +220,22 @@ class ServicesSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("name is required.")
         return cleaned
 
-    def validate(self, attrs):
-        attrs.pop("category", None)
-        attrs.pop("status", None)
-        return attrs
+    def validate_status(self, value):
+        if value and value not in ['Active', 'Inactive']:
+            raise serializers.ValidationError("Status must be 'Active' or 'Inactive'.")
+        return value
+    
+    def create(self, validated_data):
+        # Remove write-only fields before creating
+        validated_data.pop('category', None)
+        validated_data.pop('status', None)
+        return super().create(validated_data)
+    
+    def update(self, instance, validated_data):
+        # Remove write-only fields before updating
+        validated_data.pop('category', None)
+        validated_data.pop('status', None)
+        return super().update(instance, validated_data)
 
 # Serializer for SpamFilters model
 class SpamFiltersSerializer(serializers.ModelSerializer):
@@ -227,6 +245,10 @@ class SpamFiltersSerializer(serializers.ModelSerializer):
     class Meta:
         model = SpamFilters
         fields = "__all__"
+        extra_kwargs = {
+            "value": {"required": False, "allow_blank": True},
+            "rel_type": {"required": False, "allow_blank": True},
+        }
 
     def validate_type(self, value):
         cleaned = str(value or "").strip()
@@ -235,10 +257,16 @@ class SpamFiltersSerializer(serializers.ModelSerializer):
         return cleaned
 
     def validate(self, attrs):
-        if not str(attrs.get("value", "") or "").strip():
+        rule = str(attrs.get("value", "") or "").strip()
+        if not rule:
             raise serializers.ValidationError({"rule": "rule is required."})
-        if not str(attrs.get("rel_type", "") or "").strip():
-            attrs["rel_type"] = "ticket"
+        attrs["value"] = rule
+
+        action = str(attrs.get("rel_type", "") or "").strip()
+        if not action:
+            attrs["rel_type"] = "Block"
+        else:
+            attrs["rel_type"] = action
         return attrs
 
 

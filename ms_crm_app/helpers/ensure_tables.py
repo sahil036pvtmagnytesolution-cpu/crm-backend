@@ -86,6 +86,33 @@ def ensure_staff_table():
             """)
 
 
+def ensure_user_auto_login_table():
+    """Ensure ms_user_auto_login table exists for the current DB."""
+    from django.db import connections
+    from core.middleware import get_current_db
+
+    db_name = get_current_db()
+    with connections[db_name].cursor() as cursor:
+        cursor.execute("SHOW TABLES LIKE 'ms_user_auto_login'")
+        exists = cursor.fetchone()
+
+        if not exists:
+            cursor.execute(
+                """
+                CREATE TABLE ms_user_auto_login (
+                    key_id CHAR(32) NOT NULL,
+                    user_id INT(11) NOT NULL,
+                    user_agent VARCHAR(150) NOT NULL,
+                    last_ip VARCHAR(40) NOT NULL,
+                    last_login DATETIME NOT NULL,
+                    staff INT(11) NOT NULL,
+                    KEY idx_ms_user_auto_login_key (key_id),
+                    KEY idx_ms_user_auto_login_user (user_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3
+                """
+            )
+
+
 def ensure_project_tables():
     """Ensure core_project (and its M2M table) exist for the current DB."""
     from django.apps import apps
@@ -356,6 +383,127 @@ def ensure_tickets_pipe_log_table():
 
         for sql in alter_statements:
             cursor.execute(sql)
+
+
+def ensure_support_management_tables():
+    """
+    Ensure legacy support setup tables exist for the current tenant DB.
+    Covers generic manage endpoints used by Support setup:
+    - Departments
+    - TicketsPredefinedReplies
+    - Services
+    - SpamFilters
+    - TicketsStatus
+    """
+    from django.db import connections
+    from core.middleware import get_current_db
+
+    db_alias = get_current_db()
+    db_connection = connections[db_alias]
+
+    create_sql_map = {
+        "ms_departments": """
+            CREATE TABLE ms_departments (
+                departmentid INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(100) NOT NULL,
+                imap_username VARCHAR(50) DEFAULT NULL,
+                email VARCHAR(100) DEFAULT NULL,
+                email_from_header TINYINT(1) NOT NULL DEFAULT 0,
+                host VARCHAR(150) DEFAULT NULL,
+                password MEDIUMTEXT DEFAULT NULL,
+                encryption VARCHAR(3) DEFAULT NULL,
+                delete_after_import INT NOT NULL DEFAULT 0,
+                calendar_id MEDIUMTEXT DEFAULT NULL,
+                hidefromclient TINYINT(1) NOT NULL DEFAULT 0
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3
+        """,
+        "ms_services": """
+            CREATE TABLE ms_services (
+                serviceid INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(50) NOT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3
+        """,
+        "ms_spam_filters": """
+            CREATE TABLE ms_spam_filters (
+                id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                type VARCHAR(40) NOT NULL,
+                rel_type VARCHAR(10) NOT NULL,
+                value TEXT NOT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3
+        """,
+        "ms_tickets_predefined_replies": """
+            CREATE TABLE ms_tickets_predefined_replies (
+                id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(191) NOT NULL,
+                message TEXT NOT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3
+        """,
+        "ms_tickets_status": """
+            CREATE TABLE ms_tickets_status (
+                ticketstatusid INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(50) NOT NULL,
+                isdefault INT NOT NULL DEFAULT 0,
+                statuscolor VARCHAR(7) DEFAULT NULL,
+                statusorder INT DEFAULT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3
+        """,
+    }
+
+    # For older tenants, add missing columns without requiring full migrations.
+    missing_column_alters = {
+        "ms_departments": {
+            "imap_username": "ALTER TABLE ms_departments ADD COLUMN imap_username VARCHAR(50) DEFAULT NULL",
+            "email": "ALTER TABLE ms_departments ADD COLUMN email VARCHAR(100) DEFAULT NULL",
+            "email_from_header": "ALTER TABLE ms_departments ADD COLUMN email_from_header TINYINT(1) NOT NULL DEFAULT 0",
+            "host": "ALTER TABLE ms_departments ADD COLUMN host VARCHAR(150) DEFAULT NULL",
+            "password": "ALTER TABLE ms_departments ADD COLUMN password MEDIUMTEXT DEFAULT NULL",
+            "encryption": "ALTER TABLE ms_departments ADD COLUMN encryption VARCHAR(3) DEFAULT NULL",
+            "delete_after_import": "ALTER TABLE ms_departments ADD COLUMN delete_after_import INT NOT NULL DEFAULT 0",
+            "calendar_id": "ALTER TABLE ms_departments ADD COLUMN calendar_id MEDIUMTEXT DEFAULT NULL",
+            "hidefromclient": "ALTER TABLE ms_departments ADD COLUMN hidefromclient TINYINT(1) NOT NULL DEFAULT 0",
+        },
+        "ms_tickets_status": {
+            "isdefault": "ALTER TABLE ms_tickets_status ADD COLUMN isdefault INT NOT NULL DEFAULT 0",
+            "statuscolor": "ALTER TABLE ms_tickets_status ADD COLUMN statuscolor VARCHAR(7) DEFAULT NULL",
+            "statusorder": "ALTER TABLE ms_tickets_status ADD COLUMN statusorder INT DEFAULT NULL",
+        },
+    }
+
+    created_tables = set()
+
+    with db_connection.cursor() as cursor:
+        for table_name, create_sql in create_sql_map.items():
+            cursor.execute("SHOW TABLES LIKE %s", [table_name])
+            exists = cursor.fetchone() is not None
+            if not exists:
+                cursor.execute(create_sql)
+                created_tables.add(table_name)
+
+        for table_name, column_alter_map in missing_column_alters.items():
+            cursor.execute("SHOW TABLES LIKE %s", [table_name])
+            if cursor.fetchone() is None:
+                continue
+
+            cursor.execute(f"SHOW COLUMNS FROM `{table_name}`")
+            existing_columns = {row[0] for row in cursor.fetchall()}
+            for column_name, alter_sql in column_alter_map.items():
+                if column_name in existing_columns:
+                    continue
+                cursor.execute(alter_sql)
+                existing_columns.add(column_name)
+
+        if "ms_tickets_status" in created_tables:
+            cursor.execute(
+                """
+                INSERT INTO ms_tickets_status (name, isdefault, statuscolor, statusorder)
+                VALUES
+                    ('Open', 1, '#ff2d42', 1),
+                    ('In progress', 1, '#84c529', 2),
+                    ('Answered', 1, '#0000ff', 3),
+                    ('On Hold', 1, '#c0c0c0', 4),
+                    ('Closed', 1, '#03a9f4', 5)
+                """
+            )
 
 
 def ensure_gdpr_requests_table():

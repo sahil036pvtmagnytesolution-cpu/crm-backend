@@ -4,14 +4,17 @@ import uuid
 import subprocess
 import binascii
 import json
+import secrets
+import logging
 from decimal import Decimal, InvalidOperation
-from datetime import datetime
+from datetime import datetime, timedelta
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from django.contrib.auth.models import User
 from django.contrib.auth.hashers import check_password, make_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import validate_email
-from django.db import transaction, DatabaseError
+from django.db import transaction, DatabaseError, IntegrityError
 import threading
 
 from django.http import FileResponse
@@ -60,6 +63,7 @@ from ms_crm_app.helpers.ensure_tables import (
     ensure_project_tables,
     ensure_knowledge_base_tables,
     ensure_staff_table,
+    ensure_user_auto_login_table,
     ensure_announcements_table,
     ensure_goals_table,
     ensure_activity_log_table,
@@ -189,6 +193,8 @@ from .middleware import (
     user_has_permission,
 )
 
+logger = logging.getLogger(__name__)
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def timesheets_overview(request):
@@ -282,7 +288,7 @@ class ProposalViewSet(ModelViewSet):
             proposal.assigned_to = user
             proposal.save()
 
-            print("SENDING MAIL TO:", user.email)  # 👈 Debug print
+            print("SENDING MAIL TO:", user.email)  # ðŸ‘ˆ Debug print
 
             if not send_proposal_assignment_email(proposal, user):
                 raise ValueError("Unable to send proposal assignment email")
@@ -313,11 +319,11 @@ class EstimateViewSet(ModelViewSet):
     # ================= CREATE INVOICE =================
     def create_invoice(self, estimate):
 
-        # 🔹 Only run when status = Sent
+        # ðŸ”¹ Only run when status = Sent
         if estimate.status != "Sent":
             return
 
-        # 🔹 Check invoice already exists (duplicate रोकने के लिए)
+        # ðŸ”¹ Check invoice already exists (duplicate à¤°à¥‹à¤•à¤¨à¥‡ à¤•à¥‡ à¤²à¤¿à¤)
         existing_invoice = Invoice.objects.filter(
             reference_estimate=estimate
         ).first()
@@ -325,14 +331,14 @@ class EstimateViewSet(ModelViewSet):
         if existing_invoice:
             return
 
-        # 🔹 Find client
+        # ðŸ”¹ Find client
         client = estimate.customer
 
         if not client:
-            print("⚠ Client not found")
+            print("âš  Client not found")
             return
 
-        # 🔹 Create invoice
+        # ðŸ”¹ Create invoice
         invoice = Invoice.objects.create(
             invoice_number=f"INV-{estimate.id}",
             customer=client,
@@ -344,13 +350,13 @@ class EstimateViewSet(ModelViewSet):
             reference_estimate=estimate
         )
 
-        print("✅ Invoice created:", invoice.invoice_number)
+        print("âœ… Invoice created:", invoice.invoice_number)
 
-        # 🔹 Update estimate status
+        # ðŸ”¹ Update estimate status
         estimate.status = "Approved"
         estimate.save()
 
-        print("✅ Estimate status updated to Approved")
+        print("âœ… Estimate status updated to Approved")
 
 class CalendarEventViewSet(ModelViewSet):
     queryset = CalendarEvent.objects.all()
@@ -482,7 +488,7 @@ class ProjectViewSet(ModelViewSet):
         mentor_name = _user_display(mentor) if mentor else "-"
         member_names = ", ".join([_user_display(m) for m in project.members.all()]) or "-"
         visible_tabs = ", ".join(project.visible_tabs or []) or "-"
-        settings_list = "<br/>".join([f"• {s}" for s in (project.settings or [])]) or "-"
+        settings_list = "<br/>".join([f"â€¢ {s}" for s in (project.settings or [])]) or "-"
 
         subject = f"New Project Created: {project.name}"
         html_message = f"""
@@ -537,7 +543,7 @@ class ProjectViewSet(ModelViewSet):
         mentor_name = _user_display(mentor) if mentor else "-"
         member_names = ", ".join([_user_display(m) for m in project.members.all()]) or "-"
         visible_tabs = ", ".join(project.visible_tabs or []) or "-"
-        settings_list = "<br/>".join([f"• {s}" for s in (project.settings or [])]) or "-"
+        settings_list = "<br/>".join([f"â€¢ {s}" for s in (project.settings or [])]) or "-"
 
         subject = f"New Project Created: {project.name}"
         html_message = f"""
@@ -887,9 +893,17 @@ class SmallStatsView(APIView):
 # ASYNC HELPER
 # =========================
 def run_async(func, *args):
-    t = threading.Thread(target=func, args=args)
-    t.daemon = True
-    t.start()
+    try:
+        t = threading.Thread(target=func, args=args)
+        t.daemon = True
+        t.start()
+        return True
+    except Exception:
+        logger.exception(
+            "Failed to start background task: %s",
+            getattr(func, "__name__", str(func)),
+        )
+        return False
 
 
 class ExpenseViewSet(ModelViewSet):
@@ -1126,6 +1140,439 @@ def register_business(request):
             },
         },
         status=201,
+    )
+
+
+PASSWORD_RESET_TOKEN_EXPIRY_MINUTES = 20
+PASSWORD_RESET_USER_AGENT = "password_reset"
+PASSWORD_RESET_AUTH_MARKER = "auth_user"
+
+
+def _normalize_email(email_value):
+    return str(email_value or "").strip().lower()
+
+
+def _frontend_login_url():
+    return getattr(settings, "FRONTEND_LOGIN_URL", "http://localhost:3000/login")
+
+
+def _frontend_reset_url(token):
+    base_url = getattr(
+        settings,
+        "FRONTEND_RESET_PASSWORD_URL",
+        "http://localhost:3000/reset-password",
+    )
+    parsed = urlparse(base_url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["token"] = token
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def _password_hash(raw_password):
+    try:
+        return make_password(raw_password, hasher="bcrypt_sha256")
+    except Exception:
+        return make_password(raw_password)
+
+
+def _password_is_valid(raw_password):
+    return len(str(raw_password or "")) >= 8
+
+
+def _store_auth_user_reset_token(user_id, token, requested_at):
+    ensure_user_auto_login_table()
+    db_alias = get_current_db()
+    with connections[db_alias].cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM ms_user_auto_login
+            WHERE user_id = %s AND user_agent = %s AND last_ip = %s
+            """,
+            [user_id, PASSWORD_RESET_USER_AGENT, PASSWORD_RESET_AUTH_MARKER],
+        )
+        cursor.execute(
+            """
+            INSERT INTO ms_user_auto_login
+                (key_id, user_id, user_agent, last_ip, last_login, staff)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            [
+                token,
+                user_id,
+                PASSWORD_RESET_USER_AGENT,
+                PASSWORD_RESET_AUTH_MARKER,
+                requested_at,
+                0,
+            ],
+        )
+
+
+def _get_auth_user_reset_records(token):
+    ensure_user_auto_login_table()
+    db_alias = get_current_db()
+    with connections[db_alias].cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT user_id, last_login
+            FROM ms_user_auto_login
+            WHERE key_id = %s AND user_agent = %s AND last_ip = %s
+            ORDER BY last_login DESC
+            """,
+            [token, PASSWORD_RESET_USER_AGENT, PASSWORD_RESET_AUTH_MARKER],
+        )
+        return cursor.fetchall()
+
+
+def _clear_auth_user_reset_token(token=None, user_id=None):
+    if token is None and user_id is None:
+        return
+    ensure_user_auto_login_table()
+    db_alias = get_current_db()
+    with connections[db_alias].cursor() as cursor:
+        if token is not None and user_id is not None:
+            cursor.execute(
+                """
+                DELETE FROM ms_user_auto_login
+                WHERE key_id = %s AND user_id = %s
+                  AND user_agent = %s AND last_ip = %s
+                """,
+                [token, user_id, PASSWORD_RESET_USER_AGENT, PASSWORD_RESET_AUTH_MARKER],
+            )
+            return
+        if token is not None:
+            cursor.execute(
+                """
+                DELETE FROM ms_user_auto_login
+                WHERE key_id = %s AND user_agent = %s AND last_ip = %s
+                """,
+                [token, PASSWORD_RESET_USER_AGENT, PASSWORD_RESET_AUTH_MARKER],
+            )
+            return
+        cursor.execute(
+            """
+            DELETE FROM ms_user_auto_login
+            WHERE user_id = %s AND user_agent = %s AND last_ip = %s
+            """,
+            [user_id, PASSWORD_RESET_USER_AGENT, PASSWORD_RESET_AUTH_MARKER],
+        )
+
+
+def _within_reset_window(requested_at):
+    if requested_at is None:
+        return False
+    return requested_at >= timezone.now() - timedelta(minutes=PASSWORD_RESET_TOKEN_EXPIRY_MINUTES)
+
+
+def _collect_reset_targets_by_email(email):
+    targets = []
+
+    try:
+        auth_user = (
+            User.objects.filter(username__iexact=email).first()
+            or User.objects.filter(email__iexact=email).first()
+        )
+    except Exception:
+        auth_user = None
+    if auth_user:
+        targets.append({"role": "auth_user", "instance": auth_user})
+
+    try:
+        staff_matches = list(Staff.objects.filter(email__iexact=email))
+    except Exception:
+        staff_matches = []
+    for staff in staff_matches:
+        targets.append({"role": "staff", "instance": staff})
+
+    try:
+        contact_matches = list(Contacts.objects.filter(email__iexact=email))
+    except Exception:
+        contact_matches = []
+    for contact in contact_matches:
+        targets.append({"role": "contact", "instance": contact})
+
+    return targets
+
+
+def _store_reset_token_for_targets(targets, token, requested_at):
+    stored_roles = set()
+    for target in targets:
+        role = target.get("role")
+        instance = target.get("instance")
+        if instance is None:
+            continue
+        try:
+            if role == "auth_user":
+                _store_auth_user_reset_token(instance.id, token, requested_at)
+                stored_roles.add("admin")
+            elif role == "staff":
+                instance.new_pass_key = token
+                instance.new_pass_key_requested = requested_at
+                instance.save(update_fields=["new_pass_key", "new_pass_key_requested"])
+                stored_roles.add("business")
+            elif role == "contact":
+                instance.new_pass_key = token
+                instance.new_pass_key_requested = requested_at
+                instance.save(update_fields=["new_pass_key", "new_pass_key_requested"])
+                stored_roles.add("user")
+        except Exception:
+            logger.exception(
+                "Failed to store reset token for %s (%s).",
+                role,
+                getattr(instance, "email", None) or getattr(instance, "id", None),
+            )
+    return sorted(stored_roles)
+
+
+def _send_password_reset_email(email, token):
+    """Send password reset email asynchronously."""
+    reset_url = _frontend_reset_url(token)
+    expires_label = f"{PASSWORD_RESET_TOKEN_EXPIRY_MINUTES} minutes"
+    subject = "Reset your CRM password"
+    html_message = build_module_email_html(
+        title="Password Reset Request",
+        greeting=email,
+        intro=(
+            "A request was received to reset your CRM password. "
+            "Use the button below to set a new password."
+        ),
+        details=[
+            ("Email", email),
+            ("Expires In", expires_label),
+        ],
+        cta_label="Reset Password",
+        cta_url=reset_url,
+        closing="Regards,<br/><strong>Magnyte Solution CRM Team</strong>",
+    )
+    text_content = strip_tags(html_message)
+    logger.info("Sending password reset email to %s", email)
+    try:
+        result = send_branded_email(
+            subject=subject,
+            message=text_content,
+            to_emails=[email],
+            html_message=html_message,
+            fail_silently=False,
+        )
+        if result > 0:
+            logger.info("Password reset email sent to %s", email)
+        else:
+            logger.warning(
+                "Password reset email returned no recipients for %s (result=%s)",
+                email,
+                result,
+            )
+        return result > 0
+    except Exception:
+        logger.exception("Password reset email failed for %s", email)
+        return False
+
+def _send_password_changed_email(email):
+    """Send password changed notification email asynchronously."""
+    login_url = _frontend_login_url()
+    subject = "Password changed successfully"
+    message = (
+        "Your CRM password was changed successfully.\n\n"
+        f"Login here: {login_url}"
+    )
+    html_message = build_module_email_html(
+        title="Password Changed",
+        greeting=email,
+        intro="Your CRM password has been changed successfully.",
+        details=[("Login", login_url)],
+        cta_label="Login Now",
+        cta_url=login_url,
+        closing="If this was not you, contact support immediately.",
+    )
+    logger.info("Sending password changed email to %s", email)
+    try:
+        result = send_branded_email(
+            subject=subject,
+            message=message,
+            to_emails=[email],
+            html_message=html_message,
+            fail_silently=False,
+        )
+        if result > 0:
+            logger.info("Password changed email sent to %s", email)
+        else:
+            logger.warning(
+                "Password changed email returned no recipients for %s (result=%s)",
+                email,
+                result,
+            )
+        return result > 0
+    except Exception:
+        logger.exception("Password changed email failed for %s", email)
+        return False
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def forgot_password(request):
+    email = _normalize_email(request.data.get("email"))
+    if not email:
+        return Response({"message": "Email is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        validate_email(email)
+    except DjangoValidationError:
+        return Response({"message": "Enter a valid email address."}, status=status.HTTP_400_BAD_REQUEST)
+
+    generic_message = (
+        "If an account exists for this email, a password reset link has been sent."
+    )
+    targets = _collect_reset_targets_by_email(email)
+    if not targets:
+        return Response({"status": True, "message": generic_message}, status=status.HTTP_200_OK)
+
+    reset_token = secrets.token_hex(16)
+    requested_at = timezone.now()
+
+    stored_roles = _store_reset_token_for_targets(targets, reset_token, requested_at)
+    if stored_roles:
+        scheduled = run_async(_send_password_reset_email, email, reset_token)
+        if not scheduled:
+            _send_password_reset_email(email, reset_token)
+
+    return Response(
+        {
+            "status": True,
+            "message": generic_message,
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def reset_password(request):
+    token = str(request.data.get("token") or "").strip()
+    new_password = str(request.data.get("new_password") or "")
+    confirm_password = str(request.data.get("confirm_password") or "")
+
+    if not token:
+        return Response({"message": "Token is required."}, status=status.HTTP_400_BAD_REQUEST)
+    if not new_password or not confirm_password:
+        return Response(
+            {"message": "New password and confirm password are required."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if new_password != confirm_password:
+        return Response({"message": "Passwords do not match."}, status=status.HTTP_400_BAD_REQUEST)
+    if not _password_is_valid(new_password):
+        return Response(
+            {"message": "Password must be at least 8 characters long."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    valid_targets = []
+
+    try:
+        auth_records = _get_auth_user_reset_records(token)
+    except Exception:
+        auth_records = []
+
+    for user_id, requested_at in auth_records:
+        auth_user = User.objects.filter(id=user_id).first()
+        if not auth_user:
+            continue
+        if _within_reset_window(requested_at):
+            valid_targets.append({"role": "auth_user", "instance": auth_user})
+        else:
+            try:
+                _clear_auth_user_reset_token(token=token, user_id=user_id)
+            except Exception:
+                pass
+
+    try:
+        staff_targets = list(Staff.objects.filter(new_pass_key=token))
+    except Exception:
+        staff_targets = []
+    for staff in staff_targets:
+        if _within_reset_window(getattr(staff, "new_pass_key_requested", None)):
+            valid_targets.append({"role": "staff", "instance": staff})
+        else:
+            try:
+                staff.new_pass_key = None
+                staff.new_pass_key_requested = None
+                staff.save(update_fields=["new_pass_key", "new_pass_key_requested"])
+            except Exception:
+                pass
+
+    try:
+        contact_targets = list(Contacts.objects.filter(new_pass_key=token))
+    except Exception:
+        contact_targets = []
+    for contact in contact_targets:
+        if _within_reset_window(getattr(contact, "new_pass_key_requested", None)):
+            valid_targets.append({"role": "contact", "instance": contact})
+        else:
+            try:
+                contact.new_pass_key = None
+                contact.new_pass_key_requested = None
+                contact.save(update_fields=["new_pass_key", "new_pass_key_requested"])
+            except Exception:
+                pass
+
+    if not valid_targets:
+        return Response(
+            {"message": "Token is invalid or expired."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    updated_emails = set()
+    now = timezone.now()
+
+    for target in valid_targets:
+        role = target.get("role")
+        instance = target.get("instance")
+        if role == "auth_user" and instance is not None:
+            instance.password = _password_hash(new_password)
+            instance.save(update_fields=["password"])
+            updated_emails.add(_normalize_email(instance.email or instance.username))
+            try:
+                _clear_auth_user_reset_token(token=token, user_id=instance.id)
+            except Exception:
+                pass
+        elif role == "staff" and instance is not None:
+            instance.password = _password_hash(new_password)
+            instance.last_password_change = now
+            instance.new_pass_key = None
+            instance.new_pass_key_requested = None
+            instance.save(
+                update_fields=[
+                    "password",
+                    "last_password_change",
+                    "new_pass_key",
+                    "new_pass_key_requested",
+                ]
+            )
+            updated_emails.add(_normalize_email(instance.email))
+        elif role == "contact" and instance is not None:
+            instance.password = _password_hash(new_password)
+            instance.last_password_change = now
+            instance.new_pass_key = None
+            instance.new_pass_key_requested = None
+            instance.save(
+                update_fields=[
+                    "password",
+                    "last_password_change",
+                    "new_pass_key",
+                    "new_pass_key_requested",
+                ]
+            )
+            updated_emails.add(_normalize_email(instance.email))
+
+    try:
+        _clear_auth_user_reset_token(token=token)
+    except Exception:
+        pass
+
+    for email in [value for value in updated_emails if value]:
+        run_async(_send_password_changed_email, email)
+
+    return Response(
+        {"status": True, "message": "Password reset successful."},
+        status=status.HTTP_200_OK,
     )
 
 
@@ -1416,7 +1863,13 @@ def assign_role_to_user_api(request):
 
     serializer = UserRoleAssignmentSerializer(data=request.data, context={"actor": request.user})
     serializer.is_valid(raise_exception=True)
-    result = serializer.save()
+    try:
+        result = serializer.save()
+    except IntegrityError:
+        return Response(
+            {"detail": "Selected user is not available in the current tenant database."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     user_obj = result["user"]
     active_role_ids = result["active_role_ids"]
@@ -1502,7 +1955,7 @@ def send_proposal_assignment_email(proposal, user):
             details=[
                 ("Proposal ID", f"#{proposal.id}"),
                 ("Subject", getattr(proposal, "subject", "N/A")),
-                ("Total", f"₹{getattr(proposal, 'total', '0')}"),
+                ("Total", f"â‚¹{getattr(proposal, 'total', '0')}"),
             ],
             cta_label="View Proposal",
             cta_url=frontend_url,
@@ -1623,14 +2076,41 @@ def proposal_detail(request, pk):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def users_list(request):
+    def _active_non_deleted_users(user_model, alias):
+        queryset = user_model.objects.using(alias).filter(is_active=True)
+        model_field_names = {field.name for field in user_model._meta.fields}
+        if "is_deleted" in model_field_names:
+            return queryset.filter(is_deleted=False)
 
-    users = User.objects.filter(is_active=True)
+        table_name = user_model._meta.db_table
+        try:
+            connection = connections[alias]
+            with connection.cursor() as cursor:
+                table_columns = {
+                    column.name
+                    for column in connection.introspection.get_table_description(cursor, table_name)
+                }
+            if "is_deleted" in table_columns:
+                return queryset.extra(where=["COALESCE(is_deleted, 0) = 0"])
+        except Exception:
+            pass
+
+        return queryset
+
+    user_model = get_user_model()
+    db_alias = get_current_db()
+    try:
+        users = _active_non_deleted_users(user_model, db_alias)
+    except Exception:
+        users = _active_non_deleted_users(user_model, "default")
 
     data = [
         {
             "id": u.id,
             "name": u.first_name or u.username,
             "email": u.email,
+            "is_active": bool(getattr(u, "is_active", False)),
+            "is_deleted": bool(getattr(u, "is_deleted", False)),
         }
         for u in users
     ]
@@ -1931,7 +2411,7 @@ class ClientViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(data=request.data)
 
         if not serializer.is_valid():
-            print("❌ SERIALIZER ERROR:", serializer.errors)  # 👈 Important
+            print("âŒ SERIALIZER ERROR:", serializer.errors)  # ðŸ‘ˆ Important
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         self.perform_create(serializer)
@@ -1980,7 +2460,7 @@ def upload_and_send_emails(request):
     except Exception as e:
         return Response({"error": "Invalid Excel file"}, status=400)
 
-    # ✅ Detect column automatically (email / Email)
+    # âœ… Detect column automatically (email / Email)
     if "email" in df.columns:
         email_column = "email"
     elif "Email" in df.columns:
@@ -2364,14 +2844,14 @@ def invoice_payment_records(request):
         payment = InvoicePayment.objects.filter(invoice=invoice).first()
 
         if payment:
-            # 🔄 update existing payment
+            # ðŸ”„ update existing payment
             payment.payment_mode = invoice.payment_mode or "Null"
             payment.transaction_id = f"{invoice.payment_mode}-{invoice.id}"
             payment.amount = invoice.total_amount
             payment.save()
 
         else:
-            # ➕ create new payment
+            # âž• create new payment
             InvoicePayment.objects.create(
                 invoice=invoice,
                 payment_mode=invoice.payment_mode or "Null",
@@ -2562,11 +3042,11 @@ def fix_estimate_invoices(request):
 # ====================== HELPER FUNCTION ======================
 def create_invoice_from_estimate(estimate, user=None):
 
-    # 🔹 Only create when status is Sent
+    # ðŸ”¹ Only create when status is Sent
     if estimate.status != "Sent":
         return
 
-    # 🔹 check if invoice already exists
+    # ðŸ”¹ check if invoice already exists
     existing = Invoice.objects.filter(
         reference_estimate=estimate
     ).first()
@@ -2574,14 +3054,14 @@ def create_invoice_from_estimate(estimate, user=None):
     if existing:
         return
 
-    # 🔹 find client
+    # ðŸ”¹ find client
     client = estimate.customer
 
     if not client:
         print("Client not found:", estimate.customer)
         return
 
-    # 🔹 create invoice
+    # ðŸ”¹ create invoice
     invoice = Invoice.objects.create(
         invoice_number=f"INV-{estimate.estimate_number}",
         reference_estimate=estimate,
@@ -2599,7 +3079,7 @@ def create_invoice_from_estimate(estimate, user=None):
         f"Invoice Created [Invoice No: {invoice.invoice_number}]",
         user=user,
     )
-    print("✅ Invoice created from estimate:", invoice.invoice_number)
+    print("âœ… Invoice created from estimate:", invoice.invoice_number)
 
 # ======================== Customer Pach =========================
 @api_view(["PATCH"])
@@ -2807,8 +3287,8 @@ def contacts_list_create(request):
     In environments where the address columns (``street``, ``city``, ``state``,
     ``zip_code`` and ``country``) have not been created yet, this resulted in an
     ``OperationalError`` ("Unknown column 'core_contact.street'"). The address
-    fields are not used by the API response – ``_serialize_contact`` deliberately
-    omits them – so we can safely restrict the query to the columns that are
+    fields are not used by the API response â€“ ``_serialize_contact`` deliberately
+    omits them â€“ so we can safely restrict the query to the columns that are
     required for the serialization. Using ``only()`` ensures Django does *not*
     include the missing columns in the SELECT statement, preventing the error
     while keeping the existing behaviour intact.
@@ -6998,6 +7478,7 @@ class SetupRolePermissionViewSet(SetupBaseViewSet):
         if module_slug:
             queryset = queryset.filter(module_slug__iexact=module_slug)
         return queryset.order_by("role_id", "module_slug", "id")
+
 
 
 

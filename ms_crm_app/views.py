@@ -68,6 +68,7 @@ from ms_crm_app.helpers.ensure_tables import (
     ensure_roles_table,
     ensure_gdpr_requests_table,
     ensure_setup_management_tables,
+    ensure_support_management_tables,
 )
 
 
@@ -403,6 +404,17 @@ def manage_data(request, model_name, item_id=None, field=None, value=None):
             ensure_setup_management_tables()
         except Exception as exc:
             print("Setup management table ensure failed:", exc)
+    if table_name in {
+        "ms_departments",
+        "ms_tickets_predefined_replies",
+        "ms_services",
+        "ms_spam_filters",
+        "ms_tickets_status",
+    }:
+        try:
+            ensure_support_management_tables()
+        except Exception as exc:
+            print("Support management table ensure failed:", exc)
 
     try:
         db_alias = get_current_db()

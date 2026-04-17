@@ -10,7 +10,7 @@ from django.core.validators import validate_email
 from django.utils import timezone
 from django.utils.dateparse import parse_date
 from django.utils.text import slugify
-from django.db import transaction
+from django.db import connections, transaction
 from django.db.utils import OperationalError, ProgrammingError
 from rest_framework import serializers
 from .models import Business, Contact, CreditNote, CreditNoteReminder, CreditNoteTask, Customer, Item, ItemGroup, Role, Proposal, CustomFieldValue
@@ -67,6 +67,7 @@ from .middleware import (
     RBAC_ACTIONS,
     canonicalize_module,
     ensure_permission,
+    get_current_db,
     is_super_admin,
     sync_default_permissions,
 )
@@ -1767,12 +1768,40 @@ class UserRoleAssignmentSerializer(serializers.Serializer):
     role_id = serializers.IntegerField(required=False, min_value=1)
     replace_existing = serializers.BooleanField(required=False, default=True)
 
+    @staticmethod
+    def _get_active_non_deleted_user(user_model, db_alias, user_id):
+        queryset = user_model.objects.using(db_alias).filter(pk=user_id, is_active=True)
+        model_field_names = {field.name for field in user_model._meta.fields}
+        if "is_deleted" in model_field_names:
+            return queryset.filter(is_deleted=False).first()
+
+        table_name = user_model._meta.db_table
+        try:
+            connection = connections[db_alias]
+            with connection.cursor() as cursor:
+                table_columns = {
+                    column.name
+                    for column in connection.introspection.get_table_description(cursor, table_name)
+                }
+            if "is_deleted" in table_columns:
+                return queryset.extra(where=["COALESCE(is_deleted, 0) = 0"]).first()
+        except Exception:
+            pass
+
+        return queryset.first()
+
     def validate(self, attrs):
         UserModel = get_user_model()
+        db_alias = get_current_db()
         user_id = attrs.get("user_id")
-        user = UserModel.objects.filter(pk=user_id).first()
+        try:
+            user = self._get_active_non_deleted_user(UserModel, db_alias, user_id)
+        except Exception:
+            user = None
         if not user:
-            raise serializers.ValidationError({"user_id": "User not found."})
+            raise serializers.ValidationError(
+                {"user_id": "User not found, inactive, or deleted for this tenant."}
+            )
 
         role_ids = attrs.get("role_ids")
         if role_ids is None:
@@ -1782,7 +1811,7 @@ class UserRoleAssignmentSerializer(serializers.Serializer):
         clean_role_ids = sorted(set([rid for rid in role_ids if rid]))
         if clean_role_ids:
             active_roles = list(
-                Role.objects.filter(id__in=clean_role_ids, is_active=True).values(
+                Role.objects.using(db_alias).filter(id__in=clean_role_ids, is_active=True).values(
                     "id",
                     "is_super_admin",
                 )
@@ -1804,50 +1833,63 @@ class UserRoleAssignmentSerializer(serializers.Serializer):
 
         attrs["user_obj"] = user
         attrs["clean_role_ids"] = clean_role_ids
+        attrs["db_alias"] = db_alias
         return attrs
 
-    @transaction.atomic
     def save(self, **kwargs):
         user = self.validated_data["user_obj"]
         role_ids = self.validated_data["clean_role_ids"]
         replace_existing = self.validated_data.get("replace_existing", True)
+        db_alias = self.validated_data.get("db_alias") or get_current_db()
+        UserModel = get_user_model()
         actor = self.context.get("actor")
 
-        existing = {
-            row.role_id: row
-            for row in UserRole.objects.select_related("role").filter(user=user)
-        }
+        actor_in_tenant = None
+        if actor and getattr(actor, "is_authenticated", False):
+            try:
+                actor_exists = UserModel.objects.using(db_alias).filter(pk=actor.pk).exists()
+            except Exception:
+                actor_exists = False
+            actor_in_tenant = actor if actor_exists else None
 
-        if replace_existing:
-            for role_id, row in existing.items():
-                if role_id in role_ids:
+        with transaction.atomic(using=db_alias):
+            existing = {
+                row.role_id: row
+                for row in UserRole.objects.using(db_alias).select_related("role").filter(user=user)
+            }
+
+            if replace_existing:
+                for role_id, row in existing.items():
+                    if role_id in role_ids:
+                        continue
+                    if row.is_active:
+                        row.is_active = False
+                        row.save(update_fields=["is_active", "updated_at"])
+
+            assigned = []
+            for role_id in role_ids:
+                row = existing.get(role_id)
+                if row:
+                    if not row.is_active:
+                        row.is_active = True
+                        row.assigned_by = actor_in_tenant
+                        row.save(update_fields=["is_active", "assigned_by", "updated_at"])
+                    assigned.append(row)
                     continue
-                if row.is_active:
-                    row.is_active = False
-                    row.save(update_fields=["is_active", "updated_at"])
+                created = UserRole.objects.using(db_alias).create(
+                    user=user,
+                    role_id=role_id,
+                    assigned_by=actor_in_tenant,
+                    is_active=True,
+                )
+                assigned.append(created)
 
-        assigned = []
-        for role_id in role_ids:
-            row = existing.get(role_id)
-            if row:
-                if not row.is_active:
-                    row.is_active = True
-                    row.assigned_by = actor
-                    row.save(update_fields=["is_active", "assigned_by", "updated_at"])
-                assigned.append(row)
-                continue
-            created = UserRole.objects.create(
-                user=user,
-                role_id=role_id,
-                assigned_by=actor,
-                is_active=True,
-            )
-            assigned.append(created)
-
-        return {
-            "user": user,
-            "assigned_roles": [row.role for row in assigned],
-            "active_role_ids": list(
-                UserRole.objects.filter(user=user, is_active=True).values_list("role_id", flat=True)
-            ),
-        }
+            return {
+                "user": user,
+                "assigned_roles": [row.role for row in assigned],
+                "active_role_ids": list(
+                    UserRole.objects.using(db_alias)
+                    .filter(user=user, is_active=True)
+                    .values_list("role_id", flat=True)
+                ),
+            }
