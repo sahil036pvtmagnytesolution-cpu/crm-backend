@@ -1,4 +1,4 @@
-import email
+﻿import email
 import html
 import uuid
 import subprocess
@@ -267,41 +267,29 @@ class ApprovedUsersView(APIView):
 class ProposalViewSet(ModelViewSet):
     queryset = Proposal.objects.all()
     serializer_class = ProposalSerializer
-     # ================= ASSIGN + EMAIL =================
-    @action(detail=True, methods=['post'])
+
+    def perform_create(self, serializer):
+        proposal = serializer.save(created_by=self.request.user)
+        if proposal.assigned_to_id:
+            send_proposal_assignment_email(proposal, user=proposal.assigned_to)
+
+    def perform_update(self, serializer):
+        previous_assigned_id = serializer.instance.assigned_to_id
+        proposal = serializer.save()
+        if proposal.assigned_to_id and proposal.assigned_to_id != previous_assigned_id:
+            send_proposal_assignment_email(proposal, user=proposal.assigned_to)
+
+    # ================= ASSIGN + EMAIL =================
+    @action(detail=True, methods=["post"])
     def assign(self, request, pk=None):
-
-        print("ASSIGN API HIT")
-
         proposal = self.get_object()
-        user_id = request.data.get("user_id")
-
-        if not user_id:
-            proposal.assigned_to = None
-            proposal.save()
-            return Response({"message": "Unassigned successfully"})
-
-        try:
-            User = get_user_model()
-            user = User.objects.get(id=user_id)
-
-            proposal.assigned_to = user
-            proposal.save()
-
-            print("SENDING MAIL TO:", user.email)  # ðŸ‘ˆ Debug print
-
-            if not send_proposal_assignment_email(proposal, user):
-                raise ValueError("Unable to send proposal assignment email")
-
-            return Response(
-                {"message": "Assigned & Email Sent Successfully"}
-            )
-
-        except Exception as e:
-            return Response(
-                {"error": str(e)},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        result, error_response = _assign_proposal_to_target(
+            proposal=proposal,
+            payload=request.data,
+        )
+        if error_response is not None:
+            return error_response
+        return Response(result, status=status.HTTP_200_OK)
 
 class EstimateViewSet(ModelViewSet):
 
@@ -319,11 +307,11 @@ class EstimateViewSet(ModelViewSet):
     # ================= CREATE INVOICE =================
     def create_invoice(self, estimate):
 
-        # ðŸ”¹ Only run when status = Sent
+        # Ã°Å¸â€Â¹ Only run when status = Sent
         if estimate.status != "Sent":
             return
 
-        # ðŸ”¹ Check invoice already exists (duplicate à¤°à¥‹à¤•à¤¨à¥‡ à¤•à¥‡ à¤²à¤¿à¤)
+        # Ã°Å¸â€Â¹ Check invoice already exists (duplicate Ã Â¤Â°Ã Â¥â€¹Ã Â¤â€¢Ã Â¤Â¨Ã Â¥â€¡ Ã Â¤â€¢Ã Â¥â€¡ Ã Â¤Â²Ã Â¤Â¿Ã Â¤Â)
         existing_invoice = Invoice.objects.filter(
             reference_estimate=estimate
         ).first()
@@ -331,14 +319,14 @@ class EstimateViewSet(ModelViewSet):
         if existing_invoice:
             return
 
-        # ðŸ”¹ Find client
+        # Ã°Å¸â€Â¹ Find client
         client = estimate.customer
 
         if not client:
-            print("âš  Client not found")
+            print("Ã¢Å¡Â  Client not found")
             return
 
-        # ðŸ”¹ Create invoice
+        # Ã°Å¸â€Â¹ Create invoice
         invoice = Invoice.objects.create(
             invoice_number=f"INV-{estimate.id}",
             customer=client,
@@ -350,13 +338,13 @@ class EstimateViewSet(ModelViewSet):
             reference_estimate=estimate
         )
 
-        print("âœ… Invoice created:", invoice.invoice_number)
+        print("Ã¢Å“â€¦ Invoice created:", invoice.invoice_number)
 
-        # ðŸ”¹ Update estimate status
+        # Ã°Å¸â€Â¹ Update estimate status
         estimate.status = "Approved"
         estimate.save()
 
-        print("âœ… Estimate status updated to Approved")
+        print("Ã¢Å“â€¦ Estimate status updated to Approved")
 
 class CalendarEventViewSet(ModelViewSet):
     queryset = CalendarEvent.objects.all()
@@ -488,7 +476,7 @@ class ProjectViewSet(ModelViewSet):
         mentor_name = _user_display(mentor) if mentor else "-"
         member_names = ", ".join([_user_display(m) for m in project.members.all()]) or "-"
         visible_tabs = ", ".join(project.visible_tabs or []) or "-"
-        settings_list = "<br/>".join([f"â€¢ {s}" for s in (project.settings or [])]) or "-"
+        settings_list = "<br/>".join([f"Ã¢â‚¬Â¢ {s}" for s in (project.settings or [])]) or "-"
 
         subject = f"New Project Created: {project.name}"
         html_message = f"""
@@ -543,7 +531,7 @@ class ProjectViewSet(ModelViewSet):
         mentor_name = _user_display(mentor) if mentor else "-"
         member_names = ", ".join([_user_display(m) for m in project.members.all()]) or "-"
         visible_tabs = ", ".join(project.visible_tabs or []) or "-"
-        settings_list = "<br/>".join([f"â€¢ {s}" for s in (project.settings or [])]) or "-"
+        settings_list = "<br/>".join([f"Ã¢â‚¬Â¢ {s}" for s in (project.settings or [])]) or "-"
 
         subject = f"New Project Created: {project.name}"
         html_message = f"""
@@ -1761,7 +1749,14 @@ def roles_list_api(request):
         return _deny_response(RBAC_SETTINGS_MODULE, Permission.ACTION_VIEW)
 
     sync_default_permissions()
-    queryset = Role.objects.prefetch_related("role_permissions__permission", "user_roles").all().order_by("-id")
+    queryset = (
+        Role.objects.prefetch_related(
+            "role_permissions__permission",
+            "user_roles__user",
+        )
+        .all()
+        .order_by("-id")
+    )
     serializer = RoleReadSerializer(queryset, many=True)
     return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -1855,6 +1850,66 @@ def role_detail_api(request, pk):
     return Response({"success": True, "message": "Role deleted."}, status=status.HTTP_200_OK)
 
 
+def _resolve_user_email(user):
+    candidates = [
+        getattr(user, "email", None),
+        getattr(user, "username", None),
+    ]
+    return next((value for value in candidates if value and "@" in str(value)), "")
+
+
+def _role_assignment_review_email(target_user, assigned_role_names, assigned_by):
+    recipient = _resolve_user_email(target_user)
+    if not recipient or not assigned_role_names:
+        return {"sent": False, "to": [recipient] if recipient else []}
+
+    user_label = (
+        str(getattr(target_user, "first_name", "") or "").strip()
+        or str(getattr(target_user, "username", "") or "").strip()
+        or recipient
+    )
+    actor_label = (
+        str(getattr(assigned_by, "first_name", "") or "").strip()
+        or str(getattr(assigned_by, "username", "") or "").strip()
+        or _resolve_user_email(assigned_by)
+        or "System"
+    )
+    assigned_at = timezone.localtime(timezone.now()).strftime("%d %b %Y, %I:%M %p")
+    role_summary = ", ".join(assigned_role_names)
+
+    html_content = build_module_email_html(
+        title="Role Access Updated",
+        greeting=user_label,
+        intro=(
+            "Your CRM access permissions were updated successfully. "
+            "Please find your latest assigned role details below."
+        ),
+        details=[
+            ("Assigned Role(s)", role_summary),
+            ("Total Roles", str(len(assigned_role_names))),
+            ("User Account", recipient),
+            ("Assigned By", actor_label),
+            ("Assigned At", assigned_at),
+        ],
+        cta_label="Open CRM",
+        cta_url=_frontend_login_url(),
+        closing="Regards,<br/><strong>Magnyte Solution CRM Team</strong>",
+    )
+
+    try:
+        send_branded_email(
+            subject="Role Assignment Notification",
+            message=strip_tags(html_content),
+            to_emails=[recipient],
+            html_message=html_content,
+            fail_silently=False,
+        )
+        return {"sent": True, "to": [recipient]}
+    except Exception as exc:
+        logger.exception("Role assignment review email failed for user %s", getattr(target_user, "id", None))
+        return {"sent": False, "to": [recipient], "error": str(exc)}
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def assign_role_to_user_api(request):
@@ -1886,6 +1941,11 @@ def assign_role_to_user_api(request):
         event_type=RoleAuditLog.EVENT_ASSIGN,
         changes={"role_ids": active_role_ids},
     )
+    review_email = _role_assignment_review_email(
+        target_user=user_obj,
+        assigned_role_names=assigned_role_names,
+        assigned_by=request.user,
+    )
 
     return Response(
         {
@@ -1897,6 +1957,7 @@ def assign_role_to_user_api(request):
             },
             "assigned_roles": assigned_role_names,
             "rbac": build_user_access_payload(user_obj),
+            "review_email": review_email,
         },
         status=status.HTTP_200_OK,
     )
@@ -1928,21 +1989,287 @@ def sales_proposals(request):
     return Response(serializer.data, status=200)
 
 
-def send_proposal_assignment_email(proposal, user):
-    if not user:
-        return False
-    candidates = [
-        getattr(user, "email", None),
-        getattr(user, "username", None),
-        getattr(user, "first_name", None),
-        getattr(user, "last_name", None),
-    ]
-    recipient = next(
-        (value for value in candidates if value and "@" in str(value)),
-        None,
+def _active_non_deleted_users_queryset(user_model, alias):
+    queryset = user_model.objects.using(alias).filter(is_active=True)
+    model_field_names = {field.name for field in user_model._meta.fields}
+    if "is_deleted" in model_field_names:
+        return queryset.filter(is_deleted=False)
+
+    table_name = user_model._meta.db_table
+    try:
+        connection = connections[alias]
+        with connection.cursor() as cursor:
+            table_columns = {
+                column.name
+                for column in connection.introspection.get_table_description(cursor, table_name)
+            }
+        if "is_deleted" in table_columns:
+            return queryset.extra(where=["COALESCE(is_deleted, 0) = 0"])
+    except Exception:
+        pass
+
+    return queryset
+
+
+def _resolve_business_for_current_tenant(request=None):
+    db_alias = get_current_db()
+    if db_alias == "default":
+        return None
+
+    db_name = ""
+    try:
+        db_name = str(connections[db_alias].settings_dict.get("NAME") or "").strip()
+    except Exception:
+        db_name = ""
+
+    business = None
+    if db_name:
+        try:
+            business = (
+                Business.objects.using("default")
+                .filter(db_name__iexact=db_name)
+                .order_by("-created_at")
+                .first()
+            )
+        except Exception:
+            business = None
+    if business:
+        return business
+
+    user_email = str(getattr(getattr(request, "user", None), "email", "") or "").strip()
+    if not user_email:
+        return None
+    try:
+        return (
+            Business.objects.using("default")
+            .filter(email__iexact=user_email)
+            .order_by("-created_at")
+            .first()
+        )
+    except Exception:
+        return None
+
+
+def _mirror_user_to_alias(source_user, target_alias):
+    if not source_user or not target_alias or target_alias == "default":
+        return source_user
+
+    user_model = get_user_model()
+    source_alias = getattr(getattr(source_user, "_state", None), "db", None) or "default"
+    if source_alias == target_alias:
+        return source_user
+
+    target_qs = user_model.objects.using(target_alias)
+    existing = target_qs.filter(pk=source_user.pk).first()
+    if existing:
+        return existing
+
+    field_names = {field.name for field in user_model._meta.fields}
+    mirror_fields = (
+        "password",
+        "last_login",
+        "is_superuser",
+        "username",
+        "first_name",
+        "last_name",
+        "email",
+        "is_staff",
+        "is_active",
+        "date_joined",
     )
+    payload = {}
+    for field_name in mirror_fields:
+        if field_name in field_names:
+            payload[field_name] = getattr(source_user, field_name, None)
+
+    if "username" in field_names and not payload.get("username"):
+        payload["username"] = getattr(source_user, "email", None) or f"user_{source_user.pk}"
+    if "email" in field_names and payload.get("email") is None:
+        payload["email"] = ""
+
+    try:
+        target_qs.create(id=source_user.pk, **payload)
+    except Exception:
+        username_value = str(getattr(source_user, "username", "") or "").strip()
+        email_value = str(getattr(source_user, "email", "") or "").strip()
+        if username_value:
+            conflict = target_qs.filter(username__iexact=username_value).first()
+            if conflict:
+                return conflict
+        if email_value:
+            conflict = target_qs.filter(email__iexact=email_value).first()
+            if conflict:
+                return conflict
+        return None
+
+    return target_qs.filter(pk=source_user.pk).first()
+
+
+def _sync_tenant_role_users_from_default(request, user_model, db_alias, include_all=False):
+    if db_alias == "default":
+        return
+
+    default_users = _active_non_deleted_users_queryset(user_model, "default")
+    if not include_all:
+        business = _resolve_business_for_current_tenant(request)
+        business_email = str(getattr(business, "email", "") or "").strip()
+        if not business_email:
+            return
+        default_users = default_users.filter(
+            Q(email__iexact=business_email) | Q(username__iexact=business_email)
+        )
+
+    default_users = default_users.order_by("id")
+    for source_user in default_users:
+        _mirror_user_to_alias(source_user, db_alias)
+
+
+def _parse_int(value):
+    if value in (None, ""):
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_active_user(user_id):
+    user_id = _parse_int(user_id)
+    if not user_id:
+        return None
+
+    user_model = get_user_model()
+    aliases = []
+    current_alias = get_current_db()
+    if current_alias:
+        aliases.append(current_alias)
+    if "default" not in aliases:
+        aliases.append("default")
+
+    for alias in aliases:
+        try:
+            user = _active_non_deleted_users_queryset(user_model, alias).filter(id=user_id).first()
+            if user:
+                return user
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_business_queryset():
+    aliases = ["default"]
+    current_alias = get_current_db()
+    if current_alias and current_alias not in aliases:
+        aliases.append(current_alias)
+
+    for alias in aliases:
+        try:
+            return Business.objects.using(alias).all().order_by("name", "id")
+        except Exception:
+            continue
+    return Business.objects.none()
+
+
+def _resolve_business_by_id(business_id):
+    business_id = _parse_int(business_id)
+    if not business_id:
+        return None
+
+    aliases = ["default"]
+    current_alias = get_current_db()
+    if current_alias and current_alias not in aliases:
+        aliases.append(current_alias)
+
+    for alias in aliases:
+        try:
+            business = Business.objects.using(alias).filter(id=business_id).first()
+            if business:
+                return business
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_user_for_business(business):
+    if not business:
+        return None
+
+    business_email = str(getattr(business, "email", "") or "").strip()
+    if not business_email:
+        return None
+
+    user_model = get_user_model()
+    aliases = []
+    current_alias = get_current_db()
+    if current_alias:
+        aliases.append(current_alias)
+    if "default" not in aliases:
+        aliases.append("default")
+
+    for alias in aliases:
+        try:
+            user = (
+                _active_non_deleted_users_queryset(user_model, alias)
+                .filter(Q(email__iexact=business_email) | Q(username__iexact=business_email))
+                .order_by("-id")
+                .first()
+            )
+            if user:
+                return user
+        except Exception:
+            continue
+    return None
+
+
+def _serialize_proposal_assignees(include_unapproved=True):
+    rows = []
+    for business in _resolve_business_queryset():
+        if not include_unapproved and not bool(getattr(business, "is_approved", False)):
+            continue
+
+        mapped_user = _resolve_user_for_business(business)
+        rows.append(
+            {
+                "business_id": business.id,
+                "business_name": business.name,
+                "owner_name": business.owner_name,
+                "email": business.email,
+                "is_approved": bool(getattr(business, "is_approved", False)),
+                "user_id": getattr(mapped_user, "id", None),
+                "assignable": bool(mapped_user),
+            }
+        )
+    return rows
+
+
+def send_proposal_assignment_email(proposal, user=None, recipient_email=None, recipient_name=None):
+    recipient = str(recipient_email or "").strip()
+    if not recipient:
+        candidates = []
+        if user is not None:
+            candidates.extend(
+                [
+                    getattr(user, "email", None),
+                    getattr(user, "username", None),
+                    getattr(user, "first_name", None),
+                    getattr(user, "last_name", None),
+                ]
+            )
+        recipient = next(
+            (value for value in candidates if value and "@" in str(value)),
+            "",
+        )
+
+    recipient = str(recipient).strip()
     if not recipient:
         return False
+
+    greeting_name = (
+        str(recipient_name or "").strip()
+        or str(getattr(user, "first_name", "") or "").strip()
+        or str(getattr(user, "username", "") or "").strip()
+        or recipient
+    )
 
     try:
         frontend_url = f"http://localhost:3000/sales/proposals/{proposal.id}"
@@ -1950,12 +2277,12 @@ def send_proposal_assignment_email(proposal, user):
 
         html_content = build_module_email_html(
             title="New Proposal Assigned",
-            greeting=user.first_name or user.username or recipient,
-            intro="You have been assigned a new proposal. Details are below:",
+            greeting=greeting_name,
+            intro="A new proposal has been assigned to your business. Details are below:",
             details=[
                 ("Proposal ID", f"#{proposal.id}"),
                 ("Subject", getattr(proposal, "subject", "N/A")),
-                ("Total", f"â‚¹{getattr(proposal, 'total', '0')}"),
+                ("Total", f"INR {getattr(proposal, 'total', '0')}"),
             ],
             cta_label="View Proposal",
             cta_url=frontend_url,
@@ -1970,11 +2297,87 @@ def send_proposal_assignment_email(proposal, user):
             html_message=html_content,
             fail_silently=False,
         )
-        print("HTML EMAIL SENT TO:", recipient)
         return True
-    except Exception as e:
-        print("EMAIL ERROR:", str(e))
+    except Exception as exc:
+        logger.exception("Proposal assignment email failed for proposal %s", getattr(proposal, "id", None))
+        print("EMAIL ERROR:", str(exc))
         return False
+
+
+def _assign_proposal_to_target(proposal, payload):
+    user_id = _parse_int(payload.get("user_id"))
+    business_id = _parse_int(payload.get("business_id"))
+
+    if not user_id and not business_id:
+        proposal.assigned_to = None
+        proposal.save(update_fields=["assigned_to"])
+        return (
+            {
+                "message": "Unassigned successfully",
+                "email_sent": False,
+            },
+            None,
+        )
+
+    business = _resolve_business_by_id(business_id) if business_id else None
+    if business_id and not business:
+        return None, Response({"error": "Business not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    user = _resolve_active_user(user_id) if user_id else None
+    if not user and business is not None:
+        user = _resolve_user_for_business(business)
+
+    if not user:
+        return None, Response(
+            {"error": "No active user account is linked with the selected business"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if business is None and user.email:
+        business = (
+            _resolve_business_queryset()
+            .filter(email__iexact=user.email)
+            .order_by("-id")
+            .first()
+        )
+
+    proposal.assigned_to = user
+    proposal.save(update_fields=["assigned_to"])
+
+    recipient_email = str(getattr(business, "email", "") or "").strip() or str(getattr(user, "email", "") or "").strip()
+    recipient_name = str(getattr(business, "name", "") or "").strip() or str(getattr(user, "first_name", "") or "").strip() or str(getattr(user, "username", "") or "").strip()
+
+    email_sent = send_proposal_assignment_email(
+        proposal,
+        user=user,
+        recipient_email=recipient_email,
+        recipient_name=recipient_name,
+    )
+
+    return (
+        {
+            "message": "Assigned successfully",
+            "email_sent": email_sent,
+            "email_to": recipient_email,
+            "assigned_user": {
+                "id": user.id,
+                "name": user.first_name or user.username,
+                "email": user.email,
+            },
+            "assigned_business": (
+                {
+                    "id": business.id,
+                    "name": business.name,
+                    "email": business.email,
+                    "is_approved": bool(getattr(business, "is_approved", False)),
+                }
+                if business
+                else None
+            ),
+        },
+        None,
+    )
+
 
 # =========================
 # ASSIGN PROPOSAL
@@ -1985,41 +2388,15 @@ def assign_proposal(request, pk):
     try:
         proposal = Proposal.objects.get(pk=pk)
     except Proposal.DoesNotExist:
-        return Response({"error": "Proposal not found"}, status=404)
+        return Response({"error": "Proposal not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    user_id = request.data.get("user_id")
-
-    if user_id is None:
-        proposal.assigned_to = None
-        proposal.save()
-        return Response({"message": "Unassigned successfully"})
-
-    try:
-        user = User.objects.get(pk=user_id)
-        proposal.assigned_to = user
-        proposal.save()
-        email_sent = send_proposal_assignment_email(proposal, user)
-        recipient = (
-            getattr(user, "email", None)
-            or getattr(user, "username", None)
-            or getattr(user, "first_name", None)
-            or getattr(user, "last_name", None)
-            or ""
-        )
-        return Response(
-            {
-                "message": "Assigned successfully",
-                "email_sent": email_sent,
-                "email_to": recipient,
-            }
-        )
-
-    except User.DoesNotExist:
-        return Response({"error": "User not found"}, status=404)
-
-    except Exception as e:
-        print("EMAIL ERROR:", str(e))
-        return Response({"error": str(e)}, status=400)
+    result, error_response = _assign_proposal_to_target(
+        proposal=proposal,
+        payload=request.data,
+    )
+    if error_response is not None:
+        return error_response
+    return Response(result, status=status.HTTP_200_OK)
 
 
 # =========================
@@ -2032,7 +2409,7 @@ def create_proposal(request):
     if serializer.is_valid():
         proposal = serializer.save(created_by=request.user)
         if proposal.assigned_to:
-            send_proposal_assignment_email(proposal, proposal.assigned_to)
+            send_proposal_assignment_email(proposal, user=proposal.assigned_to)
         return Response(serializer.data, status=201)
     return Response(serializer.errors, status=400)
 
@@ -2058,14 +2435,17 @@ def proposal_detail(request, pk):
         if serializer.is_valid():
             proposal = serializer.save()
             if proposal.assigned_to_id and proposal.assigned_to_id != previous_assigned_id:
-                send_proposal_assignment_email(proposal, proposal.assigned_to)
+                send_proposal_assignment_email(proposal, user=proposal.assigned_to)
             return Response(serializer.data)
         return Response(serializer.errors, status=400)
 
     if request.method == "PATCH":
+        previous_assigned_id = proposal.assigned_to_id
         serializer = ProposalSerializer(proposal, data=request.data, partial=True)
         if serializer.is_valid():
-            serializer.save()
+            proposal = serializer.save()
+            if proposal.assigned_to_id and proposal.assigned_to_id != previous_assigned_id:
+                send_proposal_assignment_email(proposal, user=proposal.assigned_to)
             return Response(serializer.data)
         return Response(serializer.errors, status=400)
 
@@ -2073,49 +2453,89 @@ def proposal_detail(request, pk):
         proposal.delete()
         return Response({"message": "Deleted successfully"}, status=200)
 
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def users_list(request):
-    def _active_non_deleted_users(user_model, alias):
-        queryset = user_model.objects.using(alias).filter(is_active=True)
-        model_field_names = {field.name for field in user_model._meta.fields}
-        if "is_deleted" in model_field_names:
-            return queryset.filter(is_deleted=False)
+    user_model = get_user_model()
+    db_alias = get_current_db()
+    all_registered = str(request.query_params.get("all_registered", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
-        table_name = user_model._meta.db_table
+    if db_alias != "default" and not all_registered:
         try:
-            connection = connections[alias]
-            with connection.cursor() as cursor:
-                table_columns = {
-                    column.name
-                    for column in connection.introspection.get_table_description(cursor, table_name)
-                }
-            if "is_deleted" in table_columns:
-                return queryset.extra(where=["COALESCE(is_deleted, 0) = 0"])
+            _sync_tenant_role_users_from_default(
+                request,
+                user_model,
+                db_alias,
+                include_all=all_registered,
+            )
         except Exception:
             pass
 
-        return queryset
-
-    user_model = get_user_model()
-    db_alias = get_current_db()
     try:
-        users = _active_non_deleted_users(user_model, db_alias)
+        source_alias = "default" if all_registered else db_alias
+        users = _active_non_deleted_users_queryset(user_model, source_alias)
     except Exception:
-        users = _active_non_deleted_users(user_model, "default")
+        users = _active_non_deleted_users_queryset(user_model, "default")
+
+    if db_alias != "default" and not all_registered:
+        try:
+            if not users.exists():
+                users = _active_non_deleted_users_queryset(user_model, "default")
+                business = _resolve_business_for_current_tenant(request)
+                business_email = str(getattr(business, "email", "") or "").strip()
+                if business_email:
+                    users = users.filter(
+                        Q(email__iexact=business_email) | Q(username__iexact=business_email)
+                    )
+        except Exception:
+            pass
 
     data = [
         {
             "id": u.id,
-            "name": u.first_name or u.username,
-            "email": u.email,
+            "name": (
+                f"{str(getattr(u, 'first_name', '') or '').strip()} "
+                f"{str(getattr(u, 'last_name', '') or '').strip()}"
+            ).strip()
+            or str(getattr(u, "first_name", "") or "").strip()
+            or str(getattr(u, "username", "") or "").strip()
+            or str(getattr(u, "email", "") or "").strip(),
+            "first_name": str(getattr(u, "first_name", "") or "").strip(),
+            "last_name": str(getattr(u, "last_name", "") or "").strip(),
+            "username": str(getattr(u, "username", "") or "").strip(),
+            "email": str(getattr(u, "email", "") or "").strip(),
             "is_active": bool(getattr(u, "is_active", False)),
             "is_deleted": bool(getattr(u, "is_deleted", False)),
         }
         for u in users
     ]
+    data = sorted(
+        data,
+        key=lambda row: (
+            str(row.get("name") or "").lower(),
+            str(row.get("email") or "").lower(),
+            int(row.get("id") or 0),
+        ),
+    )
 
     return Response(data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def proposal_assignees(request):
+    include_unapproved = str(request.query_params.get("include_unapproved", "1")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
+    data = _serialize_proposal_assignees(include_unapproved=include_unapproved)
+    return Response(data, status=status.HTTP_200_OK)
 
 # ==============================
 @api_view(["GET"])
@@ -2411,7 +2831,7 @@ class ClientViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(data=request.data)
 
         if not serializer.is_valid():
-            print("âŒ SERIALIZER ERROR:", serializer.errors)  # ðŸ‘ˆ Important
+            print("Ã¢ÂÅ’ SERIALIZER ERROR:", serializer.errors)  # Ã°Å¸â€˜Ë† Important
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         self.perform_create(serializer)
@@ -2460,7 +2880,7 @@ def upload_and_send_emails(request):
     except Exception as e:
         return Response({"error": "Invalid Excel file"}, status=400)
 
-    # âœ… Detect column automatically (email / Email)
+    # Ã¢Å“â€¦ Detect column automatically (email / Email)
     if "email" in df.columns:
         email_column = "email"
     elif "Email" in df.columns:
@@ -2844,14 +3264,14 @@ def invoice_payment_records(request):
         payment = InvoicePayment.objects.filter(invoice=invoice).first()
 
         if payment:
-            # ðŸ”„ update existing payment
+            # Ã°Å¸â€â€ž update existing payment
             payment.payment_mode = invoice.payment_mode or "Null"
             payment.transaction_id = f"{invoice.payment_mode}-{invoice.id}"
             payment.amount = invoice.total_amount
             payment.save()
 
         else:
-            # âž• create new payment
+            # Ã¢Å¾â€¢ create new payment
             InvoicePayment.objects.create(
                 invoice=invoice,
                 payment_mode=invoice.payment_mode or "Null",
@@ -3042,11 +3462,11 @@ def fix_estimate_invoices(request):
 # ====================== HELPER FUNCTION ======================
 def create_invoice_from_estimate(estimate, user=None):
 
-    # ðŸ”¹ Only create when status is Sent
+    # Ã°Å¸â€Â¹ Only create when status is Sent
     if estimate.status != "Sent":
         return
 
-    # ðŸ”¹ check if invoice already exists
+    # Ã°Å¸â€Â¹ check if invoice already exists
     existing = Invoice.objects.filter(
         reference_estimate=estimate
     ).first()
@@ -3054,14 +3474,14 @@ def create_invoice_from_estimate(estimate, user=None):
     if existing:
         return
 
-    # ðŸ”¹ find client
+    # Ã°Å¸â€Â¹ find client
     client = estimate.customer
 
     if not client:
         print("Client not found:", estimate.customer)
         return
 
-    # ðŸ”¹ create invoice
+    # Ã°Å¸â€Â¹ create invoice
     invoice = Invoice.objects.create(
         invoice_number=f"INV-{estimate.estimate_number}",
         reference_estimate=estimate,
@@ -3079,7 +3499,7 @@ def create_invoice_from_estimate(estimate, user=None):
         f"Invoice Created [Invoice No: {invoice.invoice_number}]",
         user=user,
     )
-    print("âœ… Invoice created from estimate:", invoice.invoice_number)
+    print("Ã¢Å“â€¦ Invoice created from estimate:", invoice.invoice_number)
 
 # ======================== Customer Pach =========================
 @api_view(["PATCH"])
@@ -3287,8 +3707,8 @@ def contacts_list_create(request):
     In environments where the address columns (``street``, ``city``, ``state``,
     ``zip_code`` and ``country``) have not been created yet, this resulted in an
     ``OperationalError`` ("Unknown column 'core_contact.street'"). The address
-    fields are not used by the API response â€“ ``_serialize_contact`` deliberately
-    omits them â€“ so we can safely restrict the query to the columns that are
+    fields are not used by the API response Ã¢â‚¬â€œ ``_serialize_contact`` deliberately
+    omits them Ã¢â‚¬â€œ so we can safely restrict the query to the columns that are
     required for the serialization. Using ``only()`` ensures Django does *not*
     include the missing columns in the SELECT statement, preventing the error
     while keeping the existing behaviour intact.
@@ -7478,6 +7898,7 @@ class SetupRolePermissionViewSet(SetupBaseViewSet):
         if module_slug:
             queryset = queryset.filter(module_slug__iexact=module_slug)
         return queryset.order_by("role_id", "module_slug", "id")
+
 
 
 

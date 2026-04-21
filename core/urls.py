@@ -13,6 +13,7 @@ from .views import (
     approve_role,
     sales_proposals,
     assign_proposal,
+    proposal_assignees,
     users_list,
     ExpenseViewSet,
     ContractViewSet,
@@ -172,6 +173,7 @@ urlpatterns = [
     path("api/roles/my-permissions", my_permissions_api),
 
     # Proposals
+    path("proposals/assignees/", proposal_assignees),
     path("proposals/<int:pk>/assign/", assign_proposal),
     path("report/sales/", sales_proposals),
     path("proposals/<int:pk>/", proposal_detail),

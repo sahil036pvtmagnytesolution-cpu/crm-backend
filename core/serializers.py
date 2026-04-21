@@ -10,7 +10,7 @@ from django.core.validators import validate_email
 from django.utils import timezone
 from django.utils.dateparse import parse_date
 from django.utils.text import slugify
-from django.db import connections, transaction
+from django.db import connections, transaction, IntegrityError
 from django.db.utils import OperationalError, ProgrammingError
 from rest_framework import serializers
 from .models import Business, Contact, CreditNote, CreditNoteReminder, CreditNoteTask, Customer, Item, ItemGroup, Role, Proposal, CustomFieldValue
@@ -1600,6 +1600,7 @@ class PermissionDefinitionSerializer(serializers.ModelSerializer):
 class RoleReadSerializer(serializers.ModelSerializer):
     permissions = serializers.SerializerMethodField()
     users_count = serializers.SerializerMethodField()
+    assigned_users = serializers.SerializerMethodField()
 
     class Meta:
         model = Role
@@ -1612,6 +1613,7 @@ class RoleReadSerializer(serializers.ModelSerializer):
             "level",
             "permissions",
             "users_count",
+            "assigned_users",
             "created_at",
             "updated_at",
         ]
@@ -1634,6 +1636,35 @@ class RoleReadSerializer(serializers.ModelSerializer):
 
     def get_users_count(self, obj):
         return obj.user_roles.filter(is_active=True).count()
+
+    def get_assigned_users(self, obj):
+        users = []
+        seen = set()
+        links = obj.user_roles.select_related("user").filter(is_active=True).order_by("-assigned_at", "-id")
+        for row in links:
+            user = getattr(row, "user", None)
+            if not user:
+                continue
+            user_id = getattr(user, "id", None)
+            if not user_id or user_id in seen:
+                continue
+            seen.add(user_id)
+
+            display_name = (
+                str(getattr(user, "first_name", "") or "").strip()
+                or str(getattr(user, "username", "") or "").strip()
+                or str(getattr(user, "email", "") or "").strip()
+                or f"User #{user_id}"
+            )
+            users.append(
+                {
+                    "id": user_id,
+                    "name": display_name,
+                    "email": str(getattr(user, "email", "") or "").strip(),
+                    "username": str(getattr(user, "username", "") or "").strip(),
+                }
+            )
+        return users
 
 
 class RoleWriteSerializer(serializers.Serializer):
@@ -1759,6 +1790,19 @@ class RoleWriteSerializer(serializers.Serializer):
 
 
 class UserRoleAssignmentSerializer(serializers.Serializer):
+    MIRROR_FIELDS = (
+        "password",
+        "last_login",
+        "is_superuser",
+        "username",
+        "first_name",
+        "last_name",
+        "email",
+        "is_staff",
+        "is_active",
+        "date_joined",
+    )
+
     user_id = serializers.IntegerField()
     role_ids = serializers.ListField(
         child=serializers.IntegerField(min_value=1),
@@ -1769,26 +1813,90 @@ class UserRoleAssignmentSerializer(serializers.Serializer):
     replace_existing = serializers.BooleanField(required=False, default=True)
 
     @staticmethod
-    def _get_active_non_deleted_user(user_model, db_alias, user_id):
-        queryset = user_model.objects.using(db_alias).filter(pk=user_id, is_active=True)
-        model_field_names = {field.name for field in user_model._meta.fields}
-        if "is_deleted" in model_field_names:
-            return queryset.filter(is_deleted=False).first()
+    def _active_user_aliases(primary_alias):
+        aliases = []
+        for alias in (primary_alias, "default"):
+            if alias and alias not in aliases:
+                aliases.append(alias)
+        return aliases or ["default"]
 
-        table_name = user_model._meta.db_table
+    @classmethod
+    def _get_active_non_deleted_user(cls, user_model, db_alias, user_id):
+        for alias in cls._active_user_aliases(db_alias):
+            try:
+                queryset = user_model.objects.using(alias).filter(pk=user_id, is_active=True)
+            except Exception:
+                continue
+
+            model_field_names = {field.name for field in user_model._meta.fields}
+            if "is_deleted" in model_field_names:
+                user = queryset.filter(is_deleted=False).first()
+                if user:
+                    return user
+                continue
+
+            table_name = user_model._meta.db_table
+            try:
+                connection = connections[alias]
+                with connection.cursor() as cursor:
+                    table_columns = {
+                        column.name
+                        for column in connection.introspection.get_table_description(cursor, table_name)
+                    }
+                if "is_deleted" in table_columns:
+                    user = queryset.extra(where=["COALESCE(is_deleted, 0) = 0"]).first()
+                else:
+                    user = queryset.first()
+            except Exception:
+                user = queryset.first()
+
+            if user:
+                return user
+        return None
+
+    @classmethod
+    def _mirror_user_to_alias(cls, user_model, source_user, target_alias):
+        if not source_user or not target_alias:
+            return source_user
+
+        source_alias = getattr(getattr(source_user, "_state", None), "db", None) or "default"
+        if source_alias == target_alias:
+            return source_user
+
+        target_qs = user_model.objects.using(target_alias)
+        existing = target_qs.filter(pk=source_user.pk).first()
+        if existing:
+            return existing
+
+        field_names = {field.name for field in user_model._meta.fields}
+        payload = {}
+        for field_name in cls.MIRROR_FIELDS:
+            if field_name in field_names:
+                payload[field_name] = getattr(source_user, field_name, None)
+
+        if "username" in field_names and not payload.get("username"):
+            payload["username"] = (
+                getattr(source_user, "email", None)
+                or f"user_{getattr(source_user, 'pk', '')}"
+            )
+        if "email" in field_names and payload.get("email") is None:
+            payload["email"] = ""
+
         try:
-            connection = connections[db_alias]
-            with connection.cursor() as cursor:
-                table_columns = {
-                    column.name
-                    for column in connection.introspection.get_table_description(cursor, table_name)
-                }
-            if "is_deleted" in table_columns:
-                return queryset.extra(where=["COALESCE(is_deleted, 0) = 0"]).first()
-        except Exception:
-            pass
+            target_qs.create(id=source_user.pk, **payload)
+        except IntegrityError:
+            username_value = str(getattr(source_user, "username", "") or "").strip()
+            email_value = str(getattr(source_user, "email", "") or "").strip()
+            fallback = None
+            if username_value:
+                fallback = target_qs.filter(username__iexact=username_value).first()
+            if not fallback and email_value:
+                fallback = target_qs.filter(email__iexact=email_value).first()
+            if fallback:
+                return fallback
+            raise
 
-        return queryset.first()
+        return target_qs.filter(pk=source_user.pk).first() or source_user
 
     def validate(self, attrs):
         UserModel = get_user_model()
@@ -1831,6 +1939,14 @@ class UserRoleAssignmentSerializer(serializers.Serializer):
                         {"role_ids": "Only Super Admin can assign Super Admin roles."}
                     )
 
+        if db_alias and db_alias != "default":
+            try:
+                user = self._mirror_user_to_alias(UserModel, user, db_alias)
+            except Exception:
+                raise serializers.ValidationError(
+                    {"user_id": "User is active but not available in current tenant users table."}
+                )
+
         attrs["user_obj"] = user
         attrs["clean_role_ids"] = clean_role_ids
         attrs["db_alias"] = db_alias
@@ -1847,15 +1963,21 @@ class UserRoleAssignmentSerializer(serializers.Serializer):
         actor_in_tenant = None
         if actor and getattr(actor, "is_authenticated", False):
             try:
-                actor_exists = UserModel.objects.using(db_alias).filter(pk=actor.pk).exists()
+                actor_source = self._get_active_non_deleted_user(UserModel, db_alias, actor.pk)
+                if actor_source is None:
+                    actor_source = UserModel.objects.using("default").filter(pk=actor.pk).first()
             except Exception:
-                actor_exists = False
-            actor_in_tenant = actor if actor_exists else None
+                actor_source = None
+            if actor_source:
+                try:
+                    actor_in_tenant = self._mirror_user_to_alias(UserModel, actor_source, db_alias)
+                except Exception:
+                    actor_in_tenant = None
 
         with transaction.atomic(using=db_alias):
             existing = {
                 row.role_id: row
-                for row in UserRole.objects.using(db_alias).select_related("role").filter(user=user)
+                for row in UserRole.objects.using(db_alias).select_related("role").filter(user_id=user.id)
             }
 
             if replace_existing:
@@ -1872,14 +1994,14 @@ class UserRoleAssignmentSerializer(serializers.Serializer):
                 if row:
                     if not row.is_active:
                         row.is_active = True
-                        row.assigned_by = actor_in_tenant
+                        row.assigned_by_id = getattr(actor_in_tenant, "id", None)
                         row.save(update_fields=["is_active", "assigned_by", "updated_at"])
                     assigned.append(row)
                     continue
                 created = UserRole.objects.using(db_alias).create(
-                    user=user,
+                    user_id=user.id,
                     role_id=role_id,
-                    assigned_by=actor_in_tenant,
+                    assigned_by_id=getattr(actor_in_tenant, "id", None),
                     is_active=True,
                 )
                 assigned.append(created)
