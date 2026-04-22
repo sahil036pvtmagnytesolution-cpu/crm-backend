@@ -1,4 +1,5 @@
 import re
+import threading
 from typing import Optional
 
 import MySQLdb
@@ -47,6 +48,10 @@ REFERENCE_DATA_TABLES = (
     "ms_currencies",
     "ms_taxes",
 )
+
+_RUNTIME_READY_CACHE = set()
+_TENANT_DATA_PRESENT_CACHE = set()
+_RUNTIME_CACHE_LOCK = threading.Lock()
 
 
 def _is_valid_db_name(value: str) -> bool:
@@ -125,6 +130,19 @@ def _connect_mysql_root():
         charset="utf8mb4",
         autocommit=True,
     )
+
+
+def _table_has_rows(cursor, db_name: str, table_name: str) -> bool:
+    """
+    Fast existence check to avoid expensive full-table COUNT(*) scans.
+    """
+    try:
+        cursor.execute(
+            f"SELECT 1 FROM {_quote_identifier(db_name)}.{_quote_identifier(table_name)} LIMIT 1"
+        )
+    except MySQLdb.OperationalError:
+        return False
+    return cursor.fetchone() is not None
 
 
 def _database_exists(db_name: str) -> bool:
@@ -219,17 +237,17 @@ def has_tenant_business_data(db_name: str) -> bool:
     if not db_name:
         return False
 
+    with _RUNTIME_CACHE_LOCK:
+        if db_name in _TENANT_DATA_PRESENT_CACHE:
+            return True
+
     conn = _connect_mysql_root()
     try:
         with conn.cursor() as cursor:
             for table_name in TENANT_BUSINESS_DATA_CHECK_TABLES:
-                try:
-                    cursor.execute(
-                        f"SELECT COUNT(*) FROM {_quote_identifier(db_name)}.{_quote_identifier(table_name)}"
-                    )
-                except MySQLdb.OperationalError:
-                    continue
-                if cursor.fetchone()[0] > 0:
+                if _table_has_rows(cursor, db_name, table_name):
+                    with _RUNTIME_CACHE_LOCK:
+                        _TENANT_DATA_PRESENT_CACHE.add(db_name)
                     return True
     finally:
         conn.close()
@@ -273,13 +291,13 @@ def _has_legacy_user_owned_data_in_default(user_email: str) -> bool:
             for table_name, where_clause, params in ownership_checks:
                 try:
                     cursor.execute(
-                        f"SELECT COUNT(*) FROM {_quote_identifier(source_db)}.{_quote_identifier(table_name)} "
-                        f"WHERE {where_clause}",
+                        f"SELECT 1 FROM {_quote_identifier(source_db)}.{_quote_identifier(table_name)} "
+                        f"WHERE {where_clause} LIMIT 1",
                         params,
                     )
                 except MySQLdb.OperationalError:
                     continue
-                if cursor.fetchone()[0] > 0:
+                if cursor.fetchone() is not None:
                     return True
     finally:
         conn.close()
@@ -320,11 +338,7 @@ def _copy_legacy_data_from_default_to_tenant(db_name: str) -> bool:
             cursor.execute("SET FOREIGN_KEY_CHECKS=0")
             try:
                 for table_name in candidate_tables:
-                    cursor.execute(
-                        f"SELECT COUNT(*) FROM {_quote_identifier(db_name)}.{_quote_identifier(table_name)}"
-                    )
-                    dest_count = cursor.fetchone()[0]
-                    if dest_count > 0:
+                    if _table_has_rows(cursor, db_name, table_name):
                         continue
 
                     cursor.execute(
@@ -479,6 +493,11 @@ def ensure_business_runtime_ready(business: Business):
     For old approved businesses created before schema bootstrap changes.
     """
     current_db_name = (business.db_name or "").strip()
+
+    with _RUNTIME_CACHE_LOCK:
+        if current_db_name and current_db_name in _RUNTIME_READY_CACHE and _is_valid_db_name(current_db_name):
+            return
+
     has_legacy_existing_db = bool(current_db_name and _database_exists(current_db_name))
 
     if not _is_valid_db_name(current_db_name) and not has_legacy_existing_db:
@@ -500,6 +519,11 @@ def ensure_business_runtime_ready(business: Business):
     if not has_tenant_business_data(business.db_name):
         try:
             if _has_legacy_user_owned_data_in_default(business.email):
-                _copy_legacy_data_from_default_to_tenant(business.db_name)
+                if _copy_legacy_data_from_default_to_tenant(business.db_name):
+                    with _RUNTIME_CACHE_LOCK:
+                        _TENANT_DATA_PRESENT_CACHE.add(business.db_name)
         except Exception as exc:
             print(f"Legacy data copy skipped for '{business.email}': {exc}")
+
+    with _RUNTIME_CACHE_LOCK:
+        _RUNTIME_READY_CACHE.add(business.db_name)

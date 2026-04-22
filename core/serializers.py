@@ -201,6 +201,7 @@ class SetupThemeStyleSerializer(serializers.ModelSerializer):
 class InvoiceTaskSerializer(serializers.ModelSerializer):
     class Meta:
         model = InvoiceTask
+        fields = "__all__"
 
 # ------------------------------------------------------------
 # Invoice Reminder Serializer

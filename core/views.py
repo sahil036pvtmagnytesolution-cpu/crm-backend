@@ -14,6 +14,7 @@ from django.contrib.auth.models import User
 from django.contrib.auth.hashers import check_password, make_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import validate_email
+from django.core.cache import cache
 from django.db import transaction, DatabaseError, IntegrityError
 import threading
 
@@ -183,6 +184,7 @@ from .email_branding import build_module_email_html, send_branded_email
 from .models import Project
 from .serializers import ProjectSerializer
 from django.db.models import Count, Sum, Q
+from django.db.models.functions import TruncDate
 from django.db.utils import OperationalError, ProgrammingError
 from django.utils.text import slugify
 from .middleware import (
@@ -194,6 +196,7 @@ from .middleware import (
 )
 
 logger = logging.getLogger(__name__)
+DASHBOARD_MODULES_CACHE_TTL_SECONDS = 30
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -411,6 +414,16 @@ class ProjectViewSet(ModelViewSet):
             return Response([]) if empty_ok else self._missing_table_error()
         return None
 
+    def _get_list_limit(self):
+        raw_limit = self.request.query_params.get("limit")
+        if raw_limit in (None, ""):
+            return None
+        try:
+            parsed_limit = int(raw_limit)
+        except (TypeError, ValueError):
+            return 50
+        return max(1, min(parsed_limit, 50))
+
     def get_queryset(self):
         try:
             ensure_project_tables()
@@ -427,6 +440,11 @@ class ProjectViewSet(ModelViewSet):
                 qs = qs.filter(client_id=int(client_id))
             except (TypeError, ValueError):
                 pass
+
+        if getattr(self, "action", "") == "list":
+            limit = self._get_list_limit()
+            if limit is not None:
+                qs = qs[:limit]
 
         return qs
 
@@ -635,10 +653,37 @@ def _safe_decimal_sum(model, field_name, *, filters=None, db_alias=None):
         return Decimal("0")
 
 
+def _dashboard_modules_cache_key(*, db_alias, limit, include_records, user=None):
+    if include_records:
+        return ""
+
+    user_part = "anonymous"
+    if user is not None and getattr(user, "is_authenticated", False):
+        user_part = str(
+            getattr(user, "id", None)
+            or getattr(user, "pk", None)
+            or getattr(user, "username", "")
+            or "authenticated"
+        )
+
+    return f"dashboard:modules:{db_alias}:{user_part}:limit{int(limit)}:records0"
+
+
 def _build_dashboard_modules_payload(*, limit=20, include_records=True, user=None):
     from core.middleware import get_current_db
 
     db_alias = get_current_db()
+    cache_key = _dashboard_modules_cache_key(
+        db_alias=db_alias,
+        limit=limit,
+        include_records=include_records,
+        user=user,
+    )
+    if cache_key:
+        cached = cache.get(cache_key)
+        if isinstance(cached, dict):
+            return cached
+
     for ensure_fn in (
         ensure_staff_table,
         ensure_knowledge_base_tables,
@@ -835,6 +880,9 @@ def _build_dashboard_modules_payload(*, limit=20, include_records=True, user=Non
         "count": len(backups),
         "records": backups[:limit] if include_records else [],
     }
+
+    if cache_key:
+        cache.set(cache_key, modules, DASHBOARD_MODULES_CACHE_TTL_SECONDS)
 
     return modules
 
@@ -1611,7 +1659,7 @@ def login(request):
     rbac_payload = build_user_access_payload(user)
     refresh = RefreshToken.for_user(user)
     log_activity(f"Staff Login [Email: {user.email or user.username}]", user=user)
-    login_mail_sent, login_mail_error = send_login_success_email(business)
+    login_mail_scheduled = run_async(send_login_success_email, business)
 
     return Response(
         {
@@ -1633,8 +1681,9 @@ def login(request):
                 "is_approved": business.is_approved,
             },
             "login_mail": {
-                "sent": login_mail_sent,
-                "error": login_mail_error,
+                "scheduled": login_mail_scheduled,
+                "sent": login_mail_scheduled,
+                "error": None,
             },
             "rbac": rbac_payload,
         },
@@ -2667,17 +2716,21 @@ def weekly_payments(request):
     totals = {day: 0.0 for day in days}
 
     try:
-        payments = InvoicePayment.objects.filter(payment_date__range=(start_date, today))
-        for payment in payments:
-            pay_date = payment.payment_date
-            if isinstance(pay_date, datetime):
-                pay_date = pay_date.date()
-            if pay_date in totals:
-                try:
-                    amount = float(payment.amount or 0)
-                except (TypeError, ValueError):
-                    amount = 0.0
-                totals[pay_date] += amount
+        payment_rows = (
+            InvoicePayment.objects.filter(payment_date__range=(start_date, today))
+            .annotate(day=TruncDate("payment_date"))
+            .values("day")
+            .annotate(total=Sum("amount"))
+            .order_by("day")
+        )
+        for row in payment_rows:
+            day = row.get("day")
+            if day not in totals:
+                continue
+            try:
+                totals[day] = float(row.get("total") or 0)
+            except (TypeError, ValueError):
+                totals[day] = 0.0
     except (ProgrammingError, OperationalError) as exc:
         print("Weekly payments query failed:", exc)
 
@@ -2805,7 +2858,7 @@ def dashboard_module_records(request):
         limit = int(limit_param)
     except (TypeError, ValueError):
         limit = 20
-    limit = max(1, min(limit, 200))
+    limit = max(1, min(limit, 50))
 
     modules = _build_dashboard_modules_payload(
         limit=limit,
