@@ -3,6 +3,7 @@
 # - [ ] Verify Theme Style UI updates and backend integration
 import json
 import re
+from datetime import datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -301,9 +302,119 @@ class ItemSerializer(serializers.ModelSerializer):
           
 #================== CalenderEvent ============
 class CalendarEventSerializer(serializers.ModelSerializer):
+    reminder_trigger_at = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
         model = CalendarEvent
-        fields = "__all__"
+        fields = [
+            "id",
+            "title",
+            "date",
+            "color",
+            "reminder_type",
+            "reminder_value",
+            "reminder_datetime",
+            "module_type",
+            "reference_id",
+            "is_reminder_sent",
+            "reminder_trigger_at",
+        ]
+
+    def validate(self, attrs):
+        instance = getattr(self, "instance", None)
+        reminder_type = attrs.get("reminder_type", getattr(instance, "reminder_type", None))
+        reminder_value = attrs.get("reminder_value", getattr(instance, "reminder_value", None))
+        reminder_datetime = attrs.get("reminder_datetime", getattr(instance, "reminder_datetime", None))
+
+        allowed_types = {
+            CalendarEvent.REMINDER_TYPE_DAYS,
+            CalendarEvent.REMINDER_TYPE_HOURS,
+            CalendarEvent.REMINDER_TYPE_CUSTOM,
+            None,
+            "",
+        }
+        if reminder_type not in allowed_types:
+            raise serializers.ValidationError(
+                {"reminder_type": "Use one of: days, hours, custom_datetime."}
+            )
+
+        if reminder_type in {CalendarEvent.REMINDER_TYPE_DAYS, CalendarEvent.REMINDER_TYPE_HOURS}:
+            if reminder_value in (None, ""):
+                raise serializers.ValidationError(
+                    {"reminder_value": "Reminder value is required for days/hours type."}
+                )
+            try:
+                reminder_numeric = int(reminder_value)
+            except (TypeError, ValueError):
+                raise serializers.ValidationError(
+                    {"reminder_value": "Reminder value must be a whole number."}
+                )
+            if reminder_numeric < 0:
+                raise serializers.ValidationError(
+                    {"reminder_value": "Reminder value must be zero or greater."}
+                )
+            attrs["reminder_value"] = reminder_numeric
+
+        if reminder_type == CalendarEvent.REMINDER_TYPE_CUSTOM and not reminder_datetime:
+            raise serializers.ValidationError(
+                {"reminder_datetime": "Custom reminder date-time is required."}
+            )
+
+        if not reminder_type:
+            attrs["reminder_type"] = None
+            attrs["reminder_value"] = None
+            attrs["reminder_datetime"] = None
+
+        module_type = attrs.get("module_type", getattr(instance, "module_type", None))
+        if not module_type:
+            attrs["module_type"] = CalendarEvent.MODULE_TYPE_REMINDER
+
+        if instance is not None:
+            old_config = (
+                instance.reminder_type,
+                instance.reminder_value,
+                instance.reminder_datetime,
+            )
+            new_config = (
+                attrs.get("reminder_type", instance.reminder_type),
+                attrs.get("reminder_value", instance.reminder_value),
+                attrs.get("reminder_datetime", instance.reminder_datetime),
+            )
+            if old_config != new_config:
+                attrs["is_reminder_sent"] = False
+
+        return attrs
+
+    def get_reminder_trigger_at(self, obj):
+        reminder_type = str(getattr(obj, "reminder_type", "") or "").strip().lower()
+        reminder_datetime = getattr(obj, "reminder_datetime", None)
+        reminder_value = getattr(obj, "reminder_value", None)
+        event_date = getattr(obj, "date", None)
+        if not reminder_type:
+            return None
+
+        if reminder_type == CalendarEvent.REMINDER_TYPE_CUSTOM:
+            if not reminder_datetime:
+                return None
+            value = reminder_datetime
+            if timezone.is_naive(value):
+                value = timezone.make_aware(value, timezone.get_current_timezone())
+            return value.isoformat()
+
+        if not event_date:
+            return None
+
+        base_dt = timezone.make_aware(
+            datetime.combine(event_date, time.min),
+            timezone.get_current_timezone(),
+        )
+        if reminder_type == CalendarEvent.REMINDER_TYPE_DAYS:
+            offset = int(reminder_value or 0)
+            return (base_dt - timedelta(days=offset)).isoformat()
+        if reminder_type == CalendarEvent.REMINDER_TYPE_HOURS:
+            offset = int(reminder_value or 0)
+            return (base_dt - timedelta(hours=offset)).isoformat()
+        return None
 
 # ================= Customer =================
 class ClientSerializer(serializers.ModelSerializer):

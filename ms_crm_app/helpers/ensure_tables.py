@@ -233,11 +233,51 @@ def ensure_announcements_table():
                     message TEXT DEFAULT NULL,
                     showtousers INT NOT NULL DEFAULT 0,
                     showtostaff INT NOT NULL DEFAULT 0,
+                    notify_owner INT NOT NULL DEFAULT 1,
                     showname INT NOT NULL DEFAULT 1,
                     dateadded DATETIME NOT NULL,
                     userid VARCHAR(100) NOT NULL
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3
             """)
+
+
+def ensure_notifications_table():
+    """Ensure ms_notifications table exists for the current DB."""
+    from django.db import connections
+    from core.middleware import get_current_db
+
+    db_name = get_current_db()
+    with connections[db_name].cursor() as cursor:
+        cursor.execute("SHOW TABLES LIKE 'ms_notifications'")
+        exists = cursor.fetchone()
+
+        if not exists:
+            cursor.execute(
+                """
+                CREATE TABLE ms_notifications (
+                    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    isread INT NOT NULL DEFAULT 0,
+                    isread_inline INT NOT NULL DEFAULT 0,
+                    date DATETIME NOT NULL,
+                    description TEXT NOT NULL,
+                    fromuserid INT NOT NULL DEFAULT 0,
+                    fromclientid INT NOT NULL DEFAULT 0,
+                    from_fullname VARCHAR(100) NOT NULL,
+                    touserid INT NOT NULL,
+                    fromcompany INT DEFAULT NULL,
+                    link TEXT DEFAULT NULL,
+                    additional_data TEXT DEFAULT NULL,
+                    reminder_type VARCHAR(32) DEFAULT NULL,
+                    reminder_value INT DEFAULT NULL,
+                    reminder_datetime DATETIME DEFAULT NULL,
+                    module_type VARCHAR(32) DEFAULT NULL,
+                    reference_id INT DEFAULT NULL,
+                    is_reminder_sent INT NOT NULL DEFAULT 0,
+                    KEY idx_ms_notifications_touserid (touserid),
+                    KEY idx_ms_notifications_date (date)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3
+                """
+            )
 
 
 def ensure_goals_table():
@@ -383,6 +423,90 @@ def ensure_tickets_pipe_log_table():
 
         for sql in alter_statements:
             cursor.execute(sql)
+
+
+def ensure_task_timers_table():
+    """Ensure ms_taskstimers table exists for the current DB."""
+    from django.db import connections
+    from core.middleware import get_current_db
+
+    db_name = get_current_db()
+    with connections[db_name].cursor() as cursor:
+        cursor.execute("SHOW TABLES LIKE 'ms_taskstimers'")
+        exists = cursor.fetchone()
+
+        if not exists:
+            cursor.execute(
+                """
+                CREATE TABLE ms_taskstimers (
+                    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    task_id INT NOT NULL,
+                    start_time VARCHAR(64) NOT NULL,
+                    end_time VARCHAR(64) DEFAULT NULL,
+                    staff_id INT NOT NULL,
+                    hourly_rate DECIMAL(15,2) NOT NULL DEFAULT 0.00,
+                    note TEXT DEFAULT NULL,
+                    KEY task_id (task_id),
+                    KEY staff_id (staff_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3
+                """
+            )
+
+
+def ensure_reminder_notification_columns():
+    """
+    Ensure reminder-related columns exist in reminder-capable legacy tables.
+    This keeps tenant DBs compatible without requiring per-tenant migrations.
+    """
+    from django.db import connections
+    from core.middleware import get_current_db
+
+    db_alias = get_current_db()
+    db_connection = connections[db_alias]
+    ensure_notifications_table()
+
+    table_column_sql = {
+        "ms_notifications": {
+            "reminder_type": "ALTER TABLE ms_notifications ADD COLUMN reminder_type VARCHAR(32) DEFAULT NULL",
+            "reminder_value": "ALTER TABLE ms_notifications ADD COLUMN reminder_value INT DEFAULT NULL",
+            "reminder_datetime": "ALTER TABLE ms_notifications ADD COLUMN reminder_datetime DATETIME DEFAULT NULL",
+            "module_type": "ALTER TABLE ms_notifications ADD COLUMN module_type VARCHAR(32) DEFAULT NULL",
+            "reference_id": "ALTER TABLE ms_notifications ADD COLUMN reference_id INT DEFAULT NULL",
+            "is_reminder_sent": "ALTER TABLE ms_notifications ADD COLUMN is_reminder_sent INT NOT NULL DEFAULT 0",
+        },
+        "ms_announcements": {
+            "reminder_type": "ALTER TABLE ms_announcements ADD COLUMN reminder_type VARCHAR(32) DEFAULT NULL",
+            "reminder_value": "ALTER TABLE ms_announcements ADD COLUMN reminder_value INT DEFAULT NULL",
+            "reminder_datetime": "ALTER TABLE ms_announcements ADD COLUMN reminder_datetime DATETIME DEFAULT NULL",
+            "module_type": "ALTER TABLE ms_announcements ADD COLUMN module_type VARCHAR(32) DEFAULT NULL",
+            "reference_id": "ALTER TABLE ms_announcements ADD COLUMN reference_id INT DEFAULT NULL",
+            "is_reminder_sent": "ALTER TABLE ms_announcements ADD COLUMN is_reminder_sent INT NOT NULL DEFAULT 0",
+            "notify_owner": "ALTER TABLE ms_announcements ADD COLUMN notify_owner INT NOT NULL DEFAULT 1",
+        },
+        "core_calendarevent": {
+            "reminder_type": "ALTER TABLE core_calendarevent ADD COLUMN reminder_type VARCHAR(32) DEFAULT NULL",
+            "reminder_value": "ALTER TABLE core_calendarevent ADD COLUMN reminder_value INT DEFAULT NULL",
+            "reminder_datetime": "ALTER TABLE core_calendarevent ADD COLUMN reminder_datetime DATETIME DEFAULT NULL",
+            "module_type": "ALTER TABLE core_calendarevent ADD COLUMN module_type VARCHAR(32) NOT NULL DEFAULT 'reminder'",
+            "reference_id": "ALTER TABLE core_calendarevent ADD COLUMN reference_id INT DEFAULT NULL",
+            "is_reminder_sent": "ALTER TABLE core_calendarevent ADD COLUMN is_reminder_sent TINYINT(1) NOT NULL DEFAULT 0",
+        },
+    }
+
+    with db_connection.cursor() as cursor:
+        for table_name, alter_map in table_column_sql.items():
+            cursor.execute("SHOW TABLES LIKE %s", [table_name])
+            if cursor.fetchone() is None:
+                continue
+
+            cursor.execute(f"SHOW COLUMNS FROM `{table_name}`")
+            existing_columns = {row[0] for row in cursor.fetchall()}
+
+            for column_name, sql in alter_map.items():
+                if column_name in existing_columns:
+                    continue
+                cursor.execute(sql)
+                existing_columns.add(column_name)
 
 
 def ensure_support_management_tables():

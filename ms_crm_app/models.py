@@ -56,9 +56,16 @@ class Announcements(models.Model):
     message = models.TextField(blank=True, null=True)
     showtousers = models.IntegerField()
     showtostaff = models.IntegerField()
+    notify_owner = models.IntegerField(default=1)
     showname = models.IntegerField()
     dateadded = models.DateTimeField()
     userid = models.CharField(max_length=100)
+    reminder_type = models.CharField(max_length=32, blank=True, null=True)
+    reminder_value = models.IntegerField(blank=True, null=True)
+    reminder_datetime = models.DateTimeField(blank=True, null=True)
+    module_type = models.CharField(max_length=32, blank=True, null=True)
+    reference_id = models.IntegerField(blank=True, null=True)
+    is_reminder_sent = models.IntegerField(default=0)
 
     class Meta:
         managed = False
@@ -1156,6 +1163,12 @@ class Notifications(models.Model):
     fromcompany = models.IntegerField(blank=True, null=True)
     link = models.TextField(blank=True, null=True)
     additional_data = models.TextField(blank=True, null=True)
+    reminder_type = models.CharField(max_length=32, blank=True, null=True)
+    reminder_value = models.IntegerField(blank=True, null=True)
+    reminder_datetime = models.DateTimeField(blank=True, null=True)
+    module_type = models.CharField(max_length=32, blank=True, null=True)
+    reference_id = models.IntegerField(blank=True, null=True)
+    is_reminder_sent = models.IntegerField(default=0)
 
     class Meta:
         managed = False

@@ -6,6 +6,7 @@ import binascii
 import json
 import secrets
 import logging
+import importlib
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -66,11 +67,14 @@ from ms_crm_app.helpers.ensure_tables import (
     ensure_staff_table,
     ensure_user_auto_login_table,
     ensure_announcements_table,
+    ensure_notifications_table,
     ensure_goals_table,
     ensure_activity_log_table,
     ensure_surveys_table,
     ensure_tickets_pipe_log_table,
+    ensure_task_timers_table,
     ensure_finance_created_by_columns,
+    ensure_reminder_notification_columns,
 )
 from core.utils.activity_log import log_activity, serialize_activity_log
 from .serializers import (
@@ -153,7 +157,7 @@ from rest_framework.response import Response
 
 from django.utils.html import strip_tags
 from django.utils.encoding import force_bytes
-from django.utils.dateparse import parse_date
+from django.utils.dateparse import parse_date, parse_datetime
 from django.core.mail import EmailMessage
 from django.contrib.staticfiles import finders
 from django.core.files.base import ContentFile
@@ -197,6 +201,720 @@ from .middleware import (
 
 logger = logging.getLogger(__name__)
 DASHBOARD_MODULES_CACHE_TTL_SECONDS = 30
+REMINDER_TYPE_DAYS = "days"
+REMINDER_TYPE_HOURS = "hours"
+REMINDER_TYPE_CUSTOM = "custom_datetime"
+REMINDER_MODULE_TYPES = {"reminder", "announcement", "task", "ticket"}
+
+try:
+    shared_task = getattr(importlib.import_module("celery"), "shared_task")
+except Exception:
+    def shared_task(*args, **kwargs):  # type: ignore
+        def decorator(func):
+            return func
+        return decorator
+
+
+def _ensure_reminder_schema_ready():
+    ensure_functions = (
+        ensure_announcements_table,
+        ensure_notifications_table,
+        ensure_reminder_notification_columns,
+    )
+    for ensure_fn in ensure_functions:
+        try:
+            ensure_fn()
+        except Exception as exc:
+            logger.warning("Reminder schema ensure failed via %s: %s", ensure_fn.__name__, exc)
+
+
+def _normalize_reminder_type(value):
+    normalized = str(value or "").strip().lower()
+    if normalized in {REMINDER_TYPE_DAYS, REMINDER_TYPE_HOURS, REMINDER_TYPE_CUSTOM}:
+        return normalized
+    return ""
+
+
+def _safe_int(value, default=None):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _coerce_aware(dt_value):
+    if not dt_value:
+        return None
+    value = dt_value
+    if timezone.is_naive(value):
+        value = timezone.make_aware(value, timezone.get_current_timezone())
+    return value
+
+
+def _compute_trigger_datetime(reminder_type, reminder_value, reminder_datetime, base_datetime):
+    normalized_type = _normalize_reminder_type(reminder_type)
+    custom_dt = _coerce_aware(reminder_datetime)
+    base_dt = _coerce_aware(base_datetime)
+
+    if not normalized_type:
+        return None
+
+    if normalized_type == REMINDER_TYPE_CUSTOM:
+        return custom_dt
+
+    if not base_dt:
+        return None
+
+    value = _safe_int(reminder_value, 0)
+    if value is None or value < 0:
+        value = 0
+
+    if normalized_type == REMINDER_TYPE_DAYS:
+        return base_dt - timedelta(days=value)
+    if normalized_type == REMINDER_TYPE_HOURS:
+        return base_dt - timedelta(hours=value)
+    return None
+
+
+def _calendar_base_datetime(event):
+    event_date = getattr(event, "date", None)
+    if not event_date:
+        return None
+    base_dt = datetime.combine(event_date, datetime.min.time())
+    return timezone.make_aware(base_dt, timezone.get_current_timezone())
+
+
+def _announcement_base_datetime(announcement):
+    reminder_datetime = getattr(announcement, "reminder_datetime", None)
+    if reminder_datetime:
+        return reminder_datetime
+    return getattr(announcement, "dateadded", None)
+
+
+def _notification_link_for_module(module_type, reference_id):
+    normalized = str(module_type or "").strip().lower()
+    if normalized == "announcement":
+        ref = _safe_int(reference_id)
+        if ref:
+            return f"/utilities/announcements/{ref}/"
+        return "/utilities/announcements"
+    if normalized == "task":
+        return "/dashboard"
+    if normalized == "ticket":
+        return "/utilities/ticketpipelog"
+    return "/utilities/calender"
+
+
+def _module_label(module_type):
+    normalized = str(module_type or "").strip().lower()
+    return {
+        "announcement": "Announcement",
+        "task": "Task",
+        "ticket": "Ticket",
+        "reminder": "Reminder",
+    }.get(normalized, "Reminder")
+
+
+def _safe_record_title(record, fallback="Reminder"):
+    for attr in ("title", "name", "subject", "description"):
+        value = str(getattr(record, attr, "") or "").strip()
+        if value:
+            return value
+    return fallback
+
+
+def _resolve_reminder_staff_ids(module_type, record, fallback_staff_ids):
+    normalized = str(module_type or "").strip().lower()
+    if normalized == "announcement":
+        show_to_staff = _safe_int(getattr(record, "showtostaff", 0), 0) or 0
+        if show_to_staff == 1:
+            return fallback_staff_ids
+        return []
+    return fallback_staff_ids
+
+
+def _resolve_staff_emails(staff_id_list):
+    if not staff_id_list:
+        return []
+    try:
+        raw_emails = Staff.objects.filter(staffid__in=list(staff_id_list)).values_list("email", flat=True)
+    except Exception:
+        return []
+
+    unique = []
+    seen = set()
+    for value in raw_emails:
+        email_value = str(value or "").strip()
+        if not email_value or "@" not in email_value:
+            continue
+        key = email_value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(email_value)
+    return unique
+
+
+def _resolve_contact_emails(contact_id_list=None, only_active=False):
+    queryset = Contacts.objects.all()
+    if contact_id_list:
+        queryset = queryset.filter(id__in=list(contact_id_list))
+    if only_active:
+        try:
+            queryset = queryset.filter(active=1)
+        except Exception:
+            # Some legacy tenants may not have full contact schema parity.
+            pass
+
+    try:
+        raw_emails = queryset.values_list("email", flat=True)
+    except Exception:
+        return []
+
+    unique = []
+    seen = set()
+    for value in raw_emails:
+        email_value = str(value or "").strip()
+        if not email_value or "@" not in email_value:
+            continue
+        key = email_value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(email_value)
+    return unique
+
+
+def _normalize_list_payload(raw):
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        return list(raw)
+    if isinstance(raw, str):
+        value = raw.strip()
+        if not value:
+            return []
+        if value.startswith("[") and value.endswith("]"):
+            try:
+                parsed = json.loads(value)
+                return _normalize_list_payload(parsed)
+            except Exception:
+                pass
+        return [item for item in re.split(r"[,\s;]+", value) if item]
+    return [raw]
+
+
+def _parse_int_list_payload(raw):
+    values = []
+    for item in _normalize_list_payload(raw):
+        parsed = _safe_int(item)
+        if parsed is None:
+            continue
+        values.append(parsed)
+    return values
+
+
+def _parse_email_list_payload(raw):
+    emails = []
+    seen = set()
+    for item in _normalize_list_payload(raw):
+        value = str(item or "").strip()
+        if not value or "@" not in value:
+            continue
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        emails.append(value)
+    return emails
+
+
+def _parse_announcement_reminder_payload(data, base_datetime=None):
+    raw_type = data.get("reminder_type")
+    reminder_type = _normalize_reminder_type(raw_type)
+    if not reminder_type:
+        return {
+            "ok": True,
+            "reminder_type": None,
+            "reminder_value": None,
+            "reminder_datetime": None,
+            "trigger_at": None,
+            "error": None,
+        }
+
+    reminder_value = None
+    reminder_datetime = None
+
+    if reminder_type in {REMINDER_TYPE_DAYS, REMINDER_TYPE_HOURS}:
+        parsed_value = _safe_int(data.get("reminder_value"))
+        if parsed_value is None or parsed_value < 0:
+            return {
+                "ok": False,
+                "error": {"detail": "Reminder value must be a whole number zero or greater."},
+            }
+        reminder_value = parsed_value
+
+    if reminder_type == REMINDER_TYPE_CUSTOM:
+        raw_datetime = data.get("reminder_datetime")
+        if not raw_datetime:
+            return {
+                "ok": False,
+                "error": {"detail": "Reminder date-time is required for scheduled announcements."},
+            }
+        if isinstance(raw_datetime, datetime):
+            reminder_datetime = raw_datetime
+        else:
+            reminder_datetime = parse_datetime(str(raw_datetime))
+            if reminder_datetime is None:
+                raw_date = parse_date(str(raw_datetime))
+                if raw_date is not None:
+                    reminder_datetime = datetime.combine(raw_date, datetime.min.time())
+        reminder_datetime = _coerce_aware(reminder_datetime)
+        if not reminder_datetime:
+            return {
+                "ok": False,
+                "error": {"detail": "Reminder date-time format is invalid."},
+            }
+
+    trigger_at = _compute_trigger_datetime(
+        reminder_type,
+        reminder_value,
+        reminder_datetime,
+        base_datetime,
+    )
+    if not trigger_at:
+        return {
+            "ok": False,
+            "error": {"detail": "Unable to compute reminder trigger time."},
+        }
+
+    return {
+        "ok": True,
+        "reminder_type": reminder_type,
+        "reminder_value": reminder_value,
+        "reminder_datetime": reminder_datetime,
+        "trigger_at": trigger_at,
+        "error": None,
+    }
+
+
+def _send_announcement_alerts(
+    announcement,
+    sender_name="System",
+    from_user_id=0,
+    notify_staff_ids=None,
+    recipient_emails=None,
+    include_owner=None,
+    event_label="New Announcement",
+):
+    _ensure_reminder_schema_ready()
+
+    notify_staff_set = set(notify_staff_ids or [])
+    email_set = set(recipient_emails or [])
+
+    show_to_staff = _parse_bool(getattr(announcement, "showtostaff", 0))
+    show_to_users = _parse_bool(getattr(announcement, "showtousers", 0))
+
+    if show_to_staff:
+        try:
+            all_staff_ids = Staff.objects.filter(active=1).values_list("staffid", flat=True)
+            notify_staff_set.update([staff_id for staff_id in all_staff_ids if staff_id])
+        except Exception:
+            pass
+
+    if show_to_users:
+        email_set.update(_resolve_contact_emails(only_active=True))
+
+    if show_to_staff:
+        email_set.update(_resolve_staff_emails(notify_staff_set))
+
+    if include_owner is None:
+        include_owner = _parse_bool(getattr(announcement, "notify_owner", 1), default=True)
+
+    if include_owner:
+        try:
+            business = LegacyBusiness.objects.first()
+            owner_email = str(getattr(business, "email", "") or "").strip()
+            if owner_email and "@" in owner_email:
+                email_set.add(owner_email)
+        except Exception:
+            pass
+
+    notification_rows = []
+    link = f"/utilities/announcements/{announcement.announcementid}/"
+    additional_data = json.dumps(
+        {
+            "announcement_id": announcement.announcementid,
+            "title": announcement.name,
+        }
+    )
+    now_ts = timezone.now()
+
+    for staff_id in sorted(notify_staff_set):
+        notification_rows.append(
+            Notifications(
+                isread=0,
+                isread_inline=0,
+                date=now_ts,
+                description=f"{event_label}: {announcement.name}",
+                fromuserid=from_user_id or 0,
+                fromclientid=0,
+                from_fullname=sender_name or "System",
+                touserid=staff_id,
+                fromcompany=None,
+                link=link,
+                additional_data=additional_data,
+                reminder_type=getattr(announcement, "reminder_type", None),
+                reminder_value=getattr(announcement, "reminder_value", None),
+                reminder_datetime=getattr(announcement, "reminder_datetime", None),
+                module_type="announcement",
+                reference_id=announcement.announcementid,
+                is_reminder_sent=1,
+            )
+        )
+
+    notifications_created = 0
+    notifications_ok = True
+    if notification_rows:
+        try:
+            Notifications.objects.bulk_create(notification_rows, batch_size=200)
+            notifications_created = len(notification_rows)
+            for row in notification_rows:
+                _emit_notification_socket_event(
+                    {
+                        "touserid": row.touserid,
+                        "description": row.description,
+                        "module_type": "announcement",
+                        "reference_id": announcement.announcementid,
+                        "link": row.link,
+                        "tag": "Announcement",
+                    }
+                )
+        except Exception as exc:
+            notifications_ok = False
+            logger.warning("Announcement notification dispatch failed: %s", exc)
+
+    emails_ok = True
+    emails_sent_to = 0
+    recipients = sorted([value for value in email_set if value and "@" in value])
+    if recipients:
+        html_message = f"""
+<h3>{event_label}</h3>
+<p><b>Title:</b> {announcement.name}</p>
+<p><b>By:</b> {sender_name or "System"}</p>
+<hr/>
+<p>{(announcement.message or '').replace('\n', '<br/>')}</p>
+"""
+        try:
+            send_branded_email(
+                subject=f"Announcement: {announcement.name}",
+                message=strip_tags(html_message),
+                to_emails=recipients,
+                html_message=html_message,
+                fail_silently=False,
+            )
+            emails_sent_to = len(recipients)
+        except Exception as exc:
+            emails_ok = False
+            logger.warning("Announcement email dispatch failed: %s", exc)
+
+    return {
+        "ok": notifications_ok and emails_ok,
+        "notifications_created": notifications_created,
+        "emails_sent_to": emails_sent_to,
+    }
+
+
+def _emit_notification_socket_event(payload):
+    """
+    Best-effort real-time push. If channels is not configured, silently skip.
+    """
+    try:
+        get_channel_layer = getattr(importlib.import_module("channels.layers"), "get_channel_layer")
+        async_to_sync = getattr(importlib.import_module("asgiref.sync"), "async_to_sync")
+    except Exception:
+        return
+
+    try:
+        channel_layer = get_channel_layer()
+        if channel_layer is None:
+            return
+        async_to_sync(channel_layer.group_send)(
+            f"notifications_{payload.get('touserid')}",
+            {
+                "type": "notification.message",
+                "payload": payload,
+            },
+        )
+    except Exception as exc:
+        logger.debug("Notification websocket emit skipped: %s", exc)
+
+
+def _dispatch_pending_reminders(now=None):
+    _ensure_reminder_schema_ready()
+    now_ts = _coerce_aware(now or timezone.now())
+    if not now_ts:
+        now_ts = timezone.now()
+
+    try:
+        staff_ids = list(
+            Staff.objects.filter(active=1).values_list("staffid", flat=True)
+        )
+    except Exception:
+        staff_ids = []
+
+    db_alias = get_current_db()
+    try:
+        calendar_qs = CalendarEvent.objects.filter(is_reminder_sent=False).exclude(
+            reminder_type__isnull=True
+        ).exclude(reminder_type="")
+    except (ProgrammingError, OperationalError):
+        calendar_qs = []
+    try:
+        announcement_qs = (
+            LegacyAnnouncements.objects.using(db_alias)
+            .filter(is_reminder_sent=0)
+            .exclude(reminder_type__isnull=True)
+            .exclude(reminder_type="")
+        )
+    except Exception:
+        announcement_qs = []
+
+    source_rows = []
+    for row in calendar_qs:
+        module_type = (row.module_type or "reminder").strip().lower() or "reminder"
+        reference_id = row.reference_id or row.id
+        source_rows.append(
+            {
+                "source": "calendar",
+                "record": row,
+                "pk": row.id,
+                "module_type": module_type,
+                "reference_id": reference_id,
+                "reminder_type": row.reminder_type,
+                "reminder_value": row.reminder_value,
+                "reminder_datetime": row.reminder_datetime,
+                "base_datetime": _calendar_base_datetime(row),
+            }
+        )
+    for row in announcement_qs:
+        source_rows.append(
+            {
+                "source": "announcement",
+                "record": row,
+                "pk": row.announcementid,
+                "module_type": "announcement",
+                "reference_id": row.reference_id or row.announcementid,
+                "reminder_type": row.reminder_type,
+                "reminder_value": row.reminder_value,
+                "reminder_datetime": row.reminder_datetime,
+                "base_datetime": _announcement_base_datetime(row),
+            }
+        )
+
+    if not source_rows:
+        return {"created": 0, "processed": 0}
+
+    notifications_to_create = []
+    notification_keys = set()
+    reminder_email_keys = set()
+    reminder_emails_to_send = []
+    calendar_ids_to_mark = set()
+    announcement_ids_to_mark = set()
+    scheduled_notifications_created = 0
+    processed_count = 0
+
+    for item in source_rows:
+        module_type = item["module_type"]
+        if module_type not in REMINDER_MODULE_TYPES:
+            module_type = "reminder"
+
+        trigger_at = _compute_trigger_datetime(
+            item["reminder_type"],
+            item["reminder_value"],
+            item["reminder_datetime"],
+            item["base_datetime"],
+        )
+        if not trigger_at or trigger_at > now_ts:
+            continue
+
+        processed_count += 1
+        if item["source"] == "announcement":
+            dispatch_result = _send_announcement_alerts(
+                item["record"],
+                sender_name="System",
+                from_user_id=0,
+                include_owner=_parse_bool(getattr(item["record"], "notify_owner", 1), default=True),
+                event_label="Scheduled Announcement",
+            )
+            if dispatch_result.get("ok"):
+                announcement_ids_to_mark.add(item["pk"])
+                scheduled_notifications_created += int(
+                    dispatch_result.get("notifications_created") or 0
+                )
+            continue
+
+        target_staff_ids = _resolve_reminder_staff_ids(module_type, item["record"], staff_ids)
+        if not target_staff_ids:
+            continue
+
+        title = _safe_record_title(item["record"], fallback=f"{_module_label(module_type)} Reminder")
+        label = _module_label(module_type)
+        link = _notification_link_for_module(module_type, item["reference_id"])
+        reminder_data = {
+            "module_type": module_type,
+            "reference_id": item["reference_id"],
+            "reminder_type": item["reminder_type"],
+            "reminder_value": item["reminder_value"],
+            "reminder_datetime": trigger_at.isoformat(),
+            "tag": label,
+            "redirect_url": link,
+            "title": title,
+        }
+        reminder_json = json.dumps(reminder_data)
+        recipient_emails = _resolve_staff_emails(target_staff_ids)
+        email_key = (module_type, int(item["reference_id"] or 0), trigger_at.isoformat())
+        if recipient_emails and email_key not in reminder_email_keys:
+            reminder_email_keys.add(email_key)
+            trigger_label = timezone.localtime(trigger_at).strftime("%d %b %Y, %I:%M %p")
+            event_date = getattr(item["record"], "date", None)
+            event_date_label = event_date.strftime("%d %b %Y") if event_date else ""
+            details_html = [
+                f"<h3>{label} Reminder</h3>",
+                f"<p><b>Title:</b> {title}</p>",
+                f"<p><b>Reminder Time:</b> {trigger_label}</p>",
+            ]
+            if event_date_label:
+                details_html.append(f"<p><b>Event Date:</b> {event_date_label}</p>")
+            details_html.append(f"<p><b>Module:</b> {label}</p>")
+            reminder_emails_to_send.append(
+                {
+                    "subject": f"{label} Reminder: {title}",
+                    "html_message": "\n".join(details_html),
+                    "to_emails": recipient_emails,
+                }
+            )
+
+        for staff_id in target_staff_ids:
+            key = (staff_id, module_type, int(item["reference_id"] or 0), trigger_at.isoformat())
+            if key in notification_keys:
+                continue
+            notification_keys.add(key)
+
+            notifications_to_create.append(
+                Notifications(
+                    isread=0,
+                    isread_inline=0,
+                    date=now_ts,
+                    description=f"Reminder: {title}",
+                    fromuserid=0,
+                    fromclientid=0,
+                    from_fullname="System",
+                    touserid=staff_id,
+                    fromcompany=None,
+                    link=link,
+                    additional_data=reminder_json,
+                    reminder_type=item["reminder_type"] or None,
+                    reminder_value=item["reminder_value"],
+                    reminder_datetime=trigger_at,
+                    module_type=module_type,
+                    reference_id=item["reference_id"],
+                    is_reminder_sent=1,
+                )
+            )
+
+        calendar_ids_to_mark.add(item["pk"])
+
+    try:
+        with transaction.atomic(using=db_alias):
+            if notifications_to_create:
+                Notifications.objects.bulk_create(notifications_to_create, batch_size=200)
+            if calendar_ids_to_mark:
+                CalendarEvent.objects.filter(id__in=list(calendar_ids_to_mark)).update(is_reminder_sent=True)
+            if announcement_ids_to_mark:
+                LegacyAnnouncements.objects.using(db_alias).filter(
+                    announcementid__in=list(announcement_ids_to_mark)
+                ).update(is_reminder_sent=1)
+    except Exception as exc:
+        logger.warning("Reminder notification dispatch failed: %s", exc)
+        return {"created": scheduled_notifications_created, "processed": processed_count}
+
+    for row in notifications_to_create:
+        _emit_notification_socket_event(
+            {
+                "touserid": row.touserid,
+                "description": row.description,
+                "module_type": row.module_type,
+                "reference_id": row.reference_id,
+                "link": row.link,
+                "tag": _module_label(row.module_type),
+            }
+        )
+
+    for email_item in reminder_emails_to_send:
+        try:
+            send_branded_email(
+                subject=email_item["subject"],
+                message=strip_tags(email_item["html_message"]),
+                to_emails=email_item["to_emails"],
+                html_message=email_item["html_message"],
+                fail_silently=False,
+            )
+        except Exception as exc:
+            logger.warning("Reminder email dispatch failed: %s", exc)
+
+    return {
+        "created": len(notifications_to_create) + scheduled_notifications_created,
+        "processed": processed_count,
+    }
+
+
+@shared_task(name="core.dispatch_pending_reminders")
+def dispatch_pending_reminders_task():
+    """
+    Celery beat target for reminder dispatching.
+    """
+    return _dispatch_pending_reminders()
+
+
+def _schedule_exact_reminder_dispatch(trigger_at):
+    """
+    Queue reminder dispatcher exactly at trigger time when Celery is available.
+    Falls back to immediate dispatch for already-due reminders.
+    """
+    scheduled_for = _coerce_aware(trigger_at)
+    if not scheduled_for:
+        return False
+
+    scheduled_for = scheduled_for.replace(microsecond=0)
+    now_ts = timezone.now()
+    if scheduled_for <= now_ts:
+        _dispatch_pending_reminders(now=now_ts)
+        return False
+
+    apply_async = getattr(dispatch_pending_reminders_task, "apply_async", None)
+    if not callable(apply_async):
+        return False
+
+    try:
+        apply_async(eta=scheduled_for)
+        return True
+    except Exception as exc:
+        logger.warning("Exact reminder scheduling failed for %s: %s", scheduled_for.isoformat(), exc)
+        return False
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -205,6 +923,7 @@ def timesheets_overview(request):
 
     try:
         db = get_current_db()
+        ensure_task_timers_table()
         queryset = LegacyTaskTimers.objects.using(db).all().order_by("-start_time")
         queryset = _apply_limit(queryset, request)
         rows = list(queryset)
@@ -352,6 +1071,64 @@ class EstimateViewSet(ModelViewSet):
 class CalendarEventViewSet(ModelViewSet):
     queryset = CalendarEvent.objects.all()
     serializer_class = CalendarEventSerializer
+
+    def get_queryset(self):
+        _ensure_reminder_schema_ready()
+        queryset = CalendarEvent.objects.all().order_by("date", "id")
+
+        module_type = str(self.request.query_params.get("module_type", "")).strip().lower()
+        if module_type:
+            queryset = queryset.filter(module_type=module_type)
+
+        reference_id = _safe_int(self.request.query_params.get("reference_id"))
+        if reference_id is not None:
+            queryset = queryset.filter(reference_id=reference_id)
+
+        only_pending = str(self.request.query_params.get("pending_reminders", "")).strip().lower()
+        if only_pending in {"1", "true", "yes"}:
+            queryset = queryset.filter(is_reminder_sent=False).exclude(reminder_type__isnull=True).exclude(reminder_type="")
+
+        return queryset
+
+    def list(self, request, *args, **kwargs):
+        _dispatch_pending_reminders()
+        return super().list(request, *args, **kwargs)
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        update_fields = []
+        if not instance.reference_id:
+            instance.reference_id = instance.id
+            update_fields.append("reference_id")
+        if instance.reminder_type:
+            instance.is_reminder_sent = False
+            update_fields.append("is_reminder_sent")
+        if update_fields:
+            instance.save(update_fields=sorted(set(update_fields)))
+        trigger_at = _compute_trigger_datetime(
+            instance.reminder_type,
+            instance.reminder_value,
+            instance.reminder_datetime,
+            _calendar_base_datetime(instance),
+        )
+        if trigger_at and not instance.is_reminder_sent:
+            _schedule_exact_reminder_dispatch(trigger_at)
+        _dispatch_pending_reminders()
+
+    def perform_update(self, serializer):
+        instance = serializer.save()
+        if not instance.reference_id:
+            instance.reference_id = instance.id
+            instance.save(update_fields=["reference_id"])
+        trigger_at = _compute_trigger_datetime(
+            instance.reminder_type,
+            instance.reminder_value,
+            instance.reminder_datetime,
+            _calendar_base_datetime(instance),
+        )
+        if trigger_at and not instance.is_reminder_sent:
+            _schedule_exact_reminder_dispatch(trigger_at)
+        _dispatch_pending_reminders()
 
 class EstimateListCreateView(generics.ListCreateAPIView):
     queryset = Estimate.objects.all()
@@ -828,7 +1605,16 @@ def _build_dashboard_modules_payload(*, limit=20, include_records=True, user=Non
             ),
             "announcements": _safe_module_records(
                 LegacyAnnouncements,
-                ["announcementid", "name", "message", "dateadded", "userid", "showtousers", "showtostaff"],
+                [
+                    "announcementid",
+                    "name",
+                    "message",
+                    "dateadded",
+                    "userid",
+                    "showtousers",
+                    "showtostaff",
+                    "notify_owner",
+                ],
                 order_by="-announcementid",
                 limit=limit,
                 db_alias=db_alias,
@@ -4819,15 +5605,23 @@ def _seed_surveys_if_empty(db_alias):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def announcements_list(request):
+    _ensure_reminder_schema_ready()
     fields = [
         "announcementid",
         "name",
         "message",
         "showtousers",
         "showtostaff",
+        "notify_owner",
         "showname",
         "dateadded",
         "userid",
+        "reminder_type",
+        "reminder_value",
+        "reminder_datetime",
+        "module_type",
+        "reference_id",
+        "is_reminder_sent",
     ]
 
     try:
@@ -4836,57 +5630,8 @@ def announcements_list(request):
         print("Announcements table ensure failed:", exc)
 
     if request.method == "GET":
+        _dispatch_pending_reminders()
         return _safe_legacy_list(request, LegacyAnnouncements, fields, order_by="-dateadded")
-
-    def _normalize_list(raw):
-        if raw is None:
-            return []
-        if isinstance(raw, (list, tuple, set)):
-            return list(raw)
-        if isinstance(raw, str):
-            raw = raw.strip()
-            if not raw:
-                return []
-            if raw.startswith("[") and raw.endswith("]"):
-                try:
-                    parsed = json.loads(raw)
-                    return _normalize_list(parsed)
-                except Exception:
-                    pass
-            return [item for item in re.split(r"[,\s;]+", raw) if item]
-        return [raw]
-
-    def _parse_int_list(raw):
-        items = _normalize_list(raw)
-        parsed = []
-        for item in items:
-            try:
-                parsed.append(int(item))
-            except (TypeError, ValueError):
-                continue
-        return parsed
-
-    def _parse_email_list(raw):
-        items = _normalize_list(raw)
-        emails = []
-        for item in items:
-            if item is None:
-                continue
-            value = str(item).strip()
-            if not value or "@" not in value:
-                continue
-            emails.append(value)
-        return emails
-
-    def _resolve_owner_email():
-        try:
-            business = LegacyBusiness.objects.first()
-            if business and getattr(business, "email", None):
-                return business.email
-        except Exception as exc:
-            print("Owner lookup failed:", exc)
-        user = getattr(request, "user", None)
-        return getattr(user, "email", None) or getattr(user, "username", None)
 
     def _resolve_sender_staff():
         user = getattr(request, "user", None)
@@ -4924,13 +5669,28 @@ def announcements_list(request):
     if not name:
         return Response({"detail": "Title is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-    showtousers = int(bool(data.get("showtousers") or data.get("show_to_users")))
-    showtostaff = int(bool(data.get("showtostaff") or data.get("show_to_staff")))
-    showname = int(bool(data.get("showname", 1)))
+    showtousers = int(
+        _parse_bool(data.get("showtousers", data.get("show_to_users", False)), default=False)
+    )
+    showtostaff = int(
+        _parse_bool(data.get("showtostaff", data.get("show_to_staff", False)), default=False)
+    )
+    notify_owner = _parse_bool(data.get("notify_owner", data.get("showtoadmin", True)), default=True)
+    showname = int(_parse_bool(data.get("showname", True), default=True))
+    module_type = "announcement"
+    reference_id = None
 
-    if showtousers == 0 and showtostaff == 0:
+    if showtousers == 0 and showtostaff == 0 and not notify_owner:
         return Response(
-            {"detail": "Select at least one audience (users or staff)."},
+            {"detail": "Select at least one audience (users, staff, or admin)."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    now_ts = timezone.now()
+    reminder_config = _parse_announcement_reminder_payload(data, base_datetime=now_ts)
+    if not reminder_config.get("ok"):
+        return Response(
+            reminder_config.get("error") or {"detail": "Invalid reminder setup."},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -4943,12 +5703,22 @@ def announcements_list(request):
             message=message,
             showtousers=showtousers,
             showtostaff=showtostaff,
+            notify_owner=int(notify_owner),
             showname=showname,
             dateadded=timezone.now(),
             userid=getattr(request.user, "username", None)
             or getattr(request.user, "email", None)
             or "System",
+            reminder_type=reminder_config.get("reminder_type"),
+            reminder_value=reminder_config.get("reminder_value"),
+            reminder_datetime=reminder_config.get("reminder_datetime"),
+            module_type=module_type,
+            reference_id=reference_id,
+            is_reminder_sent=0,
         )
+        if not getattr(announcement, "reference_id", None):
+            announcement.reference_id = announcement.announcementid
+            announcement.save(update_fields=["reference_id"])
     except (ProgrammingError, OperationalError) as exc:
         print("Announcement create failed:", exc)
         return Response(
@@ -4956,112 +5726,61 @@ def announcements_list(request):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
+    trigger_at = reminder_config.get("trigger_at")
+    if trigger_at and int(getattr(announcement, "is_reminder_sent", 0) or 0) == 0:
+        _schedule_exact_reminder_dispatch(trigger_at)
+
     # -----------------------------
     # Send announcement email + notifications
     # -----------------------------
     try:
-        notify_owner = bool(
-            data.get("notify_owner", True)
-            if not isinstance(data.get("notify_owner", True), str)
-            else str(data.get("notify_owner", "true")).lower() not in {"0", "false", "no"}
+        notify_owner = _parse_bool(data.get("notify_owner", data.get("showtoadmin", True)), default=True)
+        recipient_staff_ids = set(
+            _parse_int_list_payload(data.get("recipient_staff_ids") or data.get("staff_ids"))
         )
+        recipient_contact_ids = set(
+            _parse_int_list_payload(data.get("recipient_contact_ids") or data.get("contact_ids"))
+        )
+        recipient_staff_emails = set(_parse_email_list_payload(data.get("recipient_staff_emails")))
+        recipient_emails = set(_parse_email_list_payload(data.get("recipient_emails") or data.get("emails")))
 
-        recipient_staff_ids = set(_parse_int_list(data.get("recipient_staff_ids") or data.get("staff_ids")))
-        recipient_contact_ids = set(_parse_int_list(data.get("recipient_contact_ids") or data.get("contact_ids")))
-        recipient_staff_emails = set(_parse_email_list(data.get("recipient_staff_emails")))
-        recipient_emails = set(_parse_email_list(data.get("recipient_emails") or data.get("emails")))
+        email_recipients = set(recipient_emails)
+        email_recipients.update(recipient_staff_emails)
+        email_recipients.update(_resolve_contact_emails(contact_id_list=recipient_contact_ids))
 
-        email_recipients = set()
-        notify_staff_ids = set()
-
-        if notify_owner:
-            owner_email = _resolve_owner_email()
-            if owner_email:
-                email_recipients.add(owner_email)
-                try:
-                    owner_staff = Staff.objects.filter(email__iexact=owner_email).first()
-                    if owner_staff:
-                        notify_staff_ids.add(owner_staff.staffid)
-                except Exception:
-                    pass
-
-        if recipient_staff_ids:
-            for staff in Staff.objects.filter(staffid__in=recipient_staff_ids):
-                if getattr(staff, "email", None):
-                    email_recipients.add(staff.email)
-                notify_staff_ids.add(staff.staffid)
-
+        notify_staff_ids = set(recipient_staff_ids)
         if recipient_staff_emails:
-            email_recipients.update(recipient_staff_emails)
             for staff in Staff.objects.filter(email__in=list(recipient_staff_emails)):
                 notify_staff_ids.add(staff.staffid)
-
-        if recipient_contact_ids:
-            for contact in Contacts.objects.filter(id__in=recipient_contact_ids):
-                if getattr(contact, "email", None):
-                    email_recipients.add(contact.email)
-
         if recipient_emails:
-            email_recipients.update(recipient_emails)
             for staff in Staff.objects.filter(email__in=list(recipient_emails)):
                 notify_staff_ids.add(staff.staffid)
 
         sender_staff = _resolve_sender_staff()
         sender_name = _resolve_sender_name(sender_staff)
+        from_user_id = sender_staff.staffid if sender_staff else 0
 
-        if email_recipients:
-            html_message = f"""
-<h3>New Announcement</h3>
-<p><b>Title:</b> {announcement.name}</p>
-<p><b>By:</b> {sender_name}</p>
-<hr/>
-<p>{(announcement.message or '').replace('\n', '<br/>')}</p>
-"""
-            plain_message = strip_tags(html_message)
-            try:
-                send_branded_email(
-                    subject=f"New Announcement: {announcement.name}",
-                    message=plain_message,
-                    to_emails=sorted(email_recipients),
-                    html_message=html_message,
-                    fail_silently=False,
-                )
-            except Exception as exc:
-                print("Announcement email failed:", exc)
-
-        if notify_staff_ids:
-            from_user_id = sender_staff.staffid if sender_staff else 0
-            description = f"New Announcement: {announcement.name}"
-            link = f"/utilities/announcements/{announcement.announcementid}/"
-            additional_data = json.dumps(
-                {
-                    "announcement_id": announcement.announcementid,
-                    "title": announcement.name,
-                }
+        if not reminder_config.get("reminder_type"):
+            send_result = _send_announcement_alerts(
+                announcement=announcement,
+                sender_name=sender_name,
+                from_user_id=from_user_id,
+                notify_staff_ids=notify_staff_ids,
+                recipient_emails=email_recipients,
+                include_owner=notify_owner,
+                event_label="New Announcement",
             )
-            now = timezone.now()
-            payload = [
-                Notifications(
-                    isread=0,
-                    isread_inline=0,
-                    date=now,
-                    description=description,
-                    fromuserid=from_user_id,
-                    fromclientid=0,
-                    from_fullname=sender_name,
-                    touserid=staff_id,
-                    fromcompany=None,
-                    link=link,
-                    additional_data=additional_data,
-                )
-                for staff_id in sorted(notify_staff_ids)
-            ]
-            try:
-                Notifications.objects.bulk_create(payload, batch_size=200)
-            except Exception as exc:
-                print("Announcement notification failed:", exc)
+            if send_result.get("ok") and announcement.is_reminder_sent != 1:
+                announcement.is_reminder_sent = 1
+                announcement.save(update_fields=["is_reminder_sent"])
     except Exception as exc:
         print("Announcement alert processing failed:", exc)
+
+    _dispatch_pending_reminders()
+    try:
+        announcement.refresh_from_db(using=db)
+    except Exception:
+        pass
 
     return Response(
         {
@@ -5070,9 +5789,16 @@ def announcements_list(request):
             "message": announcement.message,
             "showtousers": announcement.showtousers,
             "showtostaff": announcement.showtostaff,
+            "notify_owner": getattr(announcement, "notify_owner", 1),
             "showname": announcement.showname,
             "dateadded": announcement.dateadded.isoformat() if announcement.dateadded else None,
             "userid": announcement.userid,
+            "reminder_type": announcement.reminder_type,
+            "reminder_value": announcement.reminder_value,
+            "reminder_datetime": announcement.reminder_datetime.isoformat() if announcement.reminder_datetime else None,
+            "module_type": announcement.module_type,
+            "reference_id": announcement.reference_id,
+            "is_reminder_sent": announcement.is_reminder_sent,
         },
         status=status.HTTP_201_CREATED,
     )
@@ -5081,6 +5807,7 @@ def announcements_list(request):
 @api_view(["PUT", "PATCH", "DELETE"])
 @permission_classes([IsAuthenticated])
 def announcements_detail(request, pk):
+    _ensure_reminder_schema_ready()
     try:
         ensure_announcements_table()
     except Exception as exc:
@@ -5103,26 +5830,68 @@ def announcements_detail(request, pk):
     message = data.get("message")
     showtousers = data.get("showtousers")
     showtostaff = data.get("showtostaff")
+    notify_owner = data.get("notify_owner", data.get("showtoadmin"))
     showname = data.get("showname")
+    reference_id = data.get("reference_id")
 
     if name is not None:
         announcement.name = str(name).strip()
     if message is not None:
         announcement.message = message
     if showtousers is not None:
-        announcement.showtousers = int(bool(showtousers))
+        announcement.showtousers = int(_parse_bool(showtousers, default=False))
     if showtostaff is not None:
-        announcement.showtostaff = int(bool(showtostaff))
+        announcement.showtostaff = int(_parse_bool(showtostaff, default=False))
+    if notify_owner is not None:
+        announcement.notify_owner = int(_parse_bool(notify_owner, default=True))
     if showname is not None:
-        announcement.showname = int(bool(showname))
+        announcement.showname = int(_parse_bool(showname, default=True))
 
-    if announcement.showtousers == 0 and announcement.showtostaff == 0:
+    reminder_payload_supplied = any(
+        key in data for key in ("reminder_type", "reminder_value", "reminder_datetime")
+    )
+    if reminder_payload_supplied:
+        reminder_config = _parse_announcement_reminder_payload(
+            data,
+            base_datetime=getattr(announcement, "dateadded", None) or timezone.now(),
+        )
+        if not reminder_config.get("ok"):
+            return Response(
+                reminder_config.get("error") or {"detail": "Invalid reminder setup."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        announcement.reminder_type = reminder_config.get("reminder_type")
+        announcement.reminder_value = reminder_config.get("reminder_value")
+        announcement.reminder_datetime = reminder_config.get("reminder_datetime")
+        announcement.is_reminder_sent = 0 if reminder_config.get("reminder_type") else 1
+
+    announcement.module_type = "announcement"
+    if reference_id is not None:
+        announcement.reference_id = _safe_int(reference_id)
+
+    if (
+        announcement.showtousers == 0
+        and announcement.showtostaff == 0
+        and int(_parse_bool(getattr(announcement, "notify_owner", 1), default=True)) == 0
+    ):
         return Response(
-            {"detail": "Select at least one audience (users or staff)."},
+            {"detail": "Select at least one audience (users, staff, or admin)."},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
+    if not announcement.reference_id:
+        announcement.reference_id = announcement.announcementid
+
     announcement.save()
+    trigger_at = _compute_trigger_datetime(
+        getattr(announcement, "reminder_type", None),
+        getattr(announcement, "reminder_value", None),
+        getattr(announcement, "reminder_datetime", None),
+        _announcement_base_datetime(announcement),
+    )
+    if trigger_at and int(getattr(announcement, "is_reminder_sent", 0) or 0) == 0:
+        _schedule_exact_reminder_dispatch(trigger_at)
+    _dispatch_pending_reminders()
 
     return Response(
         {
@@ -5131,9 +5900,16 @@ def announcements_detail(request, pk):
             "message": announcement.message,
             "showtousers": announcement.showtousers,
             "showtostaff": announcement.showtostaff,
+            "notify_owner": getattr(announcement, "notify_owner", 1),
             "showname": announcement.showname,
             "dateadded": announcement.dateadded.isoformat() if announcement.dateadded else None,
             "userid": announcement.userid,
+            "reminder_type": announcement.reminder_type,
+            "reminder_value": announcement.reminder_value,
+            "reminder_datetime": announcement.reminder_datetime.isoformat() if announcement.reminder_datetime else None,
+            "module_type": announcement.module_type,
+            "reference_id": announcement.reference_id,
+            "is_reminder_sent": announcement.is_reminder_sent,
         },
         status=status.HTTP_200_OK,
     )

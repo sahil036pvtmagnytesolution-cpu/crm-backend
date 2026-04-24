@@ -198,3 +198,12 @@ DATABASE_ROUTERS = [
 #     0,
 #     "core.middleware.TenantMiddleware"
 # )
+
+# Reminder dispatch beat schedule (used when Celery Beat is configured in deployment).
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_BEAT_SCHEDULE = {
+    "dispatch-pending-reminders-every-minute": {
+        "task": "core.dispatch_pending_reminders",
+        "schedule": 1.0,
+    },
+}

@@ -1027,9 +1027,44 @@ class Estimate(models.Model):
         return self.estimate_number
 
 class CalendarEvent(models.Model):
+    REMINDER_TYPE_DAYS = "days"
+    REMINDER_TYPE_HOURS = "hours"
+    REMINDER_TYPE_CUSTOM = "custom_datetime"
+    REMINDER_TYPE_CHOICES = [
+        (REMINDER_TYPE_DAYS, "Days Before"),
+        (REMINDER_TYPE_HOURS, "Hours Before"),
+        (REMINDER_TYPE_CUSTOM, "Custom Date Time"),
+    ]
+
+    MODULE_TYPE_REMINDER = "reminder"
+    MODULE_TYPE_ANNOUNCEMENT = "announcement"
+    MODULE_TYPE_TASK = "task"
+    MODULE_TYPE_TICKET = "ticket"
+    MODULE_TYPE_CHOICES = [
+        (MODULE_TYPE_REMINDER, "Reminder"),
+        (MODULE_TYPE_ANNOUNCEMENT, "Announcement"),
+        (MODULE_TYPE_TASK, "Task"),
+        (MODULE_TYPE_TICKET, "Ticket"),
+    ]
+
     title = models.CharField(max_length=255)
     date = models.DateField()
     color = models.CharField(max_length=20, default="#2196f3")
+    reminder_type = models.CharField(
+        max_length=32,
+        choices=REMINDER_TYPE_CHOICES,
+        blank=True,
+        null=True,
+    )
+    reminder_value = models.IntegerField(blank=True, null=True)
+    reminder_datetime = models.DateTimeField(blank=True, null=True)
+    module_type = models.CharField(
+        max_length=32,
+        choices=MODULE_TYPE_CHOICES,
+        default=MODULE_TYPE_REMINDER,
+    )
+    reference_id = models.IntegerField(blank=True, null=True)
+    is_reminder_sent = models.BooleanField(default=False)
 
     def __str__(self):
         return self.title
