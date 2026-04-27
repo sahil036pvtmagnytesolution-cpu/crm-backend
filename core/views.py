@@ -8,7 +8,7 @@ import secrets
 import logging
 import importlib
 from decimal import Decimal, InvalidOperation
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from django.contrib.auth.models import User
@@ -1978,7 +1978,7 @@ def _frontend_login_url():
     return getattr(settings, "FRONTEND_LOGIN_URL", "http://localhost:3000/login")
 
 
-def _frontend_reset_url(token):
+def _frontend_reset_url(token, tenant_db=None, email=None):
     base_url = getattr(
         settings,
         "FRONTEND_RESET_PASSWORD_URL",
@@ -1987,6 +1987,12 @@ def _frontend_reset_url(token):
     parsed = urlparse(base_url)
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
     query["token"] = token
+    normalized_email = _normalize_email(email)
+    if normalized_email:
+        query["email"] = normalized_email
+    normalized_tenant = str(tenant_db or "").strip()
+    if normalized_tenant and normalized_tenant.lower() != "ms_crm":
+        query["tenant"] = normalized_tenant
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 
@@ -2082,7 +2088,32 @@ def _clear_auth_user_reset_token(token=None, user_id=None):
 def _within_reset_window(requested_at):
     if requested_at is None:
         return False
-    return requested_at >= timezone.now() - timedelta(minutes=PASSWORD_RESET_TOKEN_EXPIRY_MINUTES)
+    normalized_requested_at = requested_at
+
+    if isinstance(normalized_requested_at, str):
+        normalized_requested_at = parse_datetime(normalized_requested_at)
+        if normalized_requested_at is None:
+            return False
+
+    if not isinstance(normalized_requested_at, datetime):
+        return False
+
+    now = timezone.now()
+    # `last_login` from raw SQL (`ms_user_auto_login`) can come back as naive.
+    # Treat naive timestamps as UTC to avoid false "expired" results from local
+    # timezone assumptions.
+    if timezone.is_naive(normalized_requested_at):
+        normalized_requested_at = timezone.make_aware(
+            normalized_requested_at,
+            dt_timezone.utc,
+        )
+    if timezone.is_naive(now):
+        now = timezone.make_aware(now, dt_timezone.utc)
+
+    normalized_requested_at = normalized_requested_at.astimezone(dt_timezone.utc)
+    now = now.astimezone(dt_timezone.utc)
+
+    return normalized_requested_at >= now - timedelta(minutes=PASSWORD_RESET_TOKEN_EXPIRY_MINUTES)
 
 
 def _collect_reset_targets_by_email(email):
@@ -2145,9 +2176,9 @@ def _store_reset_token_for_targets(targets, token, requested_at):
     return sorted(stored_roles)
 
 
-def _send_password_reset_email(email, token):
+def _send_password_reset_email(email, token, tenant_db=None):
     """Send password reset email asynchronously."""
-    reset_url = _frontend_reset_url(token)
+    reset_url = _frontend_reset_url(token, tenant_db=tenant_db, email=email)
     expires_label = f"{PASSWORD_RESET_TOKEN_EXPIRY_MINUTES} minutes"
     subject = "Reset your CRM password"
     html_message = build_module_email_html(
@@ -2248,12 +2279,27 @@ def forgot_password(request):
 
     reset_token = secrets.token_hex(16)
     requested_at = timezone.now()
+    tenant_hint = str(request.headers.get("X-TENANT-DB") or "").strip()
+    if not tenant_hint:
+        try:
+            active_db_alias = get_current_db()
+            tenant_hint = str(
+                connections[active_db_alias].settings_dict.get("NAME")
+                or ""
+            ).strip()
+        except Exception:
+            tenant_hint = ""
 
     stored_roles = _store_reset_token_for_targets(targets, reset_token, requested_at)
     if stored_roles:
-        scheduled = run_async(_send_password_reset_email, email, reset_token)
+        scheduled = run_async(
+            _send_password_reset_email,
+            email,
+            reset_token,
+            tenant_hint,
+        )
         if not scheduled:
-            _send_password_reset_email(email, reset_token)
+            _send_password_reset_email(email, reset_token, tenant_hint)
 
     return Response(
         {
@@ -2268,11 +2314,14 @@ def forgot_password(request):
 @permission_classes([AllowAny])
 def reset_password(request):
     token = str(request.data.get("token") or "").strip()
+    requested_email = _normalize_email(request.data.get("email"))
     new_password = str(request.data.get("new_password") or "")
     confirm_password = str(request.data.get("confirm_password") or "")
 
     if not token:
         return Response({"message": "Token is required."}, status=status.HTTP_400_BAD_REQUEST)
+    if not requested_email:
+        return Response({"message": "Email is required."}, status=status.HTTP_400_BAD_REQUEST)
     if not new_password or not confirm_password:
         return Response(
             {"message": "New password and confirm password are required."},
@@ -2341,48 +2390,89 @@ def reset_password(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
+    filtered_targets = []
+    for target in valid_targets:
+        role = target.get("role")
+        instance = target.get("instance")
+        if instance is None:
+            continue
+        if role == "auth_user":
+            candidate_email = _normalize_email(getattr(instance, "email", None) or getattr(instance, "username", None))
+        else:
+            candidate_email = _normalize_email(getattr(instance, "email", None))
+        if candidate_email == requested_email:
+            filtered_targets.append(target)
+
+    valid_targets = filtered_targets
+    if not valid_targets:
+        return Response(
+            {"message": "Token is invalid for this email or has expired."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
     updated_emails = set()
     now = timezone.now()
+
+    updated_count = 0
 
     for target in valid_targets:
         role = target.get("role")
         instance = target.get("instance")
-        if role == "auth_user" and instance is not None:
-            instance.password = _password_hash(new_password)
-            instance.save(update_fields=["password"])
-            updated_emails.add(_normalize_email(instance.email or instance.username))
-            try:
-                _clear_auth_user_reset_token(token=token, user_id=instance.id)
-            except Exception:
-                pass
-        elif role == "staff" and instance is not None:
-            instance.password = _password_hash(new_password)
-            instance.last_password_change = now
-            instance.new_pass_key = None
-            instance.new_pass_key_requested = None
-            instance.save(
-                update_fields=[
-                    "password",
-                    "last_password_change",
-                    "new_pass_key",
-                    "new_pass_key_requested",
-                ]
+        if instance is None:
+            continue
+
+        try:
+            if role == "auth_user":
+                instance.password = _password_hash(new_password)
+                instance.save(update_fields=["password"])
+                updated_emails.add(_normalize_email(instance.email or instance.username))
+                try:
+                    _clear_auth_user_reset_token(token=token, user_id=instance.id)
+                except Exception:
+                    pass
+                updated_count += 1
+            elif role == "staff":
+                instance.password = _password_hash(new_password)
+                instance.last_password_change = now
+                instance.new_pass_key = None
+                instance.new_pass_key_requested = None
+                instance.save(
+                    update_fields=[
+                        "password",
+                        "last_password_change",
+                        "new_pass_key",
+                        "new_pass_key_requested",
+                    ]
+                )
+                updated_emails.add(_normalize_email(instance.email))
+                updated_count += 1
+            elif role == "contact":
+                instance.password = _password_hash(new_password)
+                instance.last_password_change = now
+                instance.new_pass_key = None
+                instance.new_pass_key_requested = None
+                instance.save(
+                    update_fields=[
+                        "password",
+                        "last_password_change",
+                        "new_pass_key",
+                        "new_pass_key_requested",
+                    ]
+                )
+                updated_emails.add(_normalize_email(instance.email))
+                updated_count += 1
+        except Exception:
+            logger.exception(
+                "Password reset update failed for role=%s target=%s",
+                role,
+                getattr(instance, "id", None),
             )
-            updated_emails.add(_normalize_email(instance.email))
-        elif role == "contact" and instance is not None:
-            instance.password = _password_hash(new_password)
-            instance.last_password_change = now
-            instance.new_pass_key = None
-            instance.new_pass_key_requested = None
-            instance.save(
-                update_fields=[
-                    "password",
-                    "last_password_change",
-                    "new_pass_key",
-                    "new_pass_key_requested",
-                ]
-            )
-            updated_emails.add(_normalize_email(instance.email))
+
+    if updated_count == 0:
+        return Response(
+            {"message": "Unable to reset password. Please request a new reset link and try again."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
     try:
         _clear_auth_user_reset_token(token=token)
